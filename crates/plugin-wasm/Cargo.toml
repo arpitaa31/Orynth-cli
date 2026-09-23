@@ -1,0 +1,15 @@
+[package]
+name = "orynth-plugin-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-kernel = { path = "../kernel" }
+orynth-plugin-discovery = { path = "../plugin-discovery" }
+orynth-plugin-api = { path = "../plugin-api" }
+orynth-security = { path = "../security" }
+wasmi = "2.0.0"
+
+[dev-dependencies]
+wat = "1.259.0"

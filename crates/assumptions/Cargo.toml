@@ -1,0 +1,8 @@
+[package]
+name = "orynth-assumptions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-kernel = { path = "../kernel" }

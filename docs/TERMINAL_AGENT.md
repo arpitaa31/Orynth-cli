@@ -1,0 +1,7 @@
+# Terminal Agent
+
+Status: canonical specification derived from the supplied research blueprint.
+
+The terminal assistant plans typed operations such as FindFiles, MoveFile, CopyFile, RemoveFile, ListProcesses, GitOperation, and a constrained raw-shell escape hatch. The current Phase 7 boundary detects bounded platform, shell, working-directory, permission-hint, and available-command facts; classifies SAFE, CONFIRM, HIGH, or BLOCK; gates confirmation; rejects path escapes and unknown Git actions; and reports compensation only where valid. The rooted adapter supports bounded find, copy, and quarantine-backed remove execution with verification and conflict-checked compensation. `orynth-shell plan` renders the report, while explicitly confirmed `orynth-shell execute` commands run only the rooted filesystem subset through the tool runtime.
+
+It shares capability, provenance, policy, event, and transaction contracts with other tools. The typed planning and execution boundary is implemented in `orynth-terminal-tools`, `orynth-cli`, and `apps/orynth-shell`. A bounded local phrase grammar translates recognized find/copy/move/remove/process-list/Git-read requests into typed operations; unsupported prose is rejected. Confirmed rooted copy/move/quarantine effects write bounded relative compensation records, and `orynth-shell undo` revalidates and restores the latest record across processes. Model-backed natural-language translation, process/Git execution adapters, stronger crash semantics, and a production terminal UX remain later Phase 7 work.

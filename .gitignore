@@ -1,0 +1,7 @@
+/target/
+.orynth/
+.env
+.env.*
+*.log
+.DS_Store
+

@@ -1,0 +1,9 @@
+[package]
+name = "orynth-protocol-a2a"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-ipc = { path = "../ipc" }
+orynth-kernel = { path = "../kernel" }

@@ -1,0 +1,10 @@
+[package]
+name = "orynth-plugin-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-kernel = { path = "../kernel" }
+orynth-plugin-api = { path = "../plugin-api" }
+orynth-security = { path = "../security" }

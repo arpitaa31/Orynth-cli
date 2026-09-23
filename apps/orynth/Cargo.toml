@@ -1,0 +1,15 @@
+[package]
+name = "orynth-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-event-store = { path = "../../crates/event-store" }
+orynth-kernel = { path = "../../crates/kernel" }
+orynth-runtime = { path = "../../crates/runtime" }
+orynth-tui = { path = "../../crates/tui" }
+
+[[bin]]
+name = "orynth"
+path = "src/main.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "orynth-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-kernel = { path = "../kernel" }
+orynth-security = { path = "../security" }
+orynth-tool-runtime = { path = "../tool-runtime" }
+orynth-terminal-tools = { path = "../terminal-tools" }

@@ -1,0 +1,20 @@
+[package]
+name = "orynth-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-assumptions = { path = "../assumptions" }
+orynth-context = { path = "../context" }
+orynth-failure-memory = { path = "../failure-memory" }
+orynth-kernel = { path = "../kernel" }
+orynth-security = { path = "../security" }
+orynth-tool-runtime = { path = "../tool-runtime" }
+orynth-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+orynth-cache = { path = "../cache" }
+orynth-event-store = { path = "../event-store" }
+orynth-scheduler = { path = "../scheduler" }
+orynth-specialist = { path = "../specialist" }

@@ -1,0 +1,17 @@
+[package]
+name = "orynth-event-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-assumptions = { path = "../assumptions" }
+orynth-ipc = { path = "../ipc" }
+orynth-kernel = { path = "../kernel" }
+orynth-scheduler = { path = "../scheduler" }
+orynth-security = { path = "../security" }
+orynth-tool-runtime = { path = "../tool-runtime" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+orynth-agent = { path = "../agent" }
+orynth-provider = { path = "../provider" }

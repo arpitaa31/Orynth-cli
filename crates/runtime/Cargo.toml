@@ -1,0 +1,18 @@
+[package]
+name = "orynth-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-assumptions = { path = "../assumptions" }
+orynth-cache = { path = "../cache" }
+orynth-context = { path = "../context" }
+orynth-event-store = { path = "../event-store" }
+orynth-failure-memory = { path = "../failure-memory" }
+orynth-ipc = { path = "../ipc" }
+orynth-kernel = { path = "../kernel" }
+orynth-scheduler = { path = "../scheduler" }
+orynth-specialist = { path = "../specialist" }
+orynth-security = { path = "../security" }
+orynth-tool-runtime = { path = "../tool-runtime" }

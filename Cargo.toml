@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kernel",
+    "crates/event-store",
+    "crates/provider",
+    "crates/context",
+    "crates/runtime",
+    "crates/cache",
+    "crates/failure-memory",
+    "crates/specialist",
+    "crates/agent",
+    "crates/ipc",
+    "crates/assumptions",
+    "crates/scheduler",
+    "crates/tool-runtime",
+    "crates/security",
+    "crates/plugin-api",
+    "crates/plugin-discovery",
+    "crates/plugin-process",
+    "crates/plugin-mcp",
+    "crates/plugin-wasm",
+    "crates/plugin-host",
+    "crates/protocol-a2a",
+    "crates/terminal-tools",
+    "crates/cli",
+    "crates/tui",
+    "apps/orynth",
+    "apps/orynth-shell",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"

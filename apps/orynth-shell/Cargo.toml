@@ -1,0 +1,13 @@
+[package]
+name = "orynth-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orynth-cli = { path = "../../crates/cli" }
+orynth-terminal-tools = { path = "../../crates/terminal-tools" }
+
+[[bin]]
+name = "orynth-shell"
+path = "src/main.rs"

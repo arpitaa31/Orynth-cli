@@ -1,0 +1,26 @@
+[runtime]
+max_concurrent_agents = 6
+event_store = ".orynth/runtime.db"
+artifact_dir = ".orynth/artifacts"
+
+[models.worker]
+provider = "mock"
+model = "foundation"
+class = "cheap"
+
+[scheduler]
+mode = "economy"
+prefer_warm_cache = true
+promote_after_failures = 3
+
+[context]
+semantic_invalidation = true
+subscriptions = true
+
+[security]
+default_network = "deny"
+
+[plugins]
+process = true
+mcp = true
+wasm = false
