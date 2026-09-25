@@ -1,37 +1,52 @@
-# TUI
+# Orynth TUI
 
-Status: Phase 8 initial slice implemented; canonical specification derived from the supplied research blueprint.
+Status: Phase F full-screen runtime debugger implemented.
 
-The TUI is a runtime debugger, not merely chat. It will show run/agent trees, roles, models, states, health, progress, context pressure, cache observations, costs, budgets, assumptions, conflicts, blockers, tools, events, artifacts, and permissions.
+The TUI is a read-only client over authoritative `RecoveredRun` projections.
+It does not call providers, append events, execute tools, grant permissions,
+or create a second runtime state model. SQLite sources recover the selected
+run through `RuntimeService`; the offline demo creates the same event-backed
+projection in memory.
 
-The current slice is a bounded text inspector. `orynth inspect --db <path>
---run <run-id>` recovers the selected run from the SQLite event store and
-renders the persisted runtime, manager, context, assumptions, tools,
-capabilities, cache, failure-memory, and recent-event projections. It is read-only: it does
-not call a provider, append events, or synthesize a demo run. Its overview
-also reports the bounded context freshness dashboard: active tokens and block
-lifecycle counts.
+## Launch
 
-The operator app also exposes `orynth replay --db <path> --run <id>
-[--at <sequence>]` for recorded prefix recovery, `orynth fork` for explicit
-SQLite branch creation and child-prefix materialization, and `orynth diff` for
-comparing two recovered projections. Recorded replay and diff never invoke a
-provider; fork materialization only copies the validated event prefix and does
-not claim to perform live re-execution.
+```text
+cargo run -p orynth -- tui --demo
+cargo run -p orynth -- tui --db .orynth/runtime.db
+cargo run -p orynth -- tui --db .orynth/runtime.db --run <run-id>
+```
 
-The renderer also scans decoded persisted transitions for semantic breakpoint
-hits: model changes, context invalidation, assumption conflicts, capability
-grants, approval gates, semantic tool repairs, tool failures, and recorded
-failure-memory entries. The scan
-returns event sequence coordinates and cannot pause or mutate a run.
+`--demo` is deterministic and offline. It contains a manager, three
+specialists, a model switch, context, IPC, an assumption conflict, health,
+budgets, ownership, a capability lease, cache telemetry, and a tool
+transaction. Set `ORYNTH_TUI_DEMO_AGENTS=10` for the bounded ten-agent
+responsiveness scenario used by the Phase F measurement.
 
-`orynth debug --db <path> --run <id>` provides a terminal-independent
-interactive session with `show`, `pane`, `next`, `prev`, `select`, `events`,
-`event <sequence>`, `breakpoints`, and `quit` commands. Pane state and item
-selection live in `orynth-tui`, not in a second persistence model. It is
-deliberately read-only; full-screen keyboard navigation and live controls
-remain future work.
+## Views
 
-Future work adds interactive panes and controls for replay, fork, comparison,
-and live breakpoint actions covering conflicts, invalidation, high-risk
-proposals, escalation, thresholds, promotion, repair, and verification failure.
+The numbered views are dashboard, agents, events, context, IPC/messages,
+tools, policy/permissions, assumptions/conflicts, and persisted runs. The
+dashboard combines the agent tree, selected-agent projection, and recent
+events. Agent rows retain the logical `AgentId` while displaying the current
+model assignment. Context uses a visibility-scoped `ContextPrincipal` and
+bounded projection limits. Details are bounded by character/row limits.
+
+The events view displays a bounded newest window. `[` requests an older page
+from the SQLite event store and `]` returns to the newest window. Paging is
+read-only and does not reconstruct or mutate a live run. Replay, fork, and
+diff remain available through the existing CLI commands and are not live TUI
+mutations.
+
+## Controls
+
+`Tab`/`Shift-Tab` changes views; `1`-`9` selects a view; arrows or `j`/`k`
+move selection; `Home`/`End` jump; `Enter` selects a run or opens event
+details; `/` filters the active list; `r` refreshes authoritative state; `R`
+opens persisted runs; `?` opens help; `Esc` closes details/help; `q` or
+`Ctrl-C` exits. The TUI restores raw mode, the alternate screen, and cursor
+visibility on normal exit, input errors, and panic unwinding through RAII.
+
+The interface remains read-only. Interactive pause, resume, cancel, model
+switch, capability grant, tool approval, replay execution, fork execution,
+and live breakpoint actions are deferred until a safe runtime-control API is
+defined.

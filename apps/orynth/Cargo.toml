@@ -1,13 +1,21 @@
 [package]
-name = "orynth-app"
+name = "orynth"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+orynth-assumptions = { path = "../../crates/assumptions" }
+orynth-context = { path = "../../crates/context" }
 orynth-event-store = { path = "../../crates/event-store" }
+orynth-failure-memory = { path = "../../crates/failure-memory" }
+orynth-ipc = { path = "../../crates/ipc" }
 orynth-kernel = { path = "../../crates/kernel" }
 orynth-runtime = { path = "../../crates/runtime" }
+orynth-scheduler = { path = "../../crates/scheduler" }
+orynth-security = { path = "../../crates/security" }
+orynth-specialist = { path = "../../crates/specialist" }
+orynth-tool-runtime = { path = "../../crates/tool-runtime" }
 orynth-tui = { path = "../../crates/tui" }
 
 [[bin]]

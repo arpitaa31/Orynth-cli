@@ -10,12 +10,21 @@ Status: canonical roadmap derived from the supplied research blueprint.
 6. Plugins/protocols: the initial contract/adaptation slice is implemented for bounded manifest discovery, revalidated discovered process/WASM activation, allowlisted atomic host startup binding, explicitly configured discovered-MCP HTTP activation, injected and command-backed process-plugin invocation, deterministic supervision, Windows process containment, bounded progressive MCP discovery, explicit legacy/modern MCP lifecycle, bounded stdio JSON-RPC and Streamable HTTP JSON/SSE responses with explicit active-stream server-request handling, bounded caller-driven GET streams and `Last-Event-ID` resumption with capped retry reconnects, MCP trust/policy translation, A2A-to-IPC mapping, and Wasmi-backed WASM execution with fuel/memory limits, manifest-and-lease capability checking, and an opt-in bounded resource-read provider. Unrestricted/implicit activation, broader bidirectional session behavior, full WASI/broader effectful host-import adapters, and stronger platform sandboxing remain.
 6. Extensions/protocols: process plugins, MCP, discovery, WASM/WASI, A2A, leases, secret handles.
 7. Terminal AI: the typed planning boundary now provides bounded host discovery, typed operations, risk, confirmation, path/Git validation, and honest compensation metadata; a bounded local phrase grammar maps recognized requests to typed operations, rooted find/copy/quarantine-backed remove execution is verified through the tool runtime, and the CLI supports explicit plan, confirmed rooted-filesystem execution, and bounded cross-process undo. Model-backed natural-language translation, process/Git adapters, stronger crash semantics, and the production terminal UX remain.
-8. TUI/debugger: projection-backed text inspection and a pure event-derived
-   semantic breakpoint scanner are implemented through `orynth-tui` and
-   `orynth inspect`; recorded replay, persisted fork materialization, and
-   projection comparison are available through `orynth replay`, `orynth fork`,
-   and `orynth diff`. Live re-execution and interactive controls remain.
+8. TUI/debugger: the projection-backed full-screen runtime debugger is
+   implemented through `orynth-tui` and `orynth tui`, including dashboard,
+   agent, bounded event paging, context, IPC, tools, policy, assumptions,
+   persisted runs, help, and deterministic offline demo views. Recorded
+   replay, persisted fork materialization, projection comparison, and the
+   terminal-independent debug session remain available through their existing
+   commands. Live re-execution and interactive mutation controls remain.
 9. Advanced orchestration: dynamic specialists, active supervision, promotion/demotion, consultation, verification, cache-aware scheduling, failure memory, and context freshness policies. Bounded specialist profiles, deterministic threshold-based promotion/pause policy, durable budget transfer, bounded event-sourced failure memory, evidence-based cache-aware ranking, and read-only freshness proprioception are implemented as preparation; profile-driven routing and the remaining orchestration automation are still future work.
 10. Hardening/release: security, fuzzing, failures/recovery, cross-platform behavior, benchmarks, RSS, startup, API stability, packaging.
 
 Contracts alone do not mark later phases complete.
+
+Phase D provider/persistence hardening, Phase E benchmark/hardening, and Phase
+F full-screen TUI/runtime debugger work are complete. Local deterministic
+measurements, TUI working-set samples, bounded fault smoke, and malformed-input
+smoke are recorded in `docs/BENCHMARK_RESULTS.md` and `docs/HARDENING.md`.
+Full cargo-fuzz, hosted cross-platform results, and real provider/plugin
+process measurements remain explicit follow-up work.

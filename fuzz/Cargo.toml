@@ -1,0 +1,37 @@
+[package]
+name = "orynth-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+orynth-assumptions = { path = "../crates/assumptions" }
+orynth-context = { path = "../crates/context" }
+orynth-ipc = { path = "../crates/ipc" }
+
+[[bin]]
+name = "assumption_transition"
+path = "fuzz_targets/assumption_transition.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "context_transition"
+path = "fuzz_targets/context_transition.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_envelope"
+path = "fuzz_targets/ipc_envelope.rs"
+test = false
+doc = false
+bench = false

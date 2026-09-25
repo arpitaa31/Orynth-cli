@@ -1,24 +1,38 @@
 //! Small command boundary for the Orynth operator app.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, Write},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use orynth_assumptions::Assumption;
+use orynth_context::{
+    ContextDraft, ContextEventLog, ContextGraph, ContextKind, ContextOwner, ContextScope,
+};
 use orynth_event_store::{
     BranchStore, EventStore, ForkStore, InMemoryEventStore, ReplayMode, SqliteArtifactStore,
-    SqliteEventStore,
+    SqliteEventStore, StoredEvent,
 };
-use orynth_kernel::RunId;
+use orynth_ipc::{IpcEnvelope, IpcMessage, IpcProvenance};
+use orynth_kernel::{
+    AgentId, AgentIdentity, Event, EventKind, ModelClass, ModelRef, RunId, Task, TaskId,
+    ToolTransactionId, TrustOrigin,
+};
 use orynth_runtime::RuntimeService;
+use orynth_scheduler::{BudgetLimits, HealthSignal};
+use orynth_security::{CapabilityDomain, CapabilityLease};
+use orynth_specialist::SpecialistProfile;
+use orynth_tool_runtime::{ToolProvenance, ToolState, ToolTransition};
 use orynth_tui::{
-    InspectorAction, InspectorPane, InspectorState, inspector_pane_item_count,
-    render_inspector_pane, render_runtime_inspector, scan_semantic_breakpoints,
+    InspectorAction, InspectorPane, InspectorState, RunSummary, TuiDataSource, TuiSnapshot,
+    inspector_pane_item_count, render_inspector_pane, render_runtime_inspector, run_fullscreen,
+    scan_semantic_breakpoints,
 };
 
-const HELP: &str = "Usage:\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth debug --db <path> --run <run-id>\n  orynth help";
+const HELP: &str = "Usage:\n  orynth tui [--db <path>] [--run <run-id>]\n  orynth tui --demo\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth debug --db <path> --run <run-id>\n  orynth help";
+const MAX_TUI_EVENT_WINDOW: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -48,6 +62,11 @@ pub enum Command {
         database: PathBuf,
         run: u64,
     },
+    Tui {
+        database: PathBuf,
+        run: Option<u64>,
+        demo: bool,
+    },
 }
 
 pub fn parse_args<I>(args: I) -> Result<Command, String>
@@ -67,6 +86,7 @@ where
         && command != "fork"
         && command != "diff"
         && command != "debug"
+        && command != "tui"
     {
         return Err(format!("unknown command {command:?}\n\n{HELP}"));
     }
@@ -78,6 +98,7 @@ where
     let mut mode = ReplayMode::Recorded;
     let mut left = None;
     let mut right = None;
+    let mut demo = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--db" => {
@@ -153,8 +174,19 @@ where
                         .map_err(|_| format!("invalid right run id {value:?}"))?,
                 );
             }
+            "--demo" if command == "tui" => demo = true,
             other => return Err(format!("unknown {command} argument {other:?}\n\n{HELP}")),
         }
+    }
+    if command == "tui" {
+        if demo && run.is_some() {
+            return Err("tui --demo cannot be combined with --run".to_owned());
+        }
+        return Ok(Command::Tui {
+            database: database.unwrap_or_else(|| PathBuf::from(".orynth/runtime.db")),
+            run,
+            demo,
+        });
     }
     let database = database.ok_or_else(|| format!("{command} requires --db\n\n{HELP}"))?;
     if command == "diff" {
@@ -225,6 +257,14 @@ where
             debug_terminal(database, run)?;
             Ok(None)
         }
+        Command::Tui {
+            database,
+            run,
+            demo,
+        } => {
+            run_tui(database, run, demo)?;
+            Ok(None)
+        }
     }
 }
 
@@ -272,6 +312,466 @@ fn recover_recorded_prefix(
         .map_err(|error| format!("could not recover recorded run {run}: {error}"))?;
     recovered.events = prefix;
     Ok(recovered)
+}
+
+struct DbTuiSource {
+    database: PathBuf,
+    selected: Option<RunId>,
+}
+
+impl DbTuiSource {
+    fn new(database: PathBuf, selected: Option<u64>) -> Self {
+        Self {
+            database,
+            selected: selected.map(RunId::from_u64),
+        }
+    }
+}
+
+impl TuiDataSource for DbTuiSource {
+    fn snapshot(&mut self) -> Result<TuiSnapshot, String> {
+        let store = SqliteEventStore::open(&self.database)
+            .map_err(|error| format!("could not open {}: {error}", self.database.display()))?;
+        let run_ids = store
+            .run_ids()
+            .map_err(|error| format!("could not list persisted runs: {error}"))?;
+        let mut runs = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            let events = store
+                .events(run_id)
+                .map_err(|error| format!("could not read run {run_id}: {error}"))?;
+            let status = events
+                .last()
+                .map(|event| match event.event.kind {
+                    EventKind::RunCompleted { .. } => "COMPLETED",
+                    EventKind::RunCancelled { .. } => "CANCELLED",
+                    EventKind::RunFailed { .. } => "FAILED",
+                    _ => "ACTIVE",
+                })
+                .unwrap_or("EMPTY")
+                .to_owned();
+            runs.push(RunSummary {
+                run_id,
+                status,
+                event_count: events.len(),
+            });
+        }
+        let selected = if let Some(run_id) = self.selected {
+            let events = store
+                .events(run_id)
+                .map_err(|error| format!("could not read selected run {run_id}: {error}"))?;
+            if events.is_empty() {
+                return Err(format!("selected run {run_id} has no events"));
+            }
+            let values = events
+                .iter()
+                .map(|stored| stored.event.clone())
+                .collect::<Vec<_>>();
+            let mut prefix = InMemoryEventStore::new();
+            prefix
+                .append_batch(&values)
+                .map_err(|error| format!("could not stage selected run {run_id}: {error}"))?;
+            Some(bound_tui_history(
+                RuntimeService::new(prefix)
+                    .recover(run_id)
+                    .map_err(|error| format!("could not recover selected run {run_id}: {error}"))?,
+            ))
+        } else {
+            None
+        };
+        Ok(TuiSnapshot { selected, runs })
+    }
+
+    fn select_run(&mut self, run_id: RunId) -> Result<(), String> {
+        self.selected = Some(run_id);
+        Ok(())
+    }
+
+    fn event_page(
+        &mut self,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let run_id = self
+            .selected
+            .ok_or_else(|| "no run selected for event paging".to_owned())?;
+        let store = SqliteEventStore::open(&self.database)
+            .map_err(|error| format!("could not open {}: {error}", self.database.display()))?;
+        let before = before_sequence.unwrap_or(u64::MAX);
+        let mut page = store
+            .events(run_id)
+            .map_err(|error| format!("could not read event page for {run_id}: {error}"))?
+            .into_iter()
+            .filter(|event| event.sequence < before)
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>();
+        page.reverse();
+        Ok(page)
+    }
+}
+
+struct DemoTuiSource {
+    snapshot: TuiSnapshot,
+}
+
+impl DemoTuiSource {
+    fn new(agent_count: usize) -> Result<Self, String> {
+        Ok(Self {
+            snapshot: if agent_count == 4 {
+                demo_snapshot()?
+            } else {
+                demo_snapshot_with_agent_count(agent_count)?
+            },
+        })
+    }
+}
+
+impl TuiDataSource for DemoTuiSource {
+    fn snapshot(&mut self) -> Result<TuiSnapshot, String> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn select_run(&mut self, _run_id: RunId) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn run_tui(database: PathBuf, run: Option<u64>, demo: bool) -> Result<(), String> {
+    if demo {
+        let agent_count = std::env::var("ORYNTH_TUI_DEMO_AGENTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|count| (1..=64).contains(count))
+            .unwrap_or(4);
+        run_fullscreen(DemoTuiSource::new(agent_count)?)
+    } else {
+        run_fullscreen(DbTuiSource::new(database, run))
+    }
+}
+
+fn bound_tui_history(mut recovered: orynth_runtime::RecoveredRun) -> orynth_runtime::RecoveredRun {
+    if recovered.events.len() > MAX_TUI_EVENT_WINDOW {
+        let start = recovered.events.len() - MAX_TUI_EVENT_WINDOW;
+        recovered.events = recovered.events.split_off(start);
+    }
+    recovered
+}
+
+fn demo_snapshot() -> Result<TuiSnapshot, String> {
+    demo_snapshot_with_agent_count(4)
+}
+
+fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, String> {
+    let run_id = RunId::from_u64(0xD3E0_0001);
+    let task = Task {
+        id: TaskId::from_u64(0xD3E0_0010),
+        run_id,
+        title: "Investigate authentication migration".to_owned(),
+    };
+    let manager = demo_agent(
+        0xD3E0_0100,
+        "MANAGER",
+        "Coordinate the migration and review specialist evidence",
+        "strong-reasoner-v1",
+        ModelClass::Strong,
+    );
+    let mut service = RuntimeService::new(InMemoryEventStore::new());
+    service
+        .event_store_mut()
+        .append_batch(&[
+            Event::new(run_id, EventKind::RunCreated { run_id }),
+            Event::new(
+                run_id,
+                EventKind::TaskCreated {
+                    task_id: task.id,
+                    run_id,
+                    title: task.title.clone(),
+                },
+            ),
+            Event::new(
+                run_id,
+                EventKind::AgentCreated {
+                    agent: manager.clone(),
+                },
+            ),
+            Event::new(
+                run_id,
+                EventKind::ModelRequested {
+                    agent_id: manager.id,
+                    model: manager.model.clone(),
+                },
+            ),
+        ])
+        .map_err(|error| format!("demo core events failed: {error}"))?;
+
+    service
+        .configure_budget(
+            run_id,
+            manager.id,
+            BudgetLimits {
+                max_tokens: Some(50_000),
+                max_child_agents: Some(agent_count as u64),
+                max_context_tokens: Some(16_384),
+                ..BudgetLimits::default()
+            },
+        )
+        .map_err(|error| format!("demo manager budget failed: {error}"))?;
+
+    let auth = demo_agent(
+        0xD3E0_0101,
+        "AUTH-01",
+        "Validate identity and token schema compatibility",
+        "cheap-coder-v2",
+        ModelClass::Cheap,
+    );
+    let db = demo_agent(
+        0xD3E0_0102,
+        "DB-02",
+        "Check migration constraints and persisted identifiers",
+        "cheap-coder-v2",
+        ModelClass::Cheap,
+    );
+    let sec = demo_agent(
+        0xD3E0_0103,
+        "SEC-03",
+        "Review capability and ownership boundaries",
+        "local-reviewer",
+        ModelClass::Local,
+    );
+    let mut specialists = vec![
+        (
+            auth.clone(),
+            "Authentication specialist",
+            vec!["src/auth/**".to_owned()],
+            vec!["filesystem.read".to_owned()],
+            true,
+        ),
+        (
+            db.clone(),
+            "Database specialist",
+            vec!["migrations/**".to_owned()],
+            vec!["filesystem.read".to_owned()],
+            false,
+        ),
+        (
+            sec.clone(),
+            "Security reviewer",
+            vec!["src/**".to_owned()],
+            vec!["policy.inspect".to_owned()],
+            false,
+        ),
+    ];
+    while specialists.len() < agent_count.saturating_sub(1) {
+        let index = specialists.len() + 1;
+        let agent = demo_agent(
+            0xD3E0_0100 + index as u64,
+            &format!("WORK-{index:02}"),
+            "Inspect a bounded migration workstream",
+            "cheap-coder-v2",
+            ModelClass::Cheap,
+        );
+        specialists.push((
+            agent,
+            "Migration specialist",
+            vec![format!("workstream-{index}/**")],
+            vec!["filesystem.read".to_owned()],
+            false,
+        ));
+    }
+    for (agent, role, scope, capabilities, promotable) in specialists {
+        service
+            .spawn_specialist(
+                run_id,
+                manager.id,
+                agent.clone(),
+                SpecialistProfile::new(agent.id, role)
+                    .with_scope(scope)
+                    .with_subscriptions(vec!["assumption.*".to_owned(), "tool.*".to_owned()])
+                    .with_capabilities(capabilities)
+                    .promotable(promotable),
+            )
+            .map_err(|error| format!("demo specialist failed: {error}"))?;
+        service
+            .configure_budget(
+                run_id,
+                agent.id,
+                BudgetLimits {
+                    max_tokens: Some(12_000),
+                    max_context_tokens: Some(4_096),
+                    ..BudgetLimits::default()
+                },
+            )
+            .map_err(|error| format!("demo specialist budget failed: {error}"))?;
+    }
+
+    service
+        .select_model(
+            run_id,
+            auth.id,
+            ModelRef::new("mock", "strong-reasoner-v1", ModelClass::Strong),
+        )
+        .map_err(|error| format!("demo model switch failed: {error}"))?;
+    service
+        .select_model(run_id, db.id, db.model.clone())
+        .map_err(|error| format!("demo database model assignment failed: {error}"))?;
+    service
+        .select_model(run_id, sec.id, sec.model.clone())
+        .map_err(|error| format!("demo security model assignment failed: {error}"))?;
+    service
+        .record_agent_usage(
+            run_id,
+            auth.id,
+            orynth_scheduler::BudgetUsage {
+                tokens: 2_340,
+                context_tokens: 640,
+                ..orynth_scheduler::BudgetUsage::default()
+            },
+        )
+        .map_err(|error| format!("demo usage failed: {error}"))?;
+    service
+        .claim_ownership(run_id, auth.id, "src/auth")
+        .map_err(|error| format!("demo ownership failed: {error}"))?;
+    service
+        .grant_capability(
+            run_id,
+            CapabilityLease {
+                agent_id: auth.id,
+                task_id: Some(task.id),
+                domain: CapabilityDomain::Filesystem,
+                resource: "src/auth".to_owned(),
+                expires_at_ms: u128::MAX,
+            },
+        )
+        .map_err(|error| format!("demo capability failed: {error}"))?;
+
+    let mut context = ContextGraph::new();
+    let publication = context
+        .publish(ContextDraft::new(
+            "auth.schema",
+            ContextKind::Contract,
+            ContextOwner::Agent(auth.id),
+            ContextScope::Private(auth.id),
+            "users.id must remain UUID during the migration.",
+        ))
+        .map_err(|error| format!("demo context failed: {error}"))?;
+    let context_events = ContextEventLog::from_transitions(publication.transitions)
+        .to_events(run_id)
+        .map_err(|error| format!("demo context encoding failed: {error}"))?;
+    service
+        .event_store_mut()
+        .append_batch(&context_events)
+        .map_err(|error| format!("demo context persistence failed: {error}"))?;
+
+    service
+        .publish_assumption(Assumption::new(
+            run_id,
+            auth.id,
+            "users.id",
+            "UUID",
+            "authentication tokens encode the identifier as UUID",
+        ))
+        .map_err(|error| format!("demo first assumption failed: {error}"))?;
+    service
+        .publish_assumption(Assumption::new(
+            run_id,
+            db.id,
+            "users.id",
+            "BIGINT",
+            "legacy database schema uses numeric identifiers",
+        ))
+        .map_err(|error| format!("demo conflict assumption failed: {error}"))?;
+    service
+        .record_health_signal(run_id, auth.id, HealthSignal::AssumptionConflict)
+        .map_err(|error| format!("demo health signal failed: {error}"))?;
+
+    service
+        .send_message(
+            IpcEnvelope::new(
+                run_id,
+                Some(task.id),
+                manager.id,
+                auth.id,
+                IpcMessage::Question {
+                    subject: "identifier migration".to_owned(),
+                    why: "confirm the conflict resolution evidence".to_owned(),
+                },
+            )
+            .with_provenance(IpcProvenance::Runtime),
+        )
+        .map_err(|error| format!("demo IPC failed: {error}"))?;
+
+    let mut input = BTreeMap::new();
+    input.insert("path".to_owned(), "src/auth/schema.rs".to_owned());
+    let transaction_id = ToolTransactionId::from_u64(0xD3E0_0200);
+    let proposal = orynth_tool_runtime::ToolProposal {
+        run_id,
+        task_id: Some(task.id),
+        agent_id: auth.id,
+        tool_name: "filesystem.inspect".to_owned(),
+        input,
+        provenance: ToolProvenance::Agent,
+        input_origins: vec![TrustOrigin::Generated],
+    };
+    service
+        .record_tool_transition(
+            run_id,
+            ToolTransition::Proposed {
+                transaction_id,
+                proposal,
+                state: ToolState::AwaitingApproval,
+            },
+        )
+        .map_err(|error| format!("demo tool proposal failed: {error}"))?;
+    service
+        .record_tool_transition(
+            run_id,
+            ToolTransition::StateChanged {
+                transaction_id,
+                state: ToolState::Verified,
+                detail: Some("read-only schema inspection verified".to_owned()),
+            },
+        )
+        .map_err(|error| format!("demo tool verification failed: {error}"))?;
+    service
+        .event_store_mut()
+        .append(Event::new(
+            run_id,
+            EventKind::CacheObserved {
+                provider: "mock".to_owned(),
+                model: "strong-reasoner-v1".to_owned(),
+                prefix_hash: [7; 32],
+                estimated_prefix_tokens: 640,
+                cached_input_tokens: 512,
+            },
+        ))
+        .map_err(|error| format!("demo cache observation failed: {error}"))?;
+    service
+        .pause_agent(run_id, sec.id)
+        .map_err(|error| format!("demo pause failed: {error}"))?;
+
+    let recovered = service
+        .recover(run_id)
+        .map_err(|error| format!("demo recovery failed: {error}"))?;
+    Ok(TuiSnapshot {
+        selected: Some(recovered),
+        runs: vec![RunSummary {
+            run_id,
+            status: "ACTIVE".to_owned(),
+            event_count: service
+                .event_store()
+                .events(run_id)
+                .map_err(|error| format!("demo event count failed: {error}"))?
+                .len(),
+        }],
+    })
+}
+
+fn demo_agent(id: u64, name: &str, mission: &str, model: &str, class: ModelClass) -> AgentIdentity {
+    let mut agent = AgentIdentity::new("demo", mission, ModelRef::new("mock", model, class));
+    agent.id = AgentId::from_u64(id);
+    agent.name = name.to_owned();
+    agent
 }
 
 pub fn inspect(database: PathBuf, run: u64) -> Result<String, String> {
@@ -633,6 +1133,54 @@ mod tests {
                 run: 1,
             })
         );
+        assert_eq!(
+            parse_args(["tui", "--demo"]),
+            Ok(Command::Tui {
+                database: PathBuf::from(".orynth/runtime.db"),
+                run: None,
+                demo: true,
+            })
+        );
+    }
+
+    #[test]
+    fn demo_builds_a_real_runtime_snapshot() {
+        let snapshot = demo_snapshot().expect("demo runtime should recover");
+        let recovered = snapshot.selected.expect("demo should select its run");
+        assert!(recovered.events.len() > 10);
+        assert_eq!(recovered.manager.agents.len(), 4);
+        assert_eq!(recovered.assumptions.conflicts().len(), 1);
+        assert_eq!(recovered.messages.len(), 3);
+        assert_eq!(recovered.tools.records().len(), 1);
+        assert!(recovered.context.block_count() > 0);
+    }
+
+    #[test]
+    fn tui_source_lists_and_recovers_a_persisted_run() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("orynth-tui-source-{suffix}.db"));
+        let run_id = RunId::from_u64(701);
+        let mut store = SqliteEventStore::open(&path).expect("SQLite store should open");
+        store
+            .append(Event::new(run_id, EventKind::RunCreated { run_id }))
+            .expect("run event should append");
+        drop(store);
+        let mut source = DbTuiSource::new(path.clone(), None);
+        let catalog = source.snapshot().expect("catalog should recover");
+        assert!(catalog.selected.is_none());
+        assert_eq!(catalog.runs[0].run_id, run_id);
+        source.select_run(run_id).expect("run should select");
+        let selected = source.snapshot().expect("selected run should recover");
+        assert_eq!(selected.selected.expect("selected run").run_id, run_id);
+        let older = source
+            .event_page(Some(2), 16)
+            .expect("older event page should load");
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].event.run_id, run_id);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

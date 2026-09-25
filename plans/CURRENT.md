@@ -236,5 +236,49 @@ workspace check, Clippy, release build, and the focused executable suites
 that the host policy allowed all pass. The exact all-features workspace test
 gate is ENVIRONMENT-BLOCKED by Windows Application Control (OS error 4551)
 for generated test binaries; this is recorded in the remediation matrix.
-Do not begin Phase D from this plan. Further work requires a separately
-authorized phase.
+## Phase D: provider, persistence, and release-hardening remediation - complete
+
+Phase D addressed ORY-AUDIT-026 through ORY-AUDIT-032 without beginning the
+benchmark/fuzzing phase. The completed work strengthens the provider-neutral typed
+contract and deterministic mock, makes filesystem metadata replacement and
+sidecar layout recoverable, keeps fork schema tags truthful, unifies durable
+frame limits, aligns CI/status claims with evidence, and bounds obvious inline
+payload/output retention.
+
+The benchmark/hardening phase was intentionally deferred during Phase D and
+was completed in Phase E. One directly related opaque-fork-tag finding was
+discovered during the final adversarial pass, fixed, and recorded as
+NEW-AUDIT-D-001.
+
+## Phase E: benchmark and hardening - complete
+
+Implemented `crates/benchmarks` as a dependency-light reproducible harness
+with release startup, memory, context, event-store, SQLite, reconstruction,
+snapshot, IPC, assumptions, tool, and stress scenarios. Added deterministic
+fault smoke, malformed-input smoke, focused fuzz-target scaffolding, and raw
+TSV/text evidence under `benchmarks/results/`. A measured conflict-heavy
+assumption bottleneck was reduced with a subject index; the before/after
+measurement and limitations are recorded in `docs/BENCHMARK_RESULTS.md`.
+
+Updated `docs/HARDENING.md` and the audit remediation with fault, fuzz,
+security, resource-boundary, and cross-platform evidence. Full cargo-fuzz is
+not installed on the current host, and Windows Application Control blocked
+some newly generated executables; these remain explicitly environment-blocked.
+
+## Phase F: full-screen TUI/runtime debugger - complete
+
+Implemented the projection-backed full-screen runtime debugger in
+`orynth-tui` and the `orynth tui` command. The client provides dashboard,
+agent, event/detail, context, IPC, tools, policy, assumptions, runs, and help
+views; keyboard navigation/filtering/refresh; explicit empty/error/small
+terminal states; SQLite run selection; bounded older event pages; and RAII
+terminal restoration. The deterministic offline demo generates real runtime
+events for agents, models, context, IPC, conflicts, health, budgets,
+ownership, capability, cache, and tool transitions.
+
+Focused TUI/runtime tests, workspace check, warnings-denied all-targets and
+all-features Clippy, workspace all-features tests, formatter check, and
+release build passed. Release working-set samples and known limits are in
+`docs/TUI_IMPLEMENTATION_REPORT.md` and `docs/BENCHMARK_RESULTS.md`.
+
+Next phase: Deep Audit #2. It has not started.

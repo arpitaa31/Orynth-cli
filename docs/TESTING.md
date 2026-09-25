@@ -74,17 +74,25 @@ filesystem/network sandboxing,
 broader bidirectional session behavior, and unrestricted/implicit activation,
 full WASI/broader effectful host imports, or preemptive WASM wall-time interruption.
 
-Current evidence is 47 event-store tests, 32 runtime tests, 6 specialist tests, 3 failure-memory
+Current evidence includes provider-contract and persistence-hardening tests in
+addition to the existing 47 event-store tests, 32 runtime tests, 6 specialist tests, 3 failure-memory
 tests, 12 scheduler tests, 11 tool-runtime
 tests, 12 terminal-tools tests, 14 CLI tests, 16 context tests, 4 cache
 tests, 6 IPC tests, 6 assumption tests, 3 security tests, 4 plugin-api tests,
 5 process-plugin library tests plus 4 command-host integration tests, 14 MCP
 session/adapter/stdio/HTTP tests, 4 plugin-discovery tests, 10 WASM adapter tests, 4 plugin-host
-tests, 2 A2A adapter tests, 4 TUI tests, 6 operator-app tests, and the existing
+tests, 2 A2A adapter tests, 8 TUI tests, 8 operator-app tests, and the existing
 foundation/agent/provider suites.
-Workspace formatting, check, Clippy, and the full workspace test suite are
-acceptance gates; the current full run passes, including command-host
-integration and doc tests.
+Workspace formatting, check, Clippy, release build, and the all-features
+workspace test suite are acceptance gates in CI. Local validation may be
+`ENVIRONMENT-BLOCKED` when Windows Application Control prevents a generated
+test binary from launching; such runs are not reported as passes.
+
+Phase E adds the release benchmark/fault commands documented in
+`docs/BENCHMARK_RESULTS.md` and `docs/HARDENING.md`. The local bounded fuzz
+smoke passed with 30,000 malformed decoder cases and zero observed panics;
+full `cargo fuzz` is unavailable on this host. Benchmark executable launches
+that Windows Application Control blocks are recorded as environment limits.
 
 The shared kernel/security trust taxonomy, expanded IPC provenance, context
 trust closure, and assumption-origin persistence are now covered. Remaining

@@ -6,9 +6,9 @@ use super::durable::{decode_event, encode_event};
 use super::{
     AgentState, AgentStatus, ArtifactError, ArtifactRef, ArtifactStore, BranchId, BranchMetadata,
     BranchStore, ContentHash, ContentHasher, DeterministicContentHasher, Event, EventKind,
-    EventStore, InMemoryEventStore, RecordedReplay, ReplayMode, RunId, RunStatus, RuntimeSnapshot,
-    RuntimeState, Sequence, SnapshotStore, StoreError, StoredArtifact, StoredEvent, TaskState,
-    TaskStatus, validate_snapshot,
+    EventStore, InMemoryEventStore, MAX_ARTIFACT_BYTES, RecordedReplay, ReplayMode, RunId,
+    RunStatus, RuntimeSnapshot, RuntimeState, Sequence, SnapshotStore, StoreError, StoredArtifact,
+    StoredEvent, TaskState, TaskStatus, validate_snapshot,
 };
 use orynth_kernel::{AgentId, AgentIdentity, ModelClass, ModelRef, TaskId, TrustOrigin, Usage};
 
@@ -102,6 +102,26 @@ impl SqliteEventStore {
             )
             .map_err(database_error)?;
         u64::try_from(count).map_err(|_| StoreError::Corrupt("negative event count".to_string()))
+    }
+
+    /// Return persisted run identities for operator-facing run selection.
+    pub fn run_ids(&self) -> Result<Vec<RunId>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT run_id FROM events ORDER BY run_id")
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(database_error)?;
+        rows.map(|row| {
+            let value = row.map_err(database_error)?;
+            let number = value
+                .strip_prefix("run-")
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                .ok_or_else(|| StoreError::Corrupt(format!("invalid persisted run ID {value}")))?;
+            Ok(RunId::from_u64(number))
+        })
+        .collect()
     }
 
     pub fn append_trace(
@@ -491,6 +511,12 @@ impl ArtifactStore for SqliteArtifactStore {
     ) -> Result<ArtifactRef, ArtifactError> {
         if media_type.trim().is_empty() {
             return Err(ArtifactError::InvalidMediaType);
+        }
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(ArtifactError::TooLarge {
+                actual: bytes.len(),
+                maximum: MAX_ARTIFACT_BYTES,
+            });
         }
 
         let content_hash = DeterministicContentHasher.hash(&bytes);

@@ -4,7 +4,10 @@
 //! detects normalized contradictions; semantic or fuzzy interpretation remains
 //! outside the deterministic kernel boundary.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use orynth_kernel::{AgentId, AssumptionId, ConflictId, Event, RunId, TrustOrigin};
 
@@ -177,6 +180,7 @@ pub struct AssumptionPublication {
 pub struct AssumptionGraph {
     assumptions: BTreeMap<AssumptionId, Assumption>,
     conflicts: BTreeMap<ConflictId, AssumptionConflict>,
+    subject_index: BTreeMap<String, BTreeSet<AssumptionId>>,
 }
 
 impl AssumptionGraph {
@@ -205,11 +209,13 @@ impl AssumptionGraph {
         }
 
         let conflicting = self
-            .assumptions
-            .values()
+            .subject_index
+            .get(&assumption.subject)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| self.assumptions.get(id))
             .filter(|existing| {
-                existing.subject == assumption.subject
-                    && existing.normalized_value != assumption.normalized_value
+                existing.normalized_value != assumption.normalized_value
                     && matches!(
                         existing.state,
                         AssumptionState::Active | AssumptionState::Conflicted
@@ -223,6 +229,10 @@ impl AssumptionGraph {
             assumption.state = AssumptionState::Conflicted;
         }
         self.assumptions.insert(assumption.id, assumption.clone());
+        self.subject_index
+            .entry(assumption.subject.clone())
+            .or_default()
+            .insert(assumption.id);
         transitions.push(AssumptionTransition::Created {
             assumption: assumption.clone(),
         });
@@ -273,13 +283,14 @@ impl AssumptionGraph {
                         assumption_id: assumption.id,
                     });
                 }
-                if self
-                    .assumptions
-                    .insert(assumption.id, assumption.clone())
-                    .is_some()
-                {
+                if self.assumptions.contains_key(&assumption.id) {
                     return Err(AssumptionError::Duplicate(assumption.id));
                 }
+                self.assumptions.insert(assumption.id, assumption.clone());
+                self.subject_index
+                    .entry(assumption.subject.clone())
+                    .or_default()
+                    .insert(assumption.id);
             }
             AssumptionTransition::StateChanged {
                 assumption_id,

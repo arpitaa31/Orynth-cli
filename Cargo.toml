@@ -25,6 +25,7 @@ members = [
     "crates/terminal-tools",
     "crates/cli",
     "crates/tui",
+    "crates/benchmarks",
     "apps/orynth",
     "apps/orynth-shell",
 ]

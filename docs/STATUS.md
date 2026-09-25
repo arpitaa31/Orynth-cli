@@ -1,10 +1,10 @@
 # Status
 
 Project: Orynth
-Stage: Phase 8 - projection-backed runtime inspection
+Stage: Phase F - full-screen TUI/runtime debugger complete
 Blueprint: SUPPLIED IN CURRENT RESEARCH BRIEF
-Implementation: Phase 2 runtime core hardened; Phase 3 context slice complete; Phase 4A/4B plus budget/health projections complete; Phase 5 security/tools slice complete; Phase 6 plugin/protocol contracts active; Phase 7 terminal planning and rooted execution active; Phase 8 inspector slice active
-Current Phase: 8 - TUI/debugger
+Implementation: Phase 2 runtime core hardened; Phase 3 context slice complete; Phase 4A/4B plus budget/health projections complete; Phase 5 security/tools slice complete; Phase 6 plugin/protocol contracts active; Phase 7 terminal planning and rooted execution active; Phase 8 inspector slice complete; Phase D provider/persistence hardening complete; Phase E benchmark and hardening complete; Phase F full-screen TUI/runtime debugger complete
+Current Phase: Phase F - full-screen TUI/runtime debugger complete; next Deep Audit #2
 
 Phase A audit remediation: ORY-AUDIT-001 through ORY-AUDIT-005 have been
 addressed in the current worktree with focused regression coverage. The
@@ -278,17 +278,21 @@ Evidence:
 - six assumption tests pass for normalized conflict detection, equal-value
   handling, trust-origin combination, persisted trust-upgrade rejection,
   legacy decoding, transition replay, and malformed/versioned payload rejection;
-- four plugin-api tests, five process-plugin library tests, fourteen MCP session/adapter/stdio/HTTP tests,
-  four plugin-discovery tests, ten WASM adapter tests, four plugin-host
-  tests, and two A2A adapter tests pass for bounded contracts, protocol validation, progressive and
-  manifest discovery, resource admission, untrusted output provenance,
-  host-owned tool policy, remote IPC mapping, and real command-host launch,
-  crash, and timeout behavior;
+- four plugin-api tests, five process-plugin library tests, fourteen MCP
+  session/adapter/stdio/HTTP tests, four plugin-discovery tests, ten WASM
+  adapter tests, four plugin-host tests, and two A2A adapter tests were
+  covered by prior focused validation. In the current host, plugin-discovery
+  and MCP stdio test binaries are ENVIRONMENT-BLOCKED by Windows Application
+  Control (OS error 4551); successful focused suites cover bounded contracts,
+  protocol validation, progressive and manifest discovery, resource
+  admission, untrusted output provenance, host-owned tool policy, remote IPC
+  mapping, and real command-host launch/crash/timeout behavior;
 - six specialist tests pass for bounded profile codecs, duplicate/invalid
-  profile rejection, and replay; four TUI tests pass for projection rendering, model-change and failure-memory
+  profile rejection, and replay; eight TUI tests pass for projection rendering, model-change, failure-memory, and terminal safety
   breakpoint scanning, and bounded pane/item navigation;
-- cargo fmt, cargo check, cargo clippy, and the full workspace test suite pass;
-  the full run includes all library, command-host integration, and doc tests.
+- cargo fmt, cargo check, and cargo clippy pass. The exact all-features
+  workspace test suite is ENVIRONMENT-BLOCKED when Windows Application Control
+  launches generated test binaries; it is not reported as a full-suite pass.
 - `cargo build --release --workspace` was previously blocked by Windows
   Application Control with OS error 4551 during an earlier Phase A attempt;
   the final Phase B release validation now passes.
@@ -304,12 +308,61 @@ Next gate:
 
 Audit gate:
 - Phase A and Phase B remediation are complete for the scoped findings.
-- Final Phase B validation passes: format check, workspace check, Clippy with
-  warnings denied, all-features workspace tests, and release workspace build.
+- Phase B implementation gates pass locally; the all-features workspace test
+  command remains host-policy dependent as recorded below.
 - Phase C remediation is complete: 7/7 scoped findings pass the Phase C gate.
 - `cargo fmt --all -- --check`, workspace check, Clippy with warnings denied,
   and release workspace build pass. The exact all-features workspace test
   command is ENVIRONMENT-BLOCKED when Windows Application Control launches
   generated test binaries (OS error 4551); focused executable suites that
   launch successfully pass.
-- Do not begin Phase D from this handoff.
+- Phase D remediation is complete for ORY-AUDIT-026 through ORY-AUDIT-032.
+- Phase E benchmark/hardening is complete with measured evidence and explicit
+  limitations in `docs/BENCHMARK_RESULTS.md` and `docs/HARDENING.md`.
+
+Phase D includes a typed provider contract with capability negotiation,
+recoverable explicit filesystem metadata generations, safe sidecar naming,
+truthful fork schema tags, shared frame limits, and bounded inline
+artifact/provider-output retention. Phase E measured the local deterministic
+startup/RSS/throughput paths and exercised bounded fault and malformed-input
+smoke. Phase F adds the full-screen projection-backed TUI, deterministic
+offline runtime demo, SQLite run selection and event paging, terminal cleanup,
+and release working-set measurements. Real network providers, full
+cargo-fuzz, and hosted cross-platform execution remain unmeasured.
+The final adversarial pass found and fixed NEW-AUDIT-D-001, an opaque fork
+fallback that could have retained a legacy payload under a current tag.
+
+## Phase F: full-screen TUI/runtime debugger - complete
+
+`orynth tui --demo` now launches the deterministic offline control-room demo;
+`orynth tui --db <path> [--run <id>]` inspects persisted SQLite runs. Views
+cover dashboard/agent tree, events and bounded older-page navigation, context,
+IPC, tools, permissions/ownership/budgets, assumptions/conflicts, persisted
+runs, and help. The client uses `RecoveredRun` and visibility-scoped context
+projection data, has explicit empty/error/small-terminal states, and restores
+terminal state through an RAII guard. It exposes no live mutation controls.
+
+Focused and workspace all-features tests, formatting, workspace check,
+warnings-denied Clippy, and release build passed. Release working-set samples
+were 6,920 KiB empty, 6,944 KiB for the four-agent demo, and 7,064 KiB for
+the ten-agent demo. Details, commands, and limitations are in
+`docs/TUI_IMPLEMENTATION_REPORT.md`.
+
+The next planned activity is Deep Audit #2; it has not started in Phase F.
+
+## Phase E: benchmark and hardening - complete
+
+The reproducible `orynth-bench` harness now records release startup, bounded
+logical-agent working-set scenarios, context, event-store append, SQLite
+growth samples, reconstruction, snapshots, IPC, assumptions, tools, stress,
+fault smoke, and malformed-input smoke. The measured assumption hotspot was
+optimized with a subject index; its 10k conflict-heavy median fell 26.4%.
+Exact measurements and limitations are in `docs/BENCHMARK_RESULTS.md`; fault,
+fuzz, stress, security, and cross-platform status is in `docs/HARDENING.md`.
+
+Phase E does not claim TUI idle RSS, real provider/plugin process memory,
+Linux/macOS execution, full cargo-fuzz campaigns, or sustained multi-hour
+stress. Windows Application Control OS error 4551 blocked the freshly rebuilt
+benchmark executable and some generated test binaries; those cases remain
+ENVIRONMENT-BLOCKED. The next phase is the full TUI/runtime debugger. No TUI
+implementation was started in Phase E.

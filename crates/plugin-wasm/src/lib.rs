@@ -1038,4 +1038,33 @@ mod tests {
         assert_eq!(response.origin, TrustOrigin::External);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn discovered_wasm_activation_rejects_a_very_large_module_before_loading() {
+        let root = std::env::temp_dir().join(format!("orynth-wasm-oversized-{}", PluginId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let module_path = root.join("module.wasm");
+        fs::write(&module_path, vec![0u8; MAX_WASM_MODULE_BYTES + 1024]).unwrap();
+        fs::write(
+            root.join("orynth-plugin.manifest"),
+            format!(
+                "protocol_version=1\nid=12\nname=wasm.oversized\nversion=1\nkind=wasm\nentrypoint={}\ncapability=filesystem:workspace\nmax_message_bytes=128\nmax_memory_bytes=65536\nmax_fuel=10000\nmax_wall_time_ms=1000\n",
+                module_path.display()
+            ),
+        )
+        .unwrap();
+        let candidate = orynth_plugin_discovery::discover_directories(
+            &[PathBuf::from(&root)],
+            &Default::default(),
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+
+        assert!(matches!(
+            activate_discovered_wasm(&candidate),
+            Err(PluginError::Protocol(message)) if message.contains("too large")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

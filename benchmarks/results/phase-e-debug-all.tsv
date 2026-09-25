@@ -1,0 +1,31 @@
+area	scenario	size	samples	median_us	p95_us	rss_before_kib	rss_after_kib	operations	notes
+startup	release-cli-help	1	1	12204	12204	NA	NA	1	binary=.\target\release\orynth.exe
+context	publish-project-search-render	100	1	1407	1407	5208	5820	100	independent blocks; 64-block prompt; bounded projection/search
+context	publish-project-search-render	1000	1	6945	6945	5892	6044	1000	independent blocks; 64-block prompt; bounded projection/search
+context	publish-project-search-render	10000	1	75706	75706	6112	6880	10000	independent blocks; 64-block prompt; bounded projection/search
+event-store	memory-append	1000	1	838	838	7184	7336	1000	2,048-event batches
+event-store	sqlite-append	1000	1	33592	33592	7344	8676	1000	synchronous SQLite; bytes=266240
+event-store	memory-append	10000	1	14066	14066	9556	9628	10000	2,048-event batches
+event-store	sqlite-append	10000	1	248451	248451	9636	9960	10000	synchronous SQLite; bytes=2256896
+replay	in-memory-reconstruction	1000	1	236	236	8960	8528	1000	fresh state reconstruction; correctness checked by event count
+replay	snapshot-save-load	1000	1	902	902	8540	8656	1000	snapshot correctness verified by sequence
+replay	in-memory-reconstruction	10000	1	3082	3082	12196	12052	10000	fresh state reconstruction; correctness checked by event count
+replay	snapshot-save-load	10000	1	9221	9221	12072	12064	10000	snapshot correctness verified by sequence
+replay	in-memory-reconstruction	50000	1	11859	11859	26608	27344	50000	fresh state reconstruction; correctness checked by event count
+replay	snapshot-save-load	50000	1	74173	74173	27412	26496	50000	snapshot correctness verified by sequence
+ipc	bounded-mailbox-roundtrip	100	1	102	102	8580	8644	100	one bounded mailbox; no unbounded queue growth
+ipc	bounded-mailbox-roundtrip	1000	1	305	305	8652	8876	1000	one bounded mailbox; no unbounded queue growth
+ipc	bounded-mailbox-roundtrip	10000	1	5427	5427	8876	8884	10000	one bounded mailbox; no unbounded queue growth
+assumptions	insert-deterministic-conflicts	100	1	983	983	8892	8624	100	32 normalized subjects; conflicts are deterministic
+assumptions	insert-deterministic-conflicts	1000	1	93350	93350	8668	9428	1000	32 normalized subjects; conflicts are deterministic
+assumptions	insert-deterministic-conflicts	10000	1	8633162	8633162	9440	11384	10000	32 normalized subjects; conflicts are deterministic
+tool-runtime	proposal-repair-validation	1	1	310	310	11460	11592	1	safe deterministic proposal path; no external effects
+stress	long-event-run	1000	1	1316	1316	11592	11636	1000	append, reconstruction, correctness checked
+stress	context-churn-publish	1000	1	11999	11999	11636	11656	1000	fresh graph per sample; bounded block payloads
+stress	agent-churn-create-reconstruct	1000	1	3911	3911	11656	11612	1000	fresh agent identities; append and reconstruct per sample
+stress	long-event-run	10000	1	27345	27345	11612	11204	10000	append, reconstruction, correctness checked
+stress	context-churn-publish	10000	1	156882	156882	11204	12140	10000	fresh graph per sample; bounded block payloads
+stress	agent-churn-create-reconstruct	10000	1	76955	76955	12140	12648	10000	fresh agent identities; append and reconstruct per sample
+stress	long-event-run	50000	1	329195	329195	12648	11984	50000	append, reconstruction, correctness checked
+stress	context-churn-publish	50000	1	768554	768554	11984	12092	50000	fresh graph per sample; bounded block payloads
+stress	agent-churn-create-reconstruct	50000	1	895708	895708	12100	11904	50000	fresh agent identities; append and reconstruct per sample

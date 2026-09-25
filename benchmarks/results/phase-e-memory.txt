@@ -1,0 +1,3 @@
+MEMORY	agents=1	rss_before_kib=4932	rss_after_kib=5300	events=3	context_blocks=1
+MEMORY	agents=4	rss_before_kib=4928	rss_after_kib=5332	events=9	context_blocks=4
+MEMORY	agents=10	rss_before_kib=4940	rss_after_kib=5408	events=21	context_blocks=10

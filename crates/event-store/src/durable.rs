@@ -3,6 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::sqlite::{decode_snapshot_state, encode_snapshot_state};
@@ -21,6 +22,7 @@ const MAX_BATCH_EVENTS: usize = 4096;
 const BATCH_BEGIN: u8 = 1;
 const BATCH_EVENT: u8 = 2;
 const BATCH_COMMIT: u8 = 3;
+static METADATA_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 type FileMetadata = (
     BTreeMap<BranchId, BranchMetadata>,
@@ -100,7 +102,8 @@ impl FileEventStore {
         }
 
         let metadata_path = metadata_path(&path);
-        let (branches, snapshots) = load_metadata(&metadata_path, &memory)?;
+        let legacy_metadata_path = legacy_metadata_path(&path);
+        let (branches, snapshots) = load_metadata(&metadata_path, &legacy_metadata_path, &memory)?;
 
         Ok(Self {
             path,
@@ -515,17 +518,138 @@ impl SnapshotStore for FileEventStore {
 }
 
 fn metadata_path(event_path: &Path) -> PathBuf {
-    event_path.with_extension("meta")
+    sibling_path(event_path, "meta")
 }
 
 fn lock_path(event_path: &Path) -> PathBuf {
+    // Preserve the established lock identity for existing stores. The Phase D
+    // collision fix is specifically for metadata sidecars; changing the lock
+    // name would allow an old and new process to bypass one another's lock.
     event_path.with_extension("lock")
 }
 
-fn load_metadata(path: &Path, events: &InMemoryEventStore) -> Result<FileMetadata, StoreError> {
-    if !path.exists() {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
+fn sibling_path(event_path: &Path, suffix: &str) -> PathBuf {
+    let parent = event_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = event_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("events");
+    parent.join(format!("{name}.{suffix}"))
+}
+
+fn legacy_metadata_path(event_path: &Path) -> PathBuf {
+    event_path.with_extension("meta")
+}
+
+fn metadata_backup_path(path: &Path) -> PathBuf {
+    sibling_path(path, "bak")
+}
+
+fn metadata_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("metadata");
+    let counter = METADATA_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{name}.tmp.{}.{}", std::process::id(), counter))
+}
+
+fn metadata_temp_candidates(path: &Path) -> Result<Vec<PathBuf>, StoreError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("metadata");
+    let prefix = format!("{name}.tmp.");
+    let mut candidates = fs::read_dir(parent)
+        .map_err(storage_error)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|candidate| {
+            candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    Ok(candidates)
+}
+
+fn remove_metadata_temps(path: &Path) -> Result<(), StoreError> {
+    for candidate in metadata_temp_candidates(path)? {
+        if candidate != path {
+            fs::remove_file(candidate).map_err(storage_error)?;
+        }
     }
+    Ok(())
+}
+
+fn load_metadata(
+    path: &Path,
+    legacy_path: &Path,
+    events: &InMemoryEventStore,
+) -> Result<FileMetadata, StoreError> {
+    let backup = metadata_backup_path(path);
+    if !path.exists() && backup.exists() {
+        fs::rename(&backup, path).map_err(storage_error)?;
+        sync_parent(path)?;
+    }
+
+    if !path.exists() && !backup.exists() {
+        for candidate in metadata_temp_candidates(path)? {
+            if read_metadata_file(&candidate, events).is_ok() {
+                fs::rename(&candidate, path).map_err(storage_error)?;
+                sync_parent(path)?;
+                break;
+            }
+        }
+    }
+
+    let primary = if path.exists() {
+        Some(read_metadata_file(path, events))
+    } else {
+        None
+    };
+    match primary {
+        Some(Ok(metadata)) => {
+            if backup.exists() {
+                fs::remove_file(&backup).map_err(storage_error)?;
+                sync_parent(path)?;
+            }
+            remove_metadata_temps(path)?;
+            return Ok(metadata);
+        }
+        Some(Err(primary_error)) if backup.exists() => {
+            let backup_metadata = read_metadata_file(&backup, events);
+            if let Ok(metadata) = backup_metadata {
+                fs::remove_file(path).map_err(storage_error)?;
+                fs::rename(&backup, path).map_err(storage_error)?;
+                sync_parent(path)?;
+                remove_metadata_temps(path)?;
+                return Ok(metadata);
+            }
+            return Err(primary_error);
+        }
+        Some(Err(error)) => return Err(error),
+        None => {}
+    }
+
+    // A legacy sidecar is accepted only when it cannot be the event file
+    // itself. It is copied into the explicit layout on successful recovery.
+    if legacy_path != path && legacy_path.exists() {
+        let metadata = read_metadata_file(legacy_path, events)?;
+        persist_metadata(path, &metadata.0, &metadata.1)?;
+        return Ok(metadata);
+    }
+    remove_metadata_temps(path)?;
+    Ok((BTreeMap::new(), BTreeMap::new()))
+}
+
+fn read_metadata_file(
+    path: &Path,
+    events: &InMemoryEventStore,
+) -> Result<FileMetadata, StoreError> {
     let bytes = fs::read(path).map_err(storage_error)?;
     if !bytes.starts_with(METADATA_MAGIC) {
         return Err(StoreError::Corrupt(
@@ -635,7 +759,8 @@ fn persist_metadata(
         append_metadata_frame(&mut bytes, 2, &payload)?;
     }
 
-    let temporary = path.with_extension("meta.tmp");
+    let temporary = metadata_temp_path(path);
+    let backup = metadata_backup_path(path);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -645,20 +770,61 @@ fn persist_metadata(
     file.write_all(&bytes).map_err(storage_error)?;
     file.flush().map_err(storage_error)?;
     file.sync_all().map_err(storage_error)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(storage_error)?;
+
+    // Keep the previous generation recoverable while installing the new one.
+    // This two-rename protocol works on both Unix and Windows: a crash before
+    // the second rename leaves the old generation in `.bak`, while a crash
+    // after it leaves a complete new generation plus a removable backup.
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(storage_error)?;
     }
-    fs::rename(temporary, path).map_err(storage_error)?;
+    if path.exists() {
+        fs::rename(path, &backup).map_err(storage_error)?;
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        if backup.exists() && !path.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(storage_error(error));
+    }
+    sync_parent(path)?;
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(storage_error)?;
+        sync_parent(path)?;
+    }
     Ok(())
 }
 
 fn append_metadata_frame(bytes: &mut Vec<u8>, kind: u8, payload: &[u8]) -> Result<(), StoreError> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(StoreError::Storage(format!(
+            "metadata payload exceeds maximum frame size: {} bytes",
+            payload.len()
+        )));
+    }
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| StoreError::Storage("metadata payload exceeds u32::MAX".to_string()))?;
     bytes.push(kind);
     bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(payload);
     bytes.extend_from_slice(&DeterministicContentHasher.hash(payload).as_bytes());
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<(), StoreError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(unix)]
+    {
+        File::open(parent)
+            .map_err(storage_error)?
+            .sync_all()
+            .map_err(storage_error)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
     Ok(())
 }
 
@@ -777,6 +943,12 @@ impl<H: ContentHasher> ArtifactStore for FileArtifactStore<H> {
     ) -> Result<ArtifactRef, ArtifactError> {
         if media_type.trim().is_empty() {
             return Err(ArtifactError::InvalidMediaType);
+        }
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(ArtifactError::TooLarge {
+                actual: bytes.len(),
+                maximum: MAX_ARTIFACT_BYTES,
+            });
         }
 
         let content_hash = self.hasher.hash(&bytes);
@@ -1875,6 +2047,160 @@ mod tests {
     }
 
     #[test]
+    fn explicit_sidecar_layout_never_collides_with_a_meta_event_filename() {
+        let path = temp_path("events.meta");
+        let trace = successful_trace();
+        let run_id = run_id(&trace);
+        let branch;
+        {
+            let mut store = FileEventStore::open(&path).expect("event store should open");
+            store.append_trace(&trace).expect("events should persist");
+            branch = store
+                .create_branch(run_id, 2, ReplayMode::ForkLive, 1)
+                .expect("branch should persist");
+        }
+        assert_ne!(metadata_path(&path), path);
+        assert!(
+            fs::read(&path)
+                .expect("event file should remain readable")
+                .starts_with(EVENT_MAGIC)
+        );
+        let reopened = FileEventStore::open(&path).expect("store should reopen");
+        assert_eq!(reopened.branch(branch.branch_id).unwrap(), Some(branch));
+        drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(metadata_path(&path));
+        let _ = fs::remove_file(lock_path(&path));
+    }
+
+    #[test]
+    fn metadata_recovers_a_valid_backup_when_the_primary_is_corrupt() {
+        let path = temp_path("metadata-backup");
+        let trace = successful_trace();
+        let run_id = run_id(&trace);
+        let branch;
+        {
+            let mut store = FileEventStore::open(&path).expect("event store should open");
+            store.append_trace(&trace).expect("events should persist");
+            branch = store
+                .create_branch(run_id, 2, ReplayMode::ForkLive, 2)
+                .expect("branch should persist");
+        }
+        let primary = metadata_path(&path);
+        let backup = metadata_backup_path(&primary);
+        fs::copy(&primary, &backup).expect("backup should be staged");
+        fs::write(&primary, b"partial metadata").expect("primary should be corrupted");
+
+        let reopened = FileEventStore::open(&path).expect("backup should recover");
+        assert_eq!(reopened.branch(branch.branch_id).unwrap(), Some(branch));
+        assert!(!backup.exists(), "recovered backup should be cleaned up");
+        drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(primary);
+        let _ = fs::remove_file(lock_path(&path));
+    }
+
+    #[test]
+    fn metadata_prefers_valid_primary_over_stale_backup_and_partial_temp() {
+        let path = temp_path("metadata-new-generation");
+        let trace = successful_trace();
+        let run_id = run_id(&trace);
+        let first_branch;
+        {
+            let mut store = FileEventStore::open(&path).expect("event store should open");
+            store.append_trace(&trace).expect("events should persist");
+            first_branch = store
+                .create_branch(run_id, 2, ReplayMode::Recorded, 6)
+                .expect("first branch should persist");
+        }
+        let primary = metadata_path(&path);
+        let stale_generation = fs::read(&primary).expect("old metadata should read");
+        let second_branch;
+        {
+            let mut store = FileEventStore::open(&path).expect("event store should reopen");
+            second_branch = store
+                .create_branch(run_id, 2, ReplayMode::ForkLive, 7)
+                .expect("second branch should persist");
+        }
+        let backup = metadata_backup_path(&primary);
+        fs::write(&backup, stale_generation).expect("stale backup should stage");
+        let temporary = metadata_temp_path(&primary);
+        fs::write(&temporary, b"partial metadata").expect("partial temp should stage");
+
+        let reopened = FileEventStore::open(&path).expect("valid primary should win");
+        assert_eq!(
+            reopened.branch(first_branch.branch_id).unwrap(),
+            Some(first_branch)
+        );
+        assert_eq!(
+            reopened.branch(second_branch.branch_id).unwrap(),
+            Some(second_branch)
+        );
+        assert!(!backup.exists(), "stale backup should be removed");
+        assert!(!temporary.exists(), "partial temp should be removed");
+        drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(primary);
+        let _ = fs::remove_file(lock_path(&path));
+    }
+
+    #[test]
+    fn metadata_recovers_a_complete_orphan_temp_file() {
+        let path = temp_path("metadata-temp");
+        let trace = successful_trace();
+        let run_id = run_id(&trace);
+        let branch;
+        {
+            let mut store = FileEventStore::open(&path).expect("event store should open");
+            store.append_trace(&trace).expect("events should persist");
+            branch = store
+                .create_branch(run_id, 2, ReplayMode::Recorded, 5)
+                .expect("branch should persist");
+        }
+        let primary = metadata_path(&path);
+        let temporary = metadata_temp_path(&primary);
+        fs::copy(&primary, &temporary).expect("temporary generation should be staged");
+        fs::remove_file(&primary).expect("primary should be absent");
+
+        let reopened = FileEventStore::open(&path).expect("orphan temp should recover");
+        assert_eq!(reopened.branch(branch.branch_id).unwrap(), Some(branch));
+        assert!(!temporary.exists(), "recovered temp should be consumed");
+        drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(primary);
+        let _ = fs::remove_file(lock_path(&path));
+    }
+
+    #[test]
+    fn legacy_metadata_sidecar_is_migrated_to_the_explicit_layout() {
+        let path = temp_path("legacy.log");
+        let trace = successful_trace();
+        let run_id = run_id(&trace);
+        let branch;
+        {
+            let mut store = FileEventStore::open(&path).expect("event store should open");
+            store.append_trace(&trace).expect("events should persist");
+            branch = store
+                .create_branch(run_id, 2, ReplayMode::Recorded, 3)
+                .expect("branch should persist");
+        }
+        let primary = metadata_path(&path);
+        let legacy = legacy_metadata_path(&path);
+        fs::rename(&primary, &legacy).expect("legacy sidecar should be staged");
+        let reopened = FileEventStore::open(&path).expect("legacy sidecar should migrate");
+        assert_eq!(reopened.branch(branch.branch_id).unwrap(), Some(branch));
+        assert!(
+            primary.exists(),
+            "migration should install the explicit sidecar"
+        );
+        drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(primary);
+        let _ = fs::remove_file(legacy);
+        let _ = fs::remove_file(lock_path(&path));
+    }
+
+    #[test]
     fn switched_model_snapshot_recovers_after_filesystem_reopen() {
         let path = temp_path("switched-model-snapshot");
         let metadata = metadata_path(&path);
@@ -2001,6 +2327,41 @@ mod tests {
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(metadata);
+    }
+
+    #[test]
+    fn event_and_metadata_frames_share_exact_boundary_limits() {
+        for size in [MAX_FRAME_BYTES - 1, MAX_FRAME_BYTES, MAX_FRAME_BYTES + 1] {
+            let payload = vec![0_u8; size];
+            let mut event_bytes = Vec::new();
+            let event_result = append_frame(&mut event_bytes, 1, &payload);
+            let mut metadata_bytes = Vec::new();
+            let metadata_result = append_metadata_frame(&mut metadata_bytes, 1, &payload);
+
+            if size <= MAX_FRAME_BYTES {
+                assert!(event_result.is_ok(), "event size {size} should be accepted");
+                assert!(
+                    metadata_result.is_ok(),
+                    "metadata size {size} should be accepted"
+                );
+                assert!(
+                    read_frame(&event_bytes, 0)
+                        .expect("legal frame should parse")
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    event_result.is_err(),
+                    "event size {size} should be rejected"
+                );
+                assert!(
+                    metadata_result.is_err(),
+                    "metadata size {size} should be rejected"
+                );
+                assert!(event_bytes.is_empty());
+                assert!(metadata_bytes.is_empty());
+            }
+        }
     }
 
     #[test]

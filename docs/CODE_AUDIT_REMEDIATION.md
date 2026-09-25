@@ -1,5 +1,33 @@
 # Orynth Audit Remediation
 
+## Phase E measurement evidence
+
+Phase E measured the bounded hot paths rather than claiming the planning
+targets from static inspection. Release evidence includes 1/4/10 logical
+waiting-agent working-set scenarios, release CLI startup, 1k/10k/50k event
+append/reconstruction and snapshot workloads, context through 10k blocks,
+SQLite file sizes, bounded IPC through 10k messages, tool validation, and
+conflict-heavy assumptions through 10k publications. The exact values and
+commands are in `docs/BENCHMARK_RESULTS.md`; raw TSV/text captures are under
+`benchmarks/results/`.
+
+The measured assumption hotspot was addressed with a subject index. The
+10,000-publication release median fell from 3,486,949 us to 2,565,214 us;
+the remaining cost is explicit conflict-record generation. This optimization
+does not change the audit status of unrelated storage limitations.
+
+`orynth-bench faults` covered five filesystem suffix truncation points plus
+malformed context/IPC/assumption inputs and an unknown tool proposal
+(`scenarios=9`, `failures=0`). The bounded smoke runner exercised 30,000
+malformed decoder cases with zero observed panics. Focused cargo-fuzz targets
+are present, but full cargo-fuzz was unavailable on the Windows host.
+
+ORY-AUDIT-032 remains `PARTIALLY FIXED`: measured hot-memory and persistence
+evidence now exists and current inline bounds are enforced, while duplicate
+transitive `base64` versions and externalized SQLite blob storage remain
+intentional limitations. TUI and cross-platform measurements are deferred to
+the next phase and are not represented as passes.
+
 ## Phase A
 
 The work below addresses the five S1 findings in `docs/CODE_AUDIT.md`. The
@@ -458,8 +486,9 @@ argv-level command profiles and production OS sandboxing remain future work.
 - Cross-cutting search covered normalization, cache ranking, unlimited budget
   transfer, health signals, lifecycle handling, direct runtime appends,
   executing tool state, and shell interpreter policy.
-- Full workspace validation and release build pass after the documentation
-  changes.
+- Focused workspace validation and release build pass after the documentation
+  changes; the current exact all-features workspace test gate is documented as
+  host-policy blocked in the Phase C and Phase D summaries.
 - No Phase C work is included or authorized by this remediation.
 
 ## Phase C
@@ -468,7 +497,7 @@ Phase C addresses ORY-AUDIT-019 through ORY-AUDIT-025. The historical audit
 file remains unchanged. Phase A and Phase B behavior and focused suites were
 preserved and rerun.
 
-### ORY-AUDIT-019
+### ORY-AUDIT-019 — Process plugin response pump uses an unbounded queue
 
 Status: FIXED
 
@@ -482,6 +511,14 @@ producers and consumers during termination. Discovery also retains only a
 bounded manifest-path list instead of materializing an entire directory
 listing.
 
+The response queue holds at most 8 frames and at most
+`min(8 * max_frame_bytes, 8 MiB)` queued payload bytes. The manifest limit
+caps `max_frame_bytes` at 1 MiB, so queued payload storage is at most 8 MiB;
+the reader may hold one additional in-progress frame of at most 1 MiB (plus
+the fixed `BufReader` buffer), for a total response-payload bound of 9 MiB.
+Overflow blocks the reader until the consumer pops data or the queue closes;
+an oversized frame is rejected before enqueueing.
+
 Files changed: `crates/plugin-process/src/lib.rs`,
 `crates/plugin-discovery/src/lib.rs`.
 
@@ -493,7 +530,7 @@ Remaining limitations: the fixed queue is an in-process backpressure boundary,
 not a child-process CPU or output-rate quota. The child can still consume its
 own resources until the session timeout or OS containment terminates it.
 
-### ORY-AUDIT-020
+### ORY-AUDIT-020 — Process plugin writes can block forever before the request timeout
 
 Status: FIXED
 
@@ -518,7 +555,7 @@ write operation independently of closing the child and its pipes; termination
 is therefore the cancellation boundary. A second in-flight write fails fast
 rather than creating another queued request.
 
-### ORY-AUDIT-021
+### ORY-AUDIT-021 — Windows process containment is attached after the child starts
 
 Status: FIXED
 
@@ -542,7 +579,7 @@ AppContainer/token/network/filesystem sandbox. Thread enumeration is kept in a
 small Win32 adapter and should receive platform-specific fault injection in a
 future hardening cycle.
 
-### ORY-AUDIT-022
+### ORY-AUDIT-022 — Plugin discovery and WASM activation read unbounded files before checking limits
 
 Status: FIXED
 
@@ -559,15 +596,15 @@ boundary.
 Files changed: `crates/plugin-discovery/src/lib.rs`,
 `crates/plugin-wasm/src/lib.rs`.
 
-Regression tests: exact-limit, below-limit, over-limit, and zero-limit bounded
-file cases; policy-preserving revalidation; existing discovery and WASM
-activation suites.
+Regression tests: exact-limit, below-limit, limit-plus-one, and zero-limit
+bounded-file cases; policy-preserving revalidation; normal WASM activation;
+and oversized-module activation rejection before module parsing.
 
 Remaining limitations: the bounded read still depends on the host filesystem
 and does not claim a race-free identity binding between metadata and later
 activation.
 
-### ORY-AUDIT-023
+### ORY-AUDIT-023 — Plugin host `max_plugins` is enforced per activation call, not cumulatively
 
 Status: FIXED
 
@@ -587,7 +624,7 @@ reuses the slot.
 Remaining limitations: activation is process-local and does not coordinate a
 limit across multiple host processes.
 
-### ORY-AUDIT-024
+### ORY-AUDIT-024 — Legacy MCP handshake accepts an unsupported server protocol version
 
 Status: FIXED
 
@@ -609,7 +646,7 @@ Remaining limitations: only the two protocol revisions currently modeled by
 Orynth are accepted; adding another revision requires an explicit mode and
 wire-contract update.
 
-### ORY-AUDIT-025
+### ORY-AUDIT-025 — A2A/IPC and ownership metadata do not enforce resource ownership across all effect paths
 
 Status: FIXED
 
@@ -667,48 +704,308 @@ required authorization.
   generated test binaries (OS error 4551), not failed by an assertion. The
   release workspace build, workspace check, formatting, and Clippy pass.
 - Architecture decisions are recorded in ADR-0063.
-- Phase D is explicitly out of scope for this cycle.
+- Phase D was explicitly out of scope for the Phase C cycle.
 
 ## New findings from Phase C
 
 ### NEW-AUDIT-C-001
 
-Severity: S2 | Confidence: HIGH | Status: FIXED
+Severity: S2
+Confidence: HIGH
+Status: FIXED
 
-Discovery materialized every directory entry before enforcing its manifest
-admission bound. Discovery now retains only candidate manifest paths and
-rejects over-limit candidate counts while scanning.
+Root cause: discovery materialized every directory entry before enforcing its
+manifest admission bound.
+
+Fix: discovery now retains only candidate manifest paths and rejects
+over-limit candidate counts while scanning.
+
+Tests: bounded discovery admission and deterministic candidate tests.
 
 ### NEW-AUDIT-C-002
 
-Severity: S2 | Confidence: HIGH | Status: FIXED
+Severity: S2
+Confidence: HIGH
+Status: FIXED
 
-Activation revalidation could have used the process-wide manifest maximum
-instead of the lower policy that produced a retained candidate. The candidate
-now carries its admission limit and revalidation enforces it; a growth test
-covers the boundary.
+Root cause: activation revalidation could have used the process-wide manifest
+maximum instead of the lower policy that produced a retained candidate.
+
+Fix: the candidate now carries its admission limit and revalidation enforces
+it.
+
+Tests: `revalidation_preserves_the_original_manifest_limit` covers file growth
+past the retained boundary.
 
 ### NEW-AUDIT-C-003
 
-Severity: S2 | Confidence: HIGH | Status: FIXED
+Severity: S2
+Confidence: HIGH
+Status: FIXED
 
-Persistent process-session termination killed the direct child but left the
-Windows Job Object open until the session was dropped. Termination now closes
-platform containment before joining I/O workers, activating descendant cleanup.
+Root cause: persistent process-session termination killed the direct child but
+left the Windows Job Object open until the session was dropped.
+
+Fix: termination now closes platform containment before joining I/O workers,
+activating descendant cleanup.
+
+Tests: response-queue close/unblock coverage and real process crash/timeout
+termination integration tests.
 
 ### NEW-AUDIT-C-004
 
-Severity: S2 | Confidence: HIGH | Status: FIXED
+Severity: S2
+Confidence: HIGH
+Status: FIXED
 
-Legacy `ToolRuntime` convenience methods implicitly supplied an allow-all
-ownership policy. They now deny write effects unless the caller supplies an
-explicit ownership policy; existing terminal tests use the explicit adapter.
+Root cause: legacy `ToolRuntime` convenience methods implicitly supplied an
+allow-all ownership policy.
+
+Fix: convenience methods now deny write effects unless the caller supplies an
+explicit ownership policy; terminal adapters pass an explicit policy.
+
+Tests: implicit-write-denial and explicit terminal ownership-boundary tests.
 
 ### NEW-AUDIT-C-005
 
-Severity: S2 | Confidence: HIGH | Status: FIXED
+Severity: S2
+Confidence: HIGH
+Status: FIXED
 
-Process executable and HTTP MCP endpoint effects were checked only through
-declared manifest resources. The concrete executable/endpoint is now checked
-against ownership at spawn/connect, with an HTTP regression proving denial
-before network I/O.
+Root cause: process executable and HTTP MCP endpoint effects were checked only
+through declared manifest resources.
+
+Fix: the concrete executable/endpoint is now checked against ownership at
+spawn/connect.
+
+Tests: process effect admission and HTTP ownership-denial regression proving
+rejection before network I/O.
+
+## Phase D
+
+Phase D addresses ORY-AUDIT-026 through ORY-AUDIT-032. The historical audit
+file remains unchanged. The benchmark/fuzzing phase is explicitly deferred.
+
+### ORY-AUDIT-026
+
+Status: FIXED
+
+Root cause: the provider boundary represented only a prompt string, a text
+iterator, and a final usage-bearing chunk, so tool calls, structured output,
+reasoning, modalities, finish reasons, cost/cache metadata, and classified
+provider failures could not be represented without provider-specific leakage.
+
+Architecture decision: ADR-0064 defines a provider-neutral typed request/event
+contract while keeping runtime state authoritative.
+
+Files changed: `crates/provider/src/lib.rs`, `crates/agent/src/lib.rs`.
+
+Fix: requests now carry bounded parts, tools, structured-output and reasoning
+options, and extension data. Providers advertise capabilities and validate
+negotiation before streaming typed text/reasoning/tool-call/usage/finish
+events. Errors classify cancellation, timeout, rate limiting, capability
+mismatch, malformed streams, and ordinary failure. Agent executions retain
+bounded text deltas rather than requiring one giant response string.
+
+Tests: provider tests cover normal text streaming, usage, finish reasons,
+tool calls, malformed tool streams, cancellation, provider failure, empty
+responses, and capability mismatch; agent tests cover cancellation, provider
+failure, fork continuation, and typed-stream execution.
+
+Validation: provider and agent focused suites pass.
+
+Remaining limitations: no real network provider adapters, provider-specific
+retry policy, or empirical stream/RSS measurements are claimed in Phase D.
+
+### ORY-AUDIT-027
+
+Status: FIXED
+
+Root cause: metadata persistence removed the committed sidecar before the new
+temporary file was installed, so a crash or rename failure could erase the
+only valid generation.
+
+Architecture decision: ADR-0064 uses same-directory synced temporary files and
+recoverable backup generations.
+
+Files changed: `crates/event-store/src/durable.rs`.
+
+Fix: metadata writes sync a unique temporary file, move the old generation to
+`.bak`, install the new generation, sync the parent directory where supported,
+and remove the backup only after installation. Open recovers a valid backup or
+deterministically migrates an unambiguous legacy sidecar.
+
+Tests: backup recovery, valid-primary precedence over stale generations,
+legacy migration, metadata corruption/torn-tail recovery, branch/snapshot
+reopen, orphan/partial temporary files, and existing filesystem crash-point
+tests.
+
+Validation: event-store focused suite passes.
+
+Remaining limitations: directory fsync and power-loss behavior remain
+platform-dependent; no impossible universal durability guarantee is claimed.
+
+### ORY-AUDIT-028
+
+Status: FIXED
+
+Root cause: `with_extension("meta")` could map an event filename ending in
+`.meta` back onto the event file itself.
+
+Architecture decision: ADR-0064 defines explicit sibling suffixes.
+
+Files changed: `crates/event-store/src/durable.rs`, `docs/PERSISTENCE.md`.
+
+Fix: metadata paths append a suffix to the complete event filename,
+preserving deterministic identity for extensionless, dotted, and `.meta`
+filenames. The established lock path is retained for compatibility, and
+legacy sidecars migrate only when their path is distinct from the event file.
+
+Tests: `.meta` event filename collision, legacy sidecar migration, normal
+metadata reopen, branch persistence, and snapshot persistence.
+
+Validation: event-store focused suite passes.
+
+Remaining limitations: legacy stores with a physically overwritten event file
+cannot be reconstructed; they are rejected rather than interpreted as empty.
+
+### ORY-AUDIT-029
+
+Status: FIXED
+
+Root cause: fork remapping decoded legacy IPC, assumption, and tool payloads,
+re-encoded current fields, and retained the legacy schema tag.
+
+Architecture decision: ADR-0064 requires the persisted tag to describe the
+bytes actually emitted.
+
+Files changed: `crates/event-store/src/lib.rs`.
+
+Fix: successful legacy remaps now write the current IPC, assumption, or tool
+schema constant; failed decodes preserve the original opaque payload/tag
+instead of claiming a transformed representation.
+
+Tests: legacy IPC, assumption, and tool payloads are forked, re-encoded,
+decoded after remapping, and checked after persistence while the parent event
+versions remain unchanged. Opaque decode failures also preserve their legacy
+payload and tag.
+
+Validation: event-store focused suite passes.
+
+Remaining limitations: future schema families must add an explicit remapper
+before becoming fork-remappable.
+
+### ORY-AUDIT-030
+
+Status: FIXED
+
+Root cause: metadata frame writing used only a u32 conversion while recovery
+enforced the domain frame limit, allowing a writer path to create data that
+recovery would reject.
+
+Architecture decision: ADR-0064 makes the frame limit a shared writer/reader
+boundary.
+
+Files changed: `crates/event-store/src/durable.rs`.
+
+Fix: event and metadata writers reject payloads over the same `MAX_FRAME_BYTES`
+used by event and metadata readers before any file write. The existing event
+batch writer already applies that limit to control and event frames.
+
+Tests: bounded metadata/event persistence, exact `max-1`/`max`/`max+1`
+event and metadata boundaries, corruption and truncation recovery, and reopen
+tests.
+
+Validation: event-store focused suite passes.
+
+Remaining limitations: the current 64 MiB domain cap is intentionally
+conservative for compatibility; payload-specific codecs retain their smaller
+limits.
+
+### ORY-AUDIT-031
+
+Status: FIXED
+
+Root cause: CI and canonical status/testing documents described a narrower
+test command as a full release gate and did not distinguish environment
+blocks, placeholder examples, or unmeasured benchmark targets.
+
+Architecture decision: no feature architecture change; evidence labels are
+now explicit and the release gate is represented in CI.
+
+Files changed: `.github/workflows/ci.yml`, `README.md`, `docs/STATUS.md`,
+`docs/TESTING.md`, `docs/PERSISTENCE.md`, `plans/CURRENT.md`.
+
+Fix: CI now runs formatting, all-features check/Clippy/test, and release build
+on Ubuntu, Windows, and macOS. Docs distinguish implemented, tested,
+environment-blocked, planned, and unmeasured behavior; placeholder directories
+remain explicitly future work rather than being presented as finished demos.
+
+Tests: workflow/document consistency inspection and all focused suites used by
+the current validation matrix.
+
+Validation: local formatting/check/Clippy and focused tests pass; any local
+Windows Application Control error 4551 remains ENVIRONMENT-BLOCKED, never a
+reported pass.
+
+Remaining limitations: hosted CI results are not available from this local
+workspace, and cross-platform claims remain conditional on matrix execution.
+
+### ORY-AUDIT-032
+
+Status: PARTIALLY FIXED
+
+Root cause: duplicate upstream `base64` versions remain in the reqwest graph,
+SQLite stores artifacts inline, and provider/agent output retention had no
+explicit hot-memory thresholds or measurements.
+
+Architecture decision: ADR-0064 bounds current hot paths without forcing
+fragile dependency patches or prematurely building a new blob subsystem.
+
+Files changed: `crates/agent/src/lib.rs`, `crates/event-store/src/lib.rs`,
+`crates/event-store/src/durable.rs`, `crates/event-store/src/sqlite.rs`,
+`docs/PERSISTENCE.md`, `docs/BENCHMARKS.md`.
+
+Fix: provider streams pull typed deltas, agent output is retained as bounded
+chunks with a 4 MiB/65,536-chunk ceiling, active and completed tool calls are
+cardinality-bounded, and inline artifact stores reject payloads over 16 MiB
+consistently across in-memory, filesystem, and SQLite adapters.
+Duplicate base64 versions were inspected and left as transitive reqwest
+dependencies because unification would require a fragile upstream patch.
+
+Tests: provider/agent stream and output-bound tests, artifact reopen and
+deduplication tests, and dependency-tree inspection.
+
+Validation: focused provider, agent, and event-store suites pass; `cargo tree
+--workspace --duplicates` reports only the two transitive base64 versions.
+
+Remaining limitations: RSS, startup, reconstruction, append throughput, and
+context/rendering benchmarks are intentionally deferred to the dedicated
+benchmark/hardening phase. External content-addressed SQLite blob storage is
+also future work.
+
+## New findings from Phase D
+
+### NEW-AUDIT-D-001
+
+Severity: S2
+
+Confidence: HIGH
+
+Area: fork remapping and opaque versioned payload fallback
+
+Root cause: the initial Phase D remapper assigned the current schema tag even
+when a legacy payload could not be decoded and was retained unchanged.
+
+Impact: an opaque child event could claim a schema version that did not
+describe its bytes, recreating the exact replay ambiguity addressed by
+ORY-AUDIT-029.
+
+Fix: failed IPC, assumption, and tool remaps now preserve both the original
+payload and its original version tag; only successful re-encodes receive the
+current tag.
+
+Tests: `failed_fork_remaps_preserve_opaque_payload_schema_tags` plus the
+successful legacy IPC/assumption/tool fork and reopen coverage.
+
+Status: FIXED

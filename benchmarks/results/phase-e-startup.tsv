@@ -1,0 +1,2 @@
+area	scenario	size	samples	median_us	p95_us	rss_before_kib	rss_after_kib	operations	notes
+startup	release-cli-help	5	5	8597	8794	NA	NA	5	binary=.\target\release\orynth.exe

@@ -10,6 +10,11 @@ use orynth_kernel::{
 
 pub type Sequence = u64;
 
+/// Inline artifact payloads are deliberately bounded. Larger immutable data
+/// belongs in a future external content-addressed blob adapter rather than in
+/// the event-store hot path or an inline SQLite row.
+pub const MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayMode {
     Recorded,
@@ -153,6 +158,7 @@ impl StoredArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactError {
     InvalidMediaType,
+    TooLarge { actual: usize, maximum: usize },
     HashCollision(ContentHash),
     MetadataMismatch(ContentHash),
     Storage(String),
@@ -163,6 +169,12 @@ impl fmt::Display for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidMediaType => formatter.write_str("artifact media type must not be empty"),
+            Self::TooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "artifact is too large: {actual} bytes (maximum {maximum})"
+                )
+            }
             Self::HashCollision(hash) => write!(formatter, "content hash collision for {hash}"),
             Self::MetadataMismatch(hash) => {
                 write!(
@@ -237,6 +249,12 @@ impl<H: ContentHasher> ArtifactStore for InMemoryArtifactStore<H> {
     ) -> Result<ArtifactRef, ArtifactError> {
         if media_type.trim().is_empty() {
             return Err(ArtifactError::InvalidMediaType);
+        }
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(ArtifactError::TooLarge {
+                actual: bytes.len(),
+                maximum: MAX_ARTIFACT_BYTES,
+            });
         }
 
         let content_hash = self.hasher.hash(&bytes);
@@ -564,28 +582,26 @@ fn remap_event_for_run(event: &Event, child_run_id: RunId) -> Event {
             cached_input_tokens: *cached_input_tokens,
         },
         EventKind::AgentMessage { version, payload } => {
-            let payload = orynth_ipc::IpcEnvelope::decode(*version, payload)
+            let remapped = orynth_ipc::IpcEnvelope::decode(*version, payload)
                 .map(|envelope| envelope.with_run_id(child_run_id).encode())
                 .ok()
-                .and_then(Result::ok)
-                .unwrap_or_else(|| payload.clone());
-            EventKind::AgentMessage {
-                version: *version,
-                payload,
-            }
+                .and_then(Result::ok);
+            let (version, payload) = remapped
+                .map(|payload| (orynth_ipc::IPC_SCHEMA_VERSION, payload))
+                .unwrap_or((*version, payload.clone()));
+            EventKind::AgentMessage { version, payload }
         }
         EventKind::AssumptionTransition { version, payload } => {
-            let payload = orynth_assumptions::decode_transition(*version, payload)
+            let remapped = orynth_assumptions::decode_transition(*version, payload)
                 .map(|transition| {
                     orynth_assumptions::encode_transition(&transition.with_run_id(child_run_id))
                 })
                 .ok()
-                .and_then(Result::ok)
-                .unwrap_or_else(|| payload.clone());
-            EventKind::AssumptionTransition {
-                version: *version,
-                payload,
-            }
+                .and_then(Result::ok);
+            let (version, payload) = remapped
+                .map(|payload| (orynth_assumptions::ASSUMPTION_SCHEMA_VERSION, payload))
+                .unwrap_or((*version, payload.clone()));
+            EventKind::AssumptionTransition { version, payload }
         }
         EventKind::SchedulerTransition { version, payload } => EventKind::SchedulerTransition {
             version: *version,
@@ -602,17 +618,16 @@ fn remap_event_for_run(event: &Event, child_run_id: RunId) -> Event {
             payload: payload.clone(),
         },
         EventKind::ToolTransition { version, payload } => {
-            let payload = orynth_tool_runtime::decode_transition(*version, payload)
+            let remapped = orynth_tool_runtime::decode_transition(*version, payload)
                 .map(|transition| {
                     orynth_tool_runtime::encode_transition(&transition.with_run_id(child_run_id))
                 })
                 .ok()
-                .and_then(Result::ok)
-                .unwrap_or_else(|| payload.clone());
-            EventKind::ToolTransition {
-                version: *version,
-                payload,
-            }
+                .and_then(Result::ok);
+            let (version, payload) = remapped
+                .map(|payload| (orynth_tool_runtime::TOOL_SCHEMA_VERSION, payload))
+                .unwrap_or((*version, payload.clone()));
+            EventKind::ToolTransition { version, payload }
         }
         EventKind::FailureMemoryTransition { version, payload } => {
             EventKind::FailureMemoryTransition {
@@ -1212,16 +1227,19 @@ mod tests {
     use super::*;
     use orynth_agent::AgentSession;
     use orynth_assumptions::{
-        ASSUMPTION_SCHEMA_VERSION, Assumption, AssumptionTransition, decode_transition,
-        encode_transition,
+        ASSUMPTION_SCHEMA_VERSION, Assumption, AssumptionTransition,
+        LEGACY_ASSUMPTION_SCHEMA_VERSION, decode_transition, encode_transition,
     };
-    use orynth_ipc::{IpcEnvelope, IpcMessage};
-    use orynth_kernel::{AgentIdentity, CancellationToken, ModelClass, ModelRef, Task};
+    use orynth_ipc::{IPC_SCHEMA_VERSION, IpcEnvelope, IpcMessage, LEGACY_IPC_SCHEMA_VERSION};
+    use orynth_kernel::{
+        AgentIdentity, CancellationToken, ModelClass, ModelRef, Task, ToolTransactionId,
+    };
     use orynth_provider::MockProvider;
     use orynth_tool_runtime::{
         TOOL_SCHEMA_VERSION, ToolProposal, ToolProvenance, ToolState, ToolTransition,
         decode_transition as decode_tool_transition, encode_transition as encode_tool_transition,
     };
+    const LEGACY_TOOL_SCHEMA_VERSION: u16 = 1;
 
     fn successful_trace() -> EventTrace {
         let model = ModelRef::new("mock", "runtime-core", ModelClass::Cheap);
@@ -1615,6 +1633,191 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fork_payloads_are_reencoded_with_their_current_schema_tags() {
+        let parent_run = RunId::new();
+        let child_run = RunId::new();
+        let agent_id = AgentId::new();
+        let model = ModelRef::new("mock", "fork", ModelClass::Cheap);
+        let agent = AgentIdentity::new("fork-agent", "legacy remap", model);
+        let task = Task::new(parent_run, "legacy fork");
+
+        let envelope = IpcEnvelope::new(
+            parent_run,
+            Some(task.id),
+            agent_id,
+            AgentId::new(),
+            IpcMessage::Question {
+                subject: "legacy".to_owned(),
+                why: "remap".to_owned(),
+            },
+        );
+        let mut ipc_payload = envelope.encode().unwrap();
+        let input_origin_offset = 8 + 8 + 1 + 8 + 8 + 8 + 2 + 1;
+        ipc_payload.drain(input_origin_offset..input_origin_offset + 2);
+
+        let assumption = Assumption::new(
+            parent_run,
+            agent_id,
+            "legacy.subject",
+            "value",
+            "legacy claim",
+        );
+        let mut assumption_payload =
+            encode_transition(&AssumptionTransition::Created { assumption }).unwrap();
+        assumption_payload.truncate(assumption_payload.len() - 3);
+
+        let tool = ToolTransition::Proposed {
+            transaction_id: ToolTransactionId::from_u64(77),
+            proposal: ToolProposal {
+                run_id: parent_run,
+                task_id: None,
+                agent_id,
+                tool_name: "audit.note".to_owned(),
+                input: std::collections::BTreeMap::new(),
+                provenance: ToolProvenance::Agent,
+                input_origins: Vec::new(),
+            },
+            state: ToolState::Validated,
+        };
+        let current_tool = encode_tool_transition(&tool).unwrap();
+        let mut tool_payload = current_tool[..current_tool.len() - 5].to_vec();
+        tool_payload.push(*current_tool.last().unwrap());
+
+        let mut trace = EventTrace::default();
+        trace.record(Event::new(
+            parent_run,
+            EventKind::RunCreated { run_id: parent_run },
+        ));
+        trace.record(Event::new(
+            parent_run,
+            EventKind::TaskCreated {
+                task_id: task.id,
+                run_id: parent_run,
+                title: task.title.clone(),
+            },
+        ));
+        trace.record(Event::new(parent_run, EventKind::AgentCreated { agent }));
+        trace.record(Event::new(
+            parent_run,
+            EventKind::AgentMessage {
+                version: LEGACY_IPC_SCHEMA_VERSION,
+                payload: ipc_payload,
+            },
+        ));
+        trace.record(Event::new(
+            parent_run,
+            EventKind::AssumptionTransition {
+                version: LEGACY_ASSUMPTION_SCHEMA_VERSION,
+                payload: assumption_payload,
+            },
+        ));
+        trace.record(Event::new(
+            parent_run,
+            EventKind::ToolTransition {
+                version: LEGACY_TOOL_SCHEMA_VERSION,
+                payload: tool_payload,
+            },
+        ));
+
+        let mut store = InMemoryEventStore::new();
+        store.append_trace(&trace).unwrap();
+        let branch = store
+            .create_branch(parent_run, trace.len() as u64, ReplayMode::Recorded, 4)
+            .unwrap();
+        let fork = store.materialize_fork(branch.branch_id, child_run).unwrap();
+
+        let child_events = fork.child_prefix.events();
+        let EventKind::AgentMessage { version, payload } = &child_events[3].kind else {
+            panic!("expected remapped IPC event");
+        };
+        assert_eq!(*version, IPC_SCHEMA_VERSION);
+        assert_eq!(
+            IpcEnvelope::decode(*version, payload).unwrap().run_id,
+            child_run
+        );
+        let EventKind::AssumptionTransition { version, payload } = &child_events[4].kind else {
+            panic!("expected remapped assumption event");
+        };
+        assert_eq!(*version, ASSUMPTION_SCHEMA_VERSION);
+        let AssumptionTransition::Created { assumption } =
+            decode_transition(*version, payload).unwrap()
+        else {
+            panic!("expected created assumption");
+        };
+        assert_eq!(assumption.run_id, child_run);
+        let EventKind::ToolTransition { version, payload } = &child_events[5].kind else {
+            panic!("expected remapped tool event");
+        };
+        assert_eq!(*version, TOOL_SCHEMA_VERSION);
+        let ToolTransition::Proposed { proposal, .. } =
+            decode_tool_transition(*version, payload).unwrap()
+        else {
+            panic!("expected proposed tool event");
+        };
+        assert_eq!(proposal.run_id, child_run);
+
+        assert!(matches!(
+            &store.events(parent_run).unwrap()[3].event.kind,
+            EventKind::AgentMessage { version, .. } if *version == LEGACY_IPC_SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
+    fn failed_fork_remaps_preserve_opaque_payload_schema_tags() {
+        let parent_run = RunId::new();
+        let child_run = RunId::new();
+        let opaque = vec![0xff, 0x00, 0x7f];
+
+        let remapped_ipc = remap_event_for_run(
+            &Event::new(
+                parent_run,
+                EventKind::AgentMessage {
+                    version: LEGACY_IPC_SCHEMA_VERSION,
+                    payload: opaque.clone(),
+                },
+            ),
+            child_run,
+        );
+        assert!(matches!(
+            remapped_ipc.kind,
+            EventKind::AgentMessage { version, payload }
+                if version == LEGACY_IPC_SCHEMA_VERSION && payload == opaque
+        ));
+
+        let remapped_assumption = remap_event_for_run(
+            &Event::new(
+                parent_run,
+                EventKind::AssumptionTransition {
+                    version: LEGACY_ASSUMPTION_SCHEMA_VERSION,
+                    payload: opaque.clone(),
+                },
+            ),
+            child_run,
+        );
+        assert!(matches!(
+            remapped_assumption.kind,
+            EventKind::AssumptionTransition { version, payload }
+                if version == LEGACY_ASSUMPTION_SCHEMA_VERSION && payload == opaque
+        ));
+
+        let remapped_tool = remap_event_for_run(
+            &Event::new(
+                parent_run,
+                EventKind::ToolTransition {
+                    version: LEGACY_TOOL_SCHEMA_VERSION,
+                    payload: opaque.clone(),
+                },
+            ),
+            child_run,
+        );
+        assert!(matches!(
+            remapped_tool.kind,
+            EventKind::ToolTransition { version, payload }
+                if version == LEGACY_TOOL_SCHEMA_VERSION && payload == opaque
+        ));
+    }
+
+    #[test]
     fn materialized_fork_remaps_assumption_run_scope() {
         let parent_run_id = RunId::new();
         let owner = orynth_kernel::AgentId::new();
@@ -1862,6 +2065,18 @@ mod tests {
                 .trust,
             TrustOrigin::WebUntrusted
         );
+    }
+
+    #[test]
+    fn artifact_payloads_have_an_explicit_inline_bound() {
+        let mut artifacts = InMemoryArtifactStore::new();
+        let oversized = vec![0_u8; MAX_ARTIFACT_BYTES + 1];
+        assert!(matches!(
+            artifacts.put("application/octet-stream", oversized),
+            Err(ArtifactError::TooLarge { actual, maximum })
+                if actual == MAX_ARTIFACT_BYTES + 1 && maximum == MAX_ARTIFACT_BYTES
+        ));
+        assert!(artifacts.is_empty());
     }
 
     #[test]

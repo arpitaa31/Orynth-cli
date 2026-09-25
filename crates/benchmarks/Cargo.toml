@@ -1,0 +1,17 @@
+[package]
+name = "orynth-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orynth-bench"
+path = "src/main.rs"
+
+[dependencies]
+orynth-assumptions = { path = "../assumptions" }
+orynth-context = { path = "../context" }
+orynth-event-store = { path = "../event-store" }
+orynth-ipc = { path = "../ipc" }
+orynth-kernel = { path = "../kernel" }
+orynth-tool-runtime = { path = "../tool-runtime" }
