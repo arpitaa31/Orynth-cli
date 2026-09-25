@@ -1,13 +1,42 @@
 use std::{
     fmt,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+// Durable IDs are serialized as u64 for compatibility with existing stores.
+// A process-unique random prefix prevents a restart from reusing the old
+// process-local sequence, while the low counter preserves cheap atomic
+// allocation within one process. This is intentionally opaque to callers;
+// persisted IDs are never reconstructed by advancing this counter.
+static ID_PREFIX: OnceLock<u32> = OnceLock::new();
+static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+pub fn new_durable_id() -> u64 {
+    let prefix = *ID_PREFIX.get_or_init(|| {
+        let mut bytes = [0_u8; 4];
+        if getrandom::getrandom(&mut bytes).is_err() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let fallback = now.as_nanos() as u64
+                ^ u64::from(std::process::id())
+                ^ (now.as_secs().rotate_left(17));
+            return (fallback as u32).max(1);
+        }
+        u32::from_le_bytes(bytes).max(1)
+    });
+    let counter = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if counter == u32::MAX {
+        // Exhausting a process prefix is safer than wrapping into an identity
+        // that may already have been persisted.
+        panic!("durable ID space exhausted for this process");
+    }
+    (u64::from(prefix) << 32) | u64::from(counter)
+}
 
 macro_rules! id_type {
     ($name:ident, $prefix:literal) => {
@@ -16,7 +45,7 @@ macro_rules! id_type {
 
         impl $name {
             pub fn new() -> Self {
-                Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+                Self(new_durable_id())
             }
 
             pub const fn from_u64(value: u64) -> Self {
@@ -431,6 +460,29 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(first.to_string().starts_with("agent-"));
+    }
+
+    #[test]
+    fn durable_identity_families_use_process_unique_values() {
+        let values = [
+            RunId::new().value(),
+            TaskId::new().value(),
+            AgentId::new().value(),
+            EventId::new().value(),
+            BranchId::new().value(),
+            MessageId::new().value(),
+            AssumptionId::new().value(),
+            ConflictId::new().value(),
+            FailureId::new().value(),
+            ToolTransactionId::new().value(),
+            PluginId::new().value(),
+        ];
+        let unique = values
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), values.len());
+        assert!(values.iter().all(|value| *value != 0));
     }
 
     #[test]

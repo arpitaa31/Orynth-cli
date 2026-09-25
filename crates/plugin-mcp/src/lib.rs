@@ -4,12 +4,17 @@
 //! into Orynth contracts but never turns server-provided annotations into
 //! capabilities, risk permissions, or trusted content.
 
-use std::{collections::BTreeMap, io::Read, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use orynth_kernel::{AgentId, TaskId, TrustOrigin};
 use orynth_plugin_api::{
     PluginError, PluginKind, PluginManifest, PluginRequest, PluginResponse, PluginTransport,
-    authorize_manifest,
+    authorize_manifest_with_ownership,
 };
 use orynth_plugin_process::{ProcessCommand, ProcessSession, spawn_process_session};
 use orynth_tool_runtime::{
@@ -37,6 +42,10 @@ pub struct McpServerInfo {
     pub name: String,
     pub version: String,
     pub protocol_version: u16,
+    /// The protocol version returned by the server during legacy
+    /// negotiation. `None` is allowed only for caller-supplied metadata before
+    /// a session has connected.
+    pub wire_protocol_version: Option<String>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -47,6 +56,9 @@ impl McpServerInfo {
         }
         if self.protocol_version != MCP_PROTOCOL_VERSION {
             return Err(McpError::UnsupportedVersion(self.protocol_version));
+        }
+        if let Some(version) = &self.wire_protocol_version {
+            validate_wire_protocol_version(version)?;
         }
         if self.metadata.len() > 64 {
             return Err(McpError::TooLarge(self.metadata.len()));
@@ -225,7 +237,9 @@ pub fn bind_tool(
         name: format!("mcp.{}.{}", server.name, description.name),
         version: server.version.clone(),
         required_fields: policy.required_fields.clone(),
+        syntax_fields: Vec::new(),
         capability: policy.capability.clone(),
+        ownership: None,
         risk: policy.risk,
         reversible: policy.reversible,
     };
@@ -297,6 +311,7 @@ pub struct McpSession<T> {
     server: McpServerInfo,
     transport: T,
     connected: bool,
+    negotiated_protocol_version: Option<String>,
 }
 
 impl<T: McpSessionTransport> McpSession<T> {
@@ -314,6 +329,7 @@ impl<T: McpSessionTransport> McpSession<T> {
             server,
             transport,
             connected: false,
+            negotiated_protocol_version: None,
         })
     }
 
@@ -322,9 +338,22 @@ impl<T: McpSessionTransport> McpSession<T> {
             return Err(McpError::Invalid("MCP session is already connected"));
         }
         if self.mode == McpProtocolMode::Legacy2025 {
-            self.server = self.transport.initialize(self.mode, &self.client)?;
-            self.server.validate()?;
+            let server = self.transport.initialize(self.mode, &self.client)?;
+            server.validate()?;
+            let negotiated = server
+                .wire_protocol_version
+                .as_deref()
+                .ok_or(McpError::Invalid(
+                    "MCP initialize result omitted protocolVersion",
+                ))?;
+            validate_negotiated_protocol(self.mode, negotiated)?;
+            self.negotiated_protocol_version = Some(negotiated.to_owned());
+            self.server = server;
             self.transport.initialized(self.mode)?;
+        } else {
+            // Modern MCP carries negotiation on every request. The selected
+            // mode is therefore the negotiated version for this session.
+            self.negotiated_protocol_version = Some(self.mode.version().to_owned());
         }
         self.connected = true;
         Ok(())
@@ -344,6 +373,10 @@ impl<T: McpSessionTransport> McpSession<T> {
 
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    pub fn negotiated_protocol_version(&self) -> Option<&str> {
+        self.negotiated_protocol_version.as_deref()
     }
 
     pub fn transport(&self) -> &T {
@@ -409,6 +442,7 @@ pub struct StdioMcpTransport {
 
 pub struct McpConnectionContext<'a> {
     pub policy: &'a orynth_security::CapabilityPolicy,
+    pub ownership: &'a dyn orynth_security::ResourceOwnershipPolicy,
     pub agent_id: AgentId,
     pub task_id: Option<TaskId>,
     pub now_ms: u128,
@@ -449,6 +483,7 @@ impl StdioMcpTransport {
                 &self.command,
                 &self.manifest,
                 context.policy,
+                context.ownership,
                 context.agent_id,
                 context.task_id,
                 context.now_ms,
@@ -473,6 +508,7 @@ impl StdioMcpTransport {
         method: &str,
         params: Value,
     ) -> Result<Value, McpError> {
+        let started = std::time::Instant::now();
         let message = json!({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -483,8 +519,10 @@ impl StdioMcpTransport {
             .map_err(|_| McpError::Invalid("MCP request could not be encoded"))?;
         let timeout = self.timeout;
         let process = self.process_mut()?;
-        process.write_line(&line).map_err(McpError::Plugin)?;
-        let response = process.read_line(timeout).map_err(McpError::Plugin)?;
+        let timeout = timeout.saturating_sub(started.elapsed());
+        let response = process
+            .request_line(&line, timeout)
+            .map_err(McpError::Plugin)?;
         let response: Value = serde_json::from_slice(&response)
             .map_err(|_| McpError::Invalid("MCP response is not valid JSON"))?;
         if response.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
@@ -556,11 +594,19 @@ impl McpSessionTransport for StdioMcpTransport {
             .get("version")
             .and_then(Value::as_str)
             .ok_or(McpError::Invalid("MCP server version is missing"))?;
+        let wire_protocol_version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or(McpError::Invalid(
+                "MCP initialize result protocolVersion is missing or malformed",
+            ))?;
+        validate_negotiated_protocol(mode, wire_protocol_version)?;
         Ok(McpServerInfo {
             name: name.to_owned(),
             version: version.to_owned(),
             protocol_version: MCP_PROTOCOL_VERSION,
-            metadata: [("wire_protocol".to_owned(), mode.version().to_owned())]
+            wire_protocol_version: Some(wire_protocol_version.to_owned()),
+            metadata: [("wire_protocol".to_owned(), wire_protocol_version.to_owned())]
                 .into_iter()
                 .collect(),
         })
@@ -625,6 +671,10 @@ pub struct HttpMcpTransport {
     endpoint_text: String,
     manifest: PluginManifest,
     client: Client,
+    capability_policy: Option<orynth_security::CapabilityPolicy>,
+    capability_agent: Option<AgentId>,
+    capability_task: Option<TaskId>,
+    ownership_authorized: bool,
     client_info: Option<McpClientInfo>,
     session_id: Option<String>,
     server_request_handler: Option<Box<McpServerRequestHandler>>,
@@ -654,8 +704,11 @@ impl HttpMcpTransport {
             return Err(McpError::Invalid("MCP HTTP timeout must be non-zero"));
         }
         let endpoint_text = endpoint.into();
+        reject_ambiguous_url_text(&endpoint_text)?;
         let endpoint = Url::parse(&endpoint_text)
             .map_err(|_| McpError::Invalid("MCP HTTP endpoint is not a valid URL"))?;
+        let endpoint = canonical_network_url(endpoint)?;
+        let endpoint_text = endpoint.to_string();
         if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
             return Err(McpError::Invalid(
                 "MCP HTTP endpoint must use HTTP(S) with a host",
@@ -679,6 +732,10 @@ impl HttpMcpTransport {
             endpoint_text,
             manifest,
             client,
+            capability_policy: None,
+            capability_agent: None,
+            capability_task: None,
+            ownership_authorized: false,
             client_info: None,
             session_id: None,
             server_request_handler: None,
@@ -732,6 +789,7 @@ impl HttpMcpTransport {
         mode: McpProtocolMode,
         last_event_id: Option<&str>,
     ) -> Result<Response, McpError> {
+        self.reauthorize()?;
         if let Some(last_event_id) = last_event_id {
             validate_sse_event_id(last_event_id)?;
         }
@@ -788,8 +846,9 @@ impl HttpMcpTransport {
         context: McpConnectionContext<'_>,
     ) -> Result<McpSession<Self>, McpError> {
         self.client_info = Some(client.clone());
-        authorize_manifest(
+        authorize_manifest_with_ownership(
             context.policy,
+            context.ownership,
             context.agent_id,
             context.task_id,
             context.now_ms,
@@ -798,7 +857,7 @@ impl HttpMcpTransport {
         .map_err(McpError::Plugin)?;
         if !self.manifest.capabilities.iter().any(|capability| {
             capability.domain == orynth_security::CapabilityDomain::Network
-                && resource_matches(&capability.resource, &self.endpoint_text)
+                && network_resource_matches(&capability.resource, &self.endpoint)
         }) {
             return Err(McpError::Plugin(PluginError::Invalid(
                 "MCP HTTP network endpoint is missing from the manifest",
@@ -816,6 +875,20 @@ impl HttpMcpTransport {
             .map_err(|error| {
                 transport_error(format!("MCP HTTP network capability denied: {error}"))
             })?;
+        context
+            .ownership
+            .authorize(
+                context.agent_id,
+                &self.endpoint_text,
+                orynth_security::OwnershipAccess::Write,
+            )
+            .map_err(|error| {
+                transport_error(format!("MCP HTTP network ownership denied: {error}"))
+            })?;
+        self.capability_policy = Some(context.policy.clone());
+        self.capability_agent = Some(context.agent_id);
+        self.capability_task = context.task_id;
+        self.ownership_authorized = true;
         let mut session = McpSession::new(mode, client, server, self)?;
         session.connect()?;
         Ok(session)
@@ -828,6 +901,7 @@ impl HttpMcpTransport {
         method: &str,
         params: Value,
     ) -> Result<Option<Value>, McpError> {
+        self.reauthorize()?;
         let message = if let Some(request_id) = request_id {
             json!({
                 "jsonrpc": "2.0",
@@ -1083,6 +1157,7 @@ impl HttpMcpTransport {
         mode: McpProtocolMode,
         message: Value,
     ) -> Result<(), McpError> {
+        self.reauthorize()?;
         let body = serde_json::to_vec(&message)
             .map_err(|_| McpError::Invalid("MCP HTTP server response could not be encoded"))?;
         if body.len() > self.manifest.limits.max_message_bytes as usize {
@@ -1108,6 +1183,27 @@ impl HttpMcpTransport {
             )));
         }
         Ok(())
+    }
+
+    fn reauthorize(&self) -> Result<(), McpError> {
+        if !self.ownership_authorized {
+            return Err(McpError::Invalid(
+                "MCP HTTP transport has no ownership authorization",
+            ));
+        }
+        let policy = self.capability_policy.as_ref().ok_or(McpError::Invalid(
+            "MCP HTTP transport has no capability context",
+        ))?;
+        policy
+            .authorize(
+                self.capability_agent
+                    .ok_or(McpError::Invalid("MCP HTTP transport has no agent context"))?,
+                self.capability_task,
+                orynth_security::CapabilityDomain::Network,
+                &self.endpoint_text,
+                current_time_ms(),
+            )
+            .map_err(|error| transport_error(format!("MCP HTTP capability denied: {error}")))
     }
 }
 
@@ -1362,6 +1458,13 @@ impl McpSessionTransport for HttpMcpTransport {
                 .ok_or(McpError::Invalid(
                     "MCP HTTP initialize result has no serverInfo",
                 ))?;
+        let wire_protocol_version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or(McpError::Invalid(
+                "MCP HTTP initialize result protocolVersion is missing or malformed",
+            ))?;
+        validate_negotiated_protocol(mode, wire_protocol_version)?;
         Ok(McpServerInfo {
             name: server
                 .get("name")
@@ -1374,7 +1477,8 @@ impl McpSessionTransport for HttpMcpTransport {
                 .ok_or(McpError::Invalid("MCP server version is missing"))?
                 .to_owned(),
             protocol_version: MCP_PROTOCOL_VERSION,
-            metadata: [("wire_protocol".to_owned(), mode.version().to_owned())]
+            wire_protocol_version: Some(wire_protocol_version.to_owned()),
+            metadata: [("wire_protocol".to_owned(), wire_protocol_version.to_owned())]
                 .into_iter()
                 .collect(),
         })
@@ -1425,13 +1529,113 @@ fn transport_error(message: String) -> McpError {
     McpError::Plugin(PluginError::Protocol(message))
 }
 
-fn resource_matches(granted: &str, requested: &str) -> bool {
-    granted == requested
-        || (requested.starts_with(granted)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NetworkTarget {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+    query: Option<String>,
+}
+
+fn canonical_network_url(mut url: Url) -> Result<Url, McpError> {
+    if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
+        return Err(McpError::Invalid(
+            "MCP HTTP endpoint must not contain credentials or a fragment",
+        ));
+    }
+    let target = network_target(&url)?;
+    url.set_path(&target.path);
+    url.set_query(target.query.as_deref());
+    Ok(url)
+}
+
+fn reject_ambiguous_url_text(endpoint: &str) -> Result<(), McpError> {
+    let lower = endpoint.to_ascii_lowercase();
+    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
+        return Err(McpError::Invalid(
+            "MCP HTTP endpoint contains an encoded path ambiguity",
+        ));
+    }
+    Ok(())
+}
+
+fn network_target(url: &Url) -> Result<NetworkTarget, McpError> {
+    let host = url
+        .host_str()
+        .ok_or(McpError::Invalid("MCP HTTP endpoint must have a host"))?
+        .to_ascii_lowercase();
+    let port = url.port_or_known_default().ok_or(McpError::Invalid(
+        "MCP HTTP endpoint must have a known port",
+    ))?;
+    let raw_path = url.path();
+    let lower_path = raw_path.to_ascii_lowercase();
+    if lower_path.contains("%2e")
+        || lower_path.contains("%2f")
+        || lower_path.contains("%5c")
+        || raw_path.contains('\\')
+    {
+        return Err(McpError::Invalid(
+            "MCP HTTP endpoint contains an encoded or alternate path separator",
+        ));
+    }
+    let mut components = Vec::new();
+    for component in raw_path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(McpError::Invalid("MCP HTTP endpoint escapes its root"));
+                }
+            }
+            value => components.push(value),
+        }
+    }
+    let path = format!("/{}", components.join("/"));
+    Ok(NetworkTarget {
+        scheme: url.scheme().to_ascii_lowercase(),
+        host,
+        port,
+        path: if path == "/" {
+            path
+        } else {
+            path.trim_end_matches('/').to_owned()
+        },
+        query: url.query().map(str::to_owned),
+    })
+}
+
+fn network_resource_matches(granted: &str, requested: &Url) -> bool {
+    let Ok(granted_url) = Url::parse(granted) else {
+        return false;
+    };
+    let Ok(granted) = network_target(&granted_url) else {
+        return false;
+    };
+    let Ok(requested) = network_target(requested) else {
+        return false;
+    };
+    if granted.scheme != requested.scheme
+        || granted.host != requested.host
+        || granted.port != requested.port
+        || granted.query != requested.query
+    {
+        return false;
+    }
+    granted.path == requested.path
+        || (requested.path.starts_with(&granted.path)
             && requested
+                .path
                 .as_bytes()
-                .get(granted.len())
-                .is_some_and(|separator| *separator == b'/' || *separator == b'\\'))
+                .get(granted.path.len())
+                .is_some_and(|separator| *separator == b'/'))
+}
+
+fn current_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 pub struct McpAdapter<I> {
@@ -1471,6 +1675,7 @@ impl<I: McpInvoker> PluginTransport for McpAdapter<I> {
     fn invoke(
         &mut self,
         policy: &orynth_security::CapabilityPolicy,
+        ownership: &dyn orynth_security::ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -1482,7 +1687,14 @@ impl<I: McpInvoker> PluginTransport for McpAdapter<I> {
                 "invocation manifest does not match the bound MCP server".to_owned(),
             ));
         }
-        authorize_manifest(policy, agent_id, task_id, now_ms, &self.manifest)?;
+        authorize_manifest_with_ownership(
+            policy,
+            ownership,
+            agent_id,
+            task_id,
+            now_ms,
+            &self.manifest,
+        )?;
         request.validate_with(self.manifest.limits)?;
         let request_id = request.request_id;
         let payload = self.invoker.invoke(&request)?;
@@ -1500,6 +1712,7 @@ impl<I: McpInvoker> PluginTransport for McpAdapter<I> {
 pub enum McpError {
     Invalid(&'static str),
     UnsupportedVersion(u16),
+    UnsupportedWireVersion(String),
     TooLarge(usize),
     Plugin(PluginError),
     Tool(ToolError),
@@ -1512,6 +1725,9 @@ impl std::fmt::Display for McpError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported MCP protocol version {version}")
             }
+            Self::UnsupportedWireVersion(version) => {
+                write!(formatter, "unsupported MCP wire protocol version {version}")
+            }
             Self::TooLarge(size) => write!(formatter, "MCP value is too large: {size}"),
             Self::Plugin(error) => write!(formatter, "MCP plugin error: {error}"),
             Self::Tool(error) => write!(formatter, "MCP tool policy error: {error}"),
@@ -1520,6 +1736,25 @@ impl std::fmt::Display for McpError {
 }
 
 impl std::error::Error for McpError {}
+
+fn validate_wire_protocol_version(version: &str) -> Result<(), McpError> {
+    if version == MCP_LEGACY_PROTOCOL_VERSION || version == MCP_MODERN_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(McpError::UnsupportedWireVersion(version.to_owned()))
+    }
+}
+
+fn validate_negotiated_protocol(
+    mode: McpProtocolMode,
+    server_version: &str,
+) -> Result<(), McpError> {
+    validate_wire_protocol_version(server_version)?;
+    if server_version != mode.version() {
+        return Err(McpError::UnsupportedWireVersion(server_version.to_owned()));
+    }
+    Ok(())
+}
 
 fn validate_page_len(length: usize) -> Result<(), McpError> {
     if length > MAX_DISCOVERY_PAGE_ITEMS {
@@ -1655,11 +1890,38 @@ mod tests {
         }
     }
 
+    struct NegotiationSession {
+        response: McpServerInfo,
+    }
+
+    impl McpSessionTransport for NegotiationSession {
+        fn initialize(
+            &mut self,
+            _mode: McpProtocolMode,
+            _client: &McpClientInfo,
+        ) -> Result<McpServerInfo, McpError> {
+            Ok(self.response.clone())
+        }
+
+        fn initialized(&mut self, _mode: McpProtocolMode) -> Result<(), McpError> {
+            Ok(())
+        }
+
+        fn request(
+            &mut self,
+            _mode: McpProtocolMode,
+            _request: &PluginRequest,
+        ) -> Result<Vec<u8>, McpError> {
+            Ok(Vec::new())
+        }
+    }
+
     fn server() -> McpServerInfo {
         McpServerInfo {
             name: "files".to_owned(),
             version: "1".to_owned(),
             protocol_version: MCP_PROTOCOL_VERSION,
+            wire_protocol_version: Some(MCP_LEGACY_PROTOCOL_VERSION.to_owned()),
             metadata: [("title".to_owned(), "Files".to_owned())]
                 .into_iter()
                 .collect(),
@@ -1710,6 +1972,7 @@ mod tests {
                     domain: CapabilityDomain::Filesystem,
                     resource: "workspace".to_owned(),
                     input_field: Some("path".to_owned()),
+                    input_fields: Vec::new(),
                 }),
                 risk: RiskLevel::High,
                 reversible: false,
@@ -1739,6 +2002,7 @@ mod tests {
         let response = adapter
             .invoke(
                 &policy,
+                &orynth_security::AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -1784,6 +2048,30 @@ mod tests {
     }
 
     #[test]
+    fn network_authorization_uses_the_normalized_structured_destination() {
+        let allowed = Url::parse("HTTP://Example.COM:80/allowed").unwrap();
+        let normalized = canonical_network_url(allowed).unwrap();
+        assert_eq!(normalized.as_str(), "http://example.com/allowed");
+        let escaped =
+            canonical_network_url(Url::parse("http://example.com/allowed/../private").unwrap())
+                .unwrap();
+        assert!(!network_resource_matches(
+            "http://example.com/allowed",
+            &escaped
+        ));
+        assert!(network_resource_matches(
+            "http://EXAMPLE.com:80/allowed",
+            &normalized
+        ));
+        assert!(!network_resource_matches(
+            "http://example.com/allowed",
+            &Url::parse("http://example.com/allowed-sibling").unwrap()
+        ));
+        assert!(canonical_network_url(Url::parse("http://[::1]/allowed").unwrap()).is_ok());
+        assert!(reject_ambiguous_url_text("http://example.com/allowed/%2e%2e/private").is_err());
+    }
+
+    #[test]
     fn legacy_session_performs_handshake_before_requests() {
         let mut session = McpSession::new(
             McpProtocolMode::Legacy2025,
@@ -1811,6 +2099,34 @@ mod tests {
             invoker.session().transport().requests,
             vec![McpProtocolMode::Legacy2025]
         );
+        assert_eq!(
+            invoker.session().negotiated_protocol_version(),
+            Some(MCP_LEGACY_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn legacy_handshake_rejects_missing_or_unsupported_wire_version() {
+        for wire_protocol_version in [
+            None,
+            Some("2024-01-01".to_owned()),
+            Some("2026-07-28".to_owned()),
+        ] {
+            let mut returned = server();
+            returned.wire_protocol_version = wire_protocol_version;
+            let mut session = McpSession::new(
+                McpProtocolMode::Legacy2025,
+                client(),
+                server(),
+                NegotiationSession { response: returned },
+            )
+            .unwrap();
+            assert!(matches!(
+                session.connect(),
+                Err(McpError::Invalid(_)) | Err(McpError::UnsupportedWireVersion(_))
+            ));
+            assert!(!session.is_connected());
+        }
     }
 
     #[test]

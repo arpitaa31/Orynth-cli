@@ -531,7 +531,7 @@ impl<S> RuntimeService<S> {
                 .collect::<Vec<_>>(),
         )?;
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::ToolTransition {
                 version: TOOL_SCHEMA_VERSION,
@@ -572,7 +572,7 @@ impl<S> RuntimeService<S> {
         )?;
         let transition = FailureTransition::Recorded { record };
         candidate.apply(&transition)?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::FailureMemoryTransition {
                 version: FAILURE_MEMORY_SCHEMA_VERSION,
@@ -601,7 +601,7 @@ impl<S> RuntimeService<S> {
         )?;
         let transition = FailureTransition::Resolved { failure_id };
         candidate.apply(&transition)?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::FailureMemoryTransition {
                 version: FAILURE_MEMORY_SCHEMA_VERSION,
@@ -641,7 +641,7 @@ impl<S> RuntimeService<S> {
         )?;
         let transition = CapabilityTransition::Granted { lease };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::CapabilityTransition {
                 version: CAPABILITY_SCHEMA_VERSION,
@@ -681,7 +681,7 @@ impl<S> RuntimeService<S> {
             resource: resource.into(),
         };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::CapabilityTransition {
                 version: CAPABILITY_SCHEMA_VERSION,
@@ -734,14 +734,17 @@ impl<S> RuntimeService<S> {
             return Err(IpcError::MailboxFull { recipient }.into());
         }
         let payload = envelope.encode()?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             envelope.run_id,
             EventKind::AgentMessage {
                 version: IPC_SCHEMA_VERSION,
                 payload,
             },
         ))?;
-        mailbox.try_send(envelope)?;
+        self.mailboxes
+            .get_mut(&recipient)
+            .expect("mailbox was inserted before append")
+            .try_send(envelope)?;
         Ok(())
     }
 
@@ -907,7 +910,7 @@ impl<S> RuntimeService<S> {
                 return Err(IpcError::MailboxFull { recipient }.into());
             }
         }
-        self.event_store.append_batch(&events)?;
+        self.append_validated_batch(&events)?;
         self.assumptions = candidate;
         for envelope in notifications {
             self.mailboxes
@@ -941,7 +944,7 @@ impl<S> RuntimeService<S> {
         let transition =
             orynth_scheduler::SchedulerTransition::BudgetConfigured { agent_id, limits };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::SchedulerTransition {
                 version: SCHEDULER_SCHEMA_VERSION,
@@ -982,7 +985,7 @@ impl<S> RuntimeService<S> {
             limits,
         };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::SchedulerTransition {
                 version: SCHEDULER_SCHEMA_VERSION,
@@ -1015,7 +1018,7 @@ impl<S> RuntimeService<S> {
         )?;
         let transition = orynth_scheduler::SchedulerTransition::UsageRecorded { agent_id, delta };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::SchedulerTransition {
                 version: SCHEDULER_SCHEMA_VERSION,
@@ -1048,7 +1051,7 @@ impl<S> RuntimeService<S> {
         )?;
         let transition = orynth_scheduler::SchedulerTransition::HealthSignaled { agent_id, signal };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::SchedulerTransition {
                 version: SCHEDULER_SCHEMA_VERSION,
@@ -1072,7 +1075,7 @@ impl<S> RuntimeService<S> {
         if !state.agents.contains_key(&agent_id) {
             return Err(StoreError::UnknownAgent(agent_id).into());
         }
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::ModelRequested { agent_id, model },
         ))?;
@@ -1119,7 +1122,7 @@ impl<S> RuntimeService<S> {
         };
         candidate.apply(usage.clone())?;
         candidate.apply(relationship.clone())?;
-        self.event_store.append_batch(&[
+        self.append_validated_batch(&[
             Event::new(run_id, EventKind::AgentCreated { agent: child }),
             Event::new(
                 run_id,
@@ -1198,7 +1201,7 @@ impl<S> RuntimeService<S> {
         let specialist = SpecialistTransition::Registered { profile };
         candidate_specialists.apply(&specialist)?;
 
-        self.event_store.append_batch(&[
+        self.append_validated_batch(&[
             Event::new(run_id, EventKind::AgentCreated { agent: child }),
             Event::new(
                 run_id,
@@ -1235,8 +1238,7 @@ impl<S> RuntimeService<S> {
         if !state.agents.contains_key(&agent_id) {
             return Err(StoreError::UnknownAgent(agent_id).into());
         }
-        self.event_store
-            .append(Event::new(run_id, EventKind::AgentPaused { agent_id }))?;
+        self.append_validated_event(Event::new(run_id, EventKind::AgentPaused { agent_id }))?;
         Ok(())
     }
 
@@ -1248,8 +1250,7 @@ impl<S> RuntimeService<S> {
         if !state.agents.contains_key(&agent_id) {
             return Err(StoreError::UnknownAgent(agent_id).into());
         }
-        self.event_store
-            .append(Event::new(run_id, EventKind::AgentResumed { agent_id }))?;
+        self.append_validated_event(Event::new(run_id, EventKind::AgentResumed { agent_id }))?;
         Ok(())
     }
 
@@ -1274,8 +1275,33 @@ impl<S> RuntimeService<S> {
             ))
             .into());
         }
-        self.event_store
-            .append(Event::new(run_id, EventKind::ModelCancelled { agent_id }))?;
+        let events = self.event_store.events(run_id)?;
+        let event_values = events
+            .iter()
+            .map(|stored| stored.event.clone())
+            .collect::<Vec<_>>();
+        let mut candidate_scheduler = SchedulerState::from_events(&event_values)?;
+        let resources = candidate_scheduler
+            .ownership()
+            .iter()
+            .filter(|(_, owner)| **owner == agent_id)
+            .map(|(resource, _)| resource.clone())
+            .collect::<Vec<_>>();
+        let mut validated = vec![Event::new(run_id, EventKind::ModelCancelled { agent_id })];
+        for resource in resources {
+            let transition =
+                orynth_scheduler::SchedulerTransition::OwnershipReleased { agent_id, resource };
+            candidate_scheduler.apply(transition.clone())?;
+            validated.push(Event::new(
+                run_id,
+                EventKind::SchedulerTransition {
+                    version: SCHEDULER_SCHEMA_VERSION,
+                    payload: orynth_scheduler::encode_transition(&transition)?,
+                },
+            ));
+        }
+        self.append_validated_batch(&validated)?;
+        self.scheduler = candidate_scheduler;
         Ok(())
     }
 
@@ -1361,8 +1387,19 @@ impl<S> RuntimeService<S> {
         S: EventStore,
     {
         let state = self.event_store.reconstruct(run_id)?;
-        if !state.agents.contains_key(&agent_id) {
-            return Err(StoreError::UnknownAgent(agent_id).into());
+        let agent = state
+            .agents
+            .get(&agent_id)
+            .ok_or(StoreError::UnknownAgent(agent_id))?;
+        if matches!(
+            agent.status,
+            AgentStatus::Completed | AgentStatus::Cancelled | AgentStatus::Failed
+        ) {
+            return Err(StoreError::InvalidTransition(format!(
+                "agent {agent_id} cannot claim ownership after {:?}",
+                agent.status
+            ))
+            .into());
         }
         let events = self.event_store.events(run_id)?;
         let mut candidate = SchedulerState::from_events(
@@ -1376,7 +1413,7 @@ impl<S> RuntimeService<S> {
             resource: resource.into(),
         };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::SchedulerTransition {
                 version: SCHEDULER_SCHEMA_VERSION,
@@ -1412,7 +1449,7 @@ impl<S> RuntimeService<S> {
             resource: resource.into(),
         };
         candidate.apply(transition.clone())?;
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::SchedulerTransition {
                 version: SCHEDULER_SCHEMA_VERSION,
@@ -1425,6 +1462,28 @@ impl<S> RuntimeService<S> {
 }
 
 impl<S: EventStore> RuntimeService<S> {
+    fn append_validated_event(&mut self, event: Event) -> Result<(), RuntimeError> {
+        let mut state = self.event_store.reconstruct(event.run_id)?;
+        state.apply_event(&event)?;
+        self.event_store.append(event)?;
+        Ok(())
+    }
+
+    fn append_validated_batch(&mut self, events: &[Event]) -> Result<(), RuntimeError> {
+        let Some(first) = events.first() else {
+            return Err(StoreError::InvalidTransition(
+                "validated event batch must not be empty".to_owned(),
+            )
+            .into());
+        };
+        let mut state = self.event_store.reconstruct(first.run_id)?;
+        for event in events {
+            state.apply_event(event)?;
+        }
+        self.event_store.append_batch(events)?;
+        Ok(())
+    }
+
     pub fn record_cache_usage(
         &mut self,
         run_id: RunId,
@@ -1433,13 +1492,14 @@ impl<S: EventStore> RuntimeService<S> {
         estimated_prefix_tokens: u64,
         usage: Usage,
     ) -> Result<Option<CacheObservation>, RuntimeError> {
+        self.event_store.reconstruct(run_id)?;
         let mut candidate = self.cache_telemetry.clone();
         let Some(observation) =
             candidate.record(model, prefix_hash, estimated_prefix_tokens, usage, now_ms())?
         else {
             return Ok(None);
         };
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::CacheObserved {
                 provider: model.provider.clone(),
@@ -1632,7 +1692,7 @@ impl<S: EventStore> RuntimeService<S> {
         run_id: RunId,
         transition: ContextTransition,
     ) -> Result<(), RuntimeError> {
-        self.event_store.append(Event::new(
+        self.append_validated_event(Event::new(
             run_id,
             EventKind::ContextTransition {
                 version: orynth_context::CONTEXT_TRANSITION_VERSION,
@@ -2873,6 +2933,83 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mutations_reject_unknown_runs_membership_and_invalid_statuses() {
+        let run_id = RunId::new();
+        let other_run = RunId::new();
+        let agent = AgentIdentity::new(
+            "worker",
+            "validate mutations",
+            ModelRef::new("mock", "cheap", ModelClass::Cheap),
+        );
+        let other_agent = AgentIdentity::new(
+            "other",
+            "other run",
+            ModelRef::new("mock", "cheap", ModelClass::Cheap),
+        );
+        let mut service = RuntimeService::new(InMemoryEventStore::new());
+        service
+            .event_store_mut()
+            .append_batch(&[
+                Event::new(run_id, EventKind::RunCreated { run_id }),
+                Event::new(
+                    run_id,
+                    EventKind::AgentCreated {
+                        agent: agent.clone(),
+                    },
+                ),
+                Event::new(other_run, EventKind::RunCreated { run_id: other_run }),
+                Event::new(
+                    other_run,
+                    EventKind::AgentCreated {
+                        agent: other_agent.clone(),
+                    },
+                ),
+            ])
+            .expect("fixture runs should append");
+        assert!(matches!(
+            service.record_cache_usage(
+                RunId::from_u64(u64::MAX),
+                &agent.model,
+                [0; 32],
+                1,
+                Usage::new(1, 1),
+            ),
+            Err(RuntimeError::EventStore(StoreError::UnknownRun(_)))
+        ));
+        assert!(matches!(
+            service.select_model(run_id, other_agent.id, agent.model.clone()),
+            Err(RuntimeError::EventStore(StoreError::UnknownAgent(_)))
+        ));
+        assert!(matches!(
+            service.resume_agent(run_id, agent.id),
+            Err(RuntimeError::EventStore(StoreError::InvalidTransition(_)))
+        ));
+
+        service
+            .event_store_mut()
+            .append(Event::new(
+                run_id,
+                EventKind::ModelCompleted {
+                    agent_id: agent.id,
+                    usage: Usage::new(1, 1),
+                },
+            ))
+            .expect("completion should append");
+        assert!(matches!(
+            service.pause_agent(run_id, agent.id),
+            Err(RuntimeError::EventStore(StoreError::InvalidTransition(_)))
+        ));
+        assert!(matches!(
+            service.select_model(
+                run_id,
+                agent.id,
+                ModelRef::new("mock", "strong", ModelClass::Strong)
+            ),
+            Err(RuntimeError::EventStore(StoreError::InvalidTransition(_)))
+        ));
+    }
+
+    #[test]
     fn budgets_and_health_survive_sqlite_reopen() {
         let path = temp_path("sqlite-scheduler");
         let run_id = RunId::new();
@@ -2993,10 +3130,57 @@ mod tests {
             vec!["repo:api".to_owned()]
         );
         service
+            .event_store_mut()
+            .append(Event::new(
+                run_id,
+                EventKind::ModelFailed {
+                    agent_id: first.id,
+                    message: "terminal".to_owned(),
+                },
+            ))
+            .expect("agent failure should append");
+        assert!(matches!(
+            service.claim_ownership(run_id, first.id, "repo:other"),
+            Err(RuntimeError::EventStore(StoreError::InvalidTransition(_)))
+        ));
+        service
             .release_ownership(run_id, first.id, "repo:api")
             .expect("owner should release resource");
         let recovered = service.recover(run_id).expect("run should recover");
         assert_eq!(recovered.scheduler.owner("repo:api"), None);
+    }
+
+    #[test]
+    fn cancelling_an_agent_releases_its_scheduler_claims() {
+        let run_id = RunId::new();
+        let agent = AgentIdentity::new(
+            "worker",
+            "release claims on cancellation",
+            ModelRef::new("mock", "cheap", ModelClass::Cheap),
+        );
+        let mut service = RuntimeService::new(InMemoryEventStore::new());
+        service
+            .event_store_mut()
+            .append_batch(&[
+                Event::new(run_id, EventKind::RunCreated { run_id }),
+                Event::new(
+                    run_id,
+                    EventKind::AgentCreated {
+                        agent: agent.clone(),
+                    },
+                ),
+            ])
+            .unwrap();
+        service
+            .claim_ownership(run_id, agent.id, "workspace/src")
+            .unwrap();
+        service.cancel_agent(run_id, agent.id).unwrap();
+        let recovered = service.recover(run_id).unwrap();
+        assert_eq!(recovered.scheduler.owner("workspace/src"), None);
+        assert_eq!(
+            recovered.manager.agents[&agent.id].status,
+            AgentStatus::Cancelled
+        );
     }
 
     #[test]

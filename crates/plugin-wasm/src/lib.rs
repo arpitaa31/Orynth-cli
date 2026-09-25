@@ -14,10 +14,10 @@ use std::{
 use orynth_kernel::{AgentId, TaskId, TrustOrigin};
 use orynth_plugin_api::{
     PluginError, PluginKind, PluginManifest, PluginRequest, PluginResponse, PluginTransport,
-    authorize_manifest,
+    authorize_manifest_with_ownership,
 };
-use orynth_plugin_discovery::{DiscoveredPlugin, revalidate_discovered_plugin};
-use orynth_security::{CapabilityDomain, CapabilityPolicy};
+use orynth_plugin_discovery::{DiscoveredPlugin, read_bounded_file, revalidate_discovered_plugin};
+use orynth_security::{CapabilityDomain, CapabilityPolicy, ResourceOwnershipPolicy};
 use wasmi::{
     Caller, Config, EnforcedLimits, Engine, Extern, Linker, Module, Store, StoreLimits,
     StoreLimitsBuilder, TrapCode,
@@ -151,7 +151,7 @@ pub fn activate_discovered_wasm(
             "WASM module entrypoint must be a regular file",
         ));
     }
-    let bytes = fs::read(&module_path)
+    let bytes = read_bounded_file(&module_path, MAX_WASM_MODULE_BYTES)
         .map_err(|error| PluginError::Protocol(format!("could not read WASM module: {error}")))?;
     WasmPlugin::new(manifest, WasmiInvoker::new(&bytes)?)
 }
@@ -310,7 +310,8 @@ fn capability_check(
         return 0;
     };
     if !context.manifest.capabilities.iter().any(|capability| {
-        capability.domain == domain && resource_matches(&capability.resource, &resource)
+        capability.domain == domain
+            && orynth_security::resource_matches(&capability.resource, &resource)
     }) {
         return 0;
     }
@@ -374,7 +375,8 @@ fn resource_read(
         return -3;
     };
     if !context.manifest.capabilities.iter().any(|capability| {
-        capability.domain == domain && resource_matches(&capability.resource, &resource)
+        capability.domain == domain
+            && orynth_security::resource_matches(&capability.resource, &resource)
     }) {
         return -3;
     }
@@ -424,15 +426,6 @@ fn wasm_capability_domain(tag: i32) -> Option<CapabilityDomain> {
     }
 }
 
-fn resource_matches(granted: &str, requested: &str) -> bool {
-    granted == requested
-        || (requested.starts_with(granted)
-            && requested
-                .as_bytes()
-                .get(granted.len())
-                .is_some_and(|separator| *separator == b'/' || *separator == b'\\'))
-}
-
 fn engine_error(error: wasmi::Error) -> PluginError {
     if matches!(error.as_trap_code(), Some(TrapCode::OutOfFuel)) {
         PluginError::ResourceExhausted("fuel limit".to_owned())
@@ -470,6 +463,7 @@ impl<I: WasmInvoker> PluginTransport for WasmPlugin<I> {
     fn invoke(
         &mut self,
         policy: &CapabilityPolicy,
+        ownership: &dyn ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -481,7 +475,14 @@ impl<I: WasmInvoker> PluginTransport for WasmPlugin<I> {
                 "invocation manifest does not match the bound WASM plugin".to_owned(),
             ));
         }
-        authorize_manifest(policy, agent_id, task_id, now_ms, &self.manifest)?;
+        authorize_manifest_with_ownership(
+            policy,
+            ownership,
+            agent_id,
+            task_id,
+            now_ms,
+            &self.manifest,
+        )?;
         request.validate_with(self.manifest.limits)?;
         let request_id = request.request_id;
         let execution = self.invoker.execute_with_context(
@@ -520,7 +521,7 @@ mod tests {
     use super::*;
     use orynth_kernel::PluginId;
     use orynth_plugin_api::{PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginResourceLimits};
-    use orynth_security::{CapabilityDomain, CapabilityLease, CapabilityPolicy};
+    use orynth_security::{AllowAllOwnership, CapabilityDomain, CapabilityLease, CapabilityPolicy};
     use std::{fs, path::PathBuf};
 
     #[derive(Clone)]
@@ -623,7 +624,15 @@ mod tests {
         )
         .unwrap();
         let response = plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
         assert_eq!(response.origin, TrustOrigin::External);
         assert_eq!(response.payload, vec![2]);
@@ -671,7 +680,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                plugin.invoke(&policy(agent_id), agent_id, None, 1, &manifest, request()),
+                plugin.invoke(
+                    &policy(agent_id),
+                    &AllowAllOwnership,
+                    agent_id,
+                    None,
+                    1,
+                    &manifest,
+                    request(),
+                ),
                 Err(expected)
             );
         }
@@ -696,6 +713,7 @@ mod tests {
         assert!(matches!(
             plugin.invoke(
                 &CapabilityPolicy::new(),
+                &AllowAllOwnership,
                 AgentId::from_u64(9),
                 None,
                 1,
@@ -727,7 +745,15 @@ mod tests {
             WasmPlugin::new(manifest.clone(), WasmiInvoker::new(&module).unwrap()).unwrap();
 
         let response = plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
 
         assert_eq!(response.payload, b"ok");
@@ -764,7 +790,15 @@ mod tests {
             WasmPlugin::new(manifest.clone(), WasmiInvoker::new(&module).unwrap()).unwrap();
 
         assert_eq!(
-            plugin.invoke(&policy(agent_id), agent_id, None, 1, &manifest, request()),
+            plugin.invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            ),
             Err(PluginError::ResourceExhausted("fuel limit".to_owned()))
         );
     }
@@ -794,7 +828,15 @@ mod tests {
             WasmPlugin::new(manifest.clone(), WasmiInvoker::new(&module).unwrap()).unwrap();
 
         let response = plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
 
         assert_eq!(response.payload, b"\x01");
@@ -826,6 +868,7 @@ mod tests {
         let denied_response = denied_plugin
             .invoke(
                 &policy(agent_id),
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -861,7 +904,15 @@ mod tests {
         let mut disabled_plugin =
             WasmPlugin::new(manifest.clone(), WasmiInvoker::new(&module).unwrap()).unwrap();
         let disabled_response = disabled_plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
         assert_eq!(disabled_response.payload, b"\0\0");
 
@@ -874,7 +925,15 @@ mod tests {
         .unwrap();
 
         let response = plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
 
         assert_eq!(response.payload, b"ok");
@@ -912,7 +971,15 @@ mod tests {
         .unwrap();
 
         let response = plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
 
         assert_eq!(response.payload, b"\xfd");
@@ -956,7 +1023,15 @@ mod tests {
         let mut plugin = activate_discovered_wasm(&candidate).unwrap();
 
         let response = plugin
-            .invoke(&policy(agent_id), agent_id, None, 1, &manifest, request())
+            .invoke(
+                &policy(agent_id),
+                &AllowAllOwnership,
+                agent_id,
+                None,
+                1,
+                &manifest,
+                request(),
+            )
             .unwrap();
 
         assert_eq!(response.payload, b"ok");

@@ -6,6 +6,9 @@ use std::{
 };
 
 use orynth_kernel::{AgentId, Event, EventKind, Usage};
+use orynth_security::{
+    OwnershipAccess, OwnershipError, ResourceOwnershipPolicy, canonical_resource, resources_overlap,
+};
 
 pub const SCHEDULER_SCHEMA_VERSION: u16 = 1;
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -122,14 +125,16 @@ fn rank_cache_aware_candidates_at_inner(
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
+        let cache_tie_break = |route: &RankedModelRoute| {
+            if policy.prefer_warm_cache && route.cache_observation_fresh {
+                route.observed_cached_tokens.unwrap_or_default()
+            } else {
+                0
+            }
+        };
         left.effective_cost_micros
             .cmp(&right.effective_cost_micros)
-            .then_with(|| {
-                right
-                    .observed_cached_tokens
-                    .unwrap_or_default()
-                    .cmp(&left.observed_cached_tokens.unwrap_or_default())
-            })
+            .then_with(|| cache_tie_break(right).cmp(&cache_tie_break(left)))
             .then_with(|| left.model.provider.cmp(&right.model.provider))
             .then_with(|| left.model.model.cmp(&right.model.model))
             .then_with(|| model_class_key(&left.model).cmp(&model_class_key(&right.model)))
@@ -376,6 +381,14 @@ pub enum HealthSignal {
     VerificationFailure,
     DependencyInvalidation,
     Progress,
+    FailureResolved,
+    ToolErrorResolved,
+    NoProgressResolved,
+    ContextPressureResolved,
+    BudgetPressureResolved,
+    AssumptionConflictResolved,
+    VerificationFailureResolved,
+    DependencyInvalidationResolved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,6 +402,16 @@ pub struct HealthState {
     pub assumption_conflicts: u32,
     pub verification_failures: u32,
     pub dependency_invalidations: u32,
+    /// Current unresolved pressure. The fields above remain historical
+    /// counters; these fields drive current health.
+    pub active_failures: u32,
+    pub active_tool_errors: u32,
+    pub active_no_progress: u32,
+    pub active_context_pressure: u32,
+    pub active_budget_pressure: u32,
+    pub active_assumption_conflicts: u32,
+    pub active_verification_failures: u32,
+    pub active_dependency_invalidations: u32,
 }
 
 impl Default for HealthState {
@@ -403,6 +426,14 @@ impl Default for HealthState {
             assumption_conflicts: 0,
             verification_failures: 0,
             dependency_invalidations: 0,
+            active_failures: 0,
+            active_tool_errors: 0,
+            active_no_progress: 0,
+            active_context_pressure: 0,
+            active_budget_pressure: 0,
+            active_assumption_conflicts: 0,
+            active_verification_failures: 0,
+            active_dependency_invalidations: 0,
         }
     }
 }
@@ -411,47 +442,90 @@ impl HealthState {
     fn apply_signal(mut self, signal: HealthSignal) -> Self {
         match signal {
             HealthSignal::Failure => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1)
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                self.active_failures = self.active_failures.saturating_add(1);
             }
             HealthSignal::ToolError => {
-                self.consecutive_tool_errors = self.consecutive_tool_errors.saturating_add(1)
+                self.consecutive_tool_errors = self.consecutive_tool_errors.saturating_add(1);
+                self.active_tool_errors = self.active_tool_errors.saturating_add(1);
             }
-            HealthSignal::NoProgress => self.no_progress = self.no_progress.saturating_add(1),
+            HealthSignal::NoProgress => {
+                self.no_progress = self.no_progress.saturating_add(1);
+                self.active_no_progress = self.active_no_progress.saturating_add(1);
+            }
             HealthSignal::ContextPressure => {
-                self.context_pressure = self.context_pressure.saturating_add(1)
+                self.context_pressure = self.context_pressure.saturating_add(1);
+                self.active_context_pressure = self.active_context_pressure.saturating_add(1);
             }
             HealthSignal::BudgetPressure => {
-                self.budget_pressure = self.budget_pressure.saturating_add(1)
+                self.budget_pressure = self.budget_pressure.saturating_add(1);
+                self.active_budget_pressure = self.active_budget_pressure.saturating_add(1);
             }
             HealthSignal::AssumptionConflict => {
-                self.assumption_conflicts = self.assumption_conflicts.saturating_add(1)
+                self.assumption_conflicts = self.assumption_conflicts.saturating_add(1);
+                self.active_assumption_conflicts =
+                    self.active_assumption_conflicts.saturating_add(1);
             }
             HealthSignal::VerificationFailure => {
-                self.verification_failures = self.verification_failures.saturating_add(1)
+                self.verification_failures = self.verification_failures.saturating_add(1);
+                self.active_verification_failures =
+                    self.active_verification_failures.saturating_add(1);
             }
             HealthSignal::DependencyInvalidation => {
-                self.dependency_invalidations = self.dependency_invalidations.saturating_add(1)
+                self.dependency_invalidations = self.dependency_invalidations.saturating_add(1);
+                self.active_dependency_invalidations =
+                    self.active_dependency_invalidations.saturating_add(1);
             }
             HealthSignal::Progress => {
                 self.consecutive_failures = 0;
                 self.consecutive_tool_errors = 0;
                 self.no_progress = 0;
+                self.active_failures = 0;
+                self.active_tool_errors = 0;
+                self.active_no_progress = 0;
+            }
+            HealthSignal::FailureResolved => {
+                self.active_failures = self.active_failures.saturating_sub(1)
+            }
+            HealthSignal::ToolErrorResolved => {
+                self.active_tool_errors = self.active_tool_errors.saturating_sub(1)
+            }
+            HealthSignal::NoProgressResolved => {
+                self.active_no_progress = self.active_no_progress.saturating_sub(1)
+            }
+            HealthSignal::ContextPressureResolved => {
+                self.active_context_pressure = self.active_context_pressure.saturating_sub(1)
+            }
+            HealthSignal::BudgetPressureResolved => {
+                self.active_budget_pressure = self.active_budget_pressure.saturating_sub(1)
+            }
+            HealthSignal::AssumptionConflictResolved => {
+                self.active_assumption_conflicts =
+                    self.active_assumption_conflicts.saturating_sub(1)
+            }
+            HealthSignal::VerificationFailureResolved => {
+                self.active_verification_failures =
+                    self.active_verification_failures.saturating_sub(1)
+            }
+            HealthSignal::DependencyInvalidationResolved => {
+                self.active_dependency_invalidations =
+                    self.active_dependency_invalidations.saturating_sub(1)
             }
         }
-        self.status = if self.dependency_invalidations > 0
-            || self.consecutive_failures >= 3
-            || self.consecutive_tool_errors >= 3
-            || self.assumption_conflicts >= 2
-            || self.verification_failures >= 3
+        self.status = if self.active_dependency_invalidations > 0
+            || self.active_failures >= 3
+            || self.active_tool_errors >= 3
+            || self.active_assumption_conflicts >= 2
+            || self.active_verification_failures >= 3
         {
             HealthStatus::Blocked
-        } else if self.consecutive_failures > 0
-            || self.consecutive_tool_errors > 0
-            || self.no_progress > 0
-            || self.context_pressure > 0
-            || self.budget_pressure > 0
-            || self.assumption_conflicts > 0
-            || self.verification_failures > 0
+        } else if self.active_failures > 0
+            || self.active_tool_errors > 0
+            || self.active_no_progress > 0
+            || self.active_context_pressure > 0
+            || self.active_budget_pressure > 0
+            || self.active_assumption_conflicts > 0
+            || self.active_verification_failures > 0
         {
             HealthStatus::Degraded
         } else {
@@ -582,11 +656,45 @@ impl SchedulerState {
     }
 
     pub fn owner(&self, resource: &str) -> Option<AgentId> {
-        self.ownership.get(resource).copied()
+        canonical_resource(resource).and_then(|resource| self.ownership.get(&resource).copied())
     }
 
     pub fn ownership(&self) -> &BTreeMap<String, AgentId> {
         &self.ownership
+    }
+
+    pub fn authorize_ownership(
+        &self,
+        agent_id: AgentId,
+        resource: &str,
+        access: OwnershipAccess,
+    ) -> Result<(), OwnershipError> {
+        let resource = canonical_resource(resource).ok_or(OwnershipError::Invalid(
+            "resource must be a canonical identity",
+        ))?;
+        if access == OwnershipAccess::Read {
+            return Ok(());
+        }
+        let mut requester_holds = false;
+        for (claimed, owner) in &self.ownership {
+            if !resources_overlap(claimed, &resource) {
+                continue;
+            }
+            if *owner == agent_id {
+                requester_holds = true;
+            } else {
+                return Err(OwnershipError::Conflict {
+                    agent_id,
+                    resource: resource.clone(),
+                    owner: *owner,
+                });
+            }
+        }
+        if requester_holds {
+            Ok(())
+        } else {
+            Err(OwnershipError::Unowned { agent_id, resource })
+        }
     }
 
     pub fn parent_of(&self, child_id: AgentId) -> Option<AgentId> {
@@ -623,20 +731,20 @@ impl SchedulerState {
                 *state = state.apply_signal(signal);
             }
             SchedulerTransition::OwnershipClaimed { agent_id, resource } => {
-                validate_resource(&resource)?;
-                if let Some(owner) = self.owner(&resource)
-                    && owner != agent_id
-                {
-                    return Err(SchedulerError::OwnershipConflict {
-                        resource,
-                        owner,
-                        requester: agent_id,
-                    });
+                let resource = canonical_scheduler_resource(&resource)?;
+                for (claimed, owner) in &self.ownership {
+                    if *owner != agent_id && resources_overlap(claimed, &resource) {
+                        return Err(SchedulerError::OwnershipConflict {
+                            resource,
+                            owner: *owner,
+                            requester: agent_id,
+                        });
+                    }
                 }
                 self.ownership.insert(resource, agent_id);
             }
             SchedulerTransition::OwnershipReleased { agent_id, resource } => {
-                validate_resource(&resource)?;
+                let resource = canonical_scheduler_resource(&resource)?;
                 match self.owner(&resource) {
                     Some(owner) if owner == agent_id => {
                         self.ownership.remove(&resource);
@@ -717,6 +825,17 @@ impl SchedulerState {
             }
         }
         Ok(state)
+    }
+}
+
+impl ResourceOwnershipPolicy for SchedulerState {
+    fn authorize(
+        &self,
+        agent_id: AgentId,
+        resource: &str,
+        access: OwnershipAccess,
+    ) -> Result<(), OwnershipError> {
+        self.authorize_ownership(agent_id, resource, access)
     }
 }
 
@@ -814,6 +933,14 @@ fn transfer_dimension(
     let Some(amount) = amount else {
         return Ok((source, target));
     };
+    if amount == 0 {
+        return Ok((source, target));
+    }
+    if source.is_none() {
+        return Err(SchedulerError::Invalid(
+            "unlimited budget dimensions cannot transfer finite capacity",
+        ));
+    }
     let source = source
         .map(|limit| {
             limit.checked_sub(amount).ok_or(SchedulerError::Invalid(
@@ -1037,6 +1164,14 @@ fn encode_signal(signal: HealthSignal) -> u8 {
         HealthSignal::VerificationFailure => 6,
         HealthSignal::DependencyInvalidation => 7,
         HealthSignal::Progress => 8,
+        HealthSignal::FailureResolved => 9,
+        HealthSignal::ToolErrorResolved => 10,
+        HealthSignal::NoProgressResolved => 11,
+        HealthSignal::ContextPressureResolved => 12,
+        HealthSignal::BudgetPressureResolved => 13,
+        HealthSignal::AssumptionConflictResolved => 14,
+        HealthSignal::VerificationFailureResolved => 15,
+        HealthSignal::DependencyInvalidationResolved => 16,
     }
 }
 
@@ -1052,8 +1187,15 @@ fn validate_resource(resource: &str) -> Result<(), SchedulerError> {
     Ok(())
 }
 
-fn encode_resource(bytes: &mut Vec<u8>, resource: &str) -> Result<(), SchedulerError> {
+fn canonical_scheduler_resource(resource: &str) -> Result<String, SchedulerError> {
     validate_resource(resource)?;
+    canonical_resource(resource).ok_or(SchedulerError::Invalid(
+        "ownership resource must not escape its relative root",
+    ))
+}
+
+fn encode_resource(bytes: &mut Vec<u8>, resource: &str) -> Result<(), SchedulerError> {
+    let resource = canonical_scheduler_resource(resource)?;
     let length =
         u32::try_from(resource.len()).map_err(|_| SchedulerError::TooLarge(resource.len()))?;
     bytes.extend_from_slice(&length.to_le_bytes());
@@ -1072,6 +1214,14 @@ fn decode_signal(tag: u8) -> Result<HealthSignal, SchedulerError> {
         6 => Ok(HealthSignal::VerificationFailure),
         7 => Ok(HealthSignal::DependencyInvalidation),
         8 => Ok(HealthSignal::Progress),
+        9 => Ok(HealthSignal::FailureResolved),
+        10 => Ok(HealthSignal::ToolErrorResolved),
+        11 => Ok(HealthSignal::NoProgressResolved),
+        12 => Ok(HealthSignal::ContextPressureResolved),
+        13 => Ok(HealthSignal::BudgetPressureResolved),
+        14 => Ok(HealthSignal::AssumptionConflictResolved),
+        15 => Ok(HealthSignal::VerificationFailureResolved),
+        16 => Ok(HealthSignal::DependencyInvalidationResolved),
         _ => Err(SchedulerError::Invalid("unknown health signal")),
     }
 }
@@ -1280,6 +1430,74 @@ mod tests {
     }
 
     #[test]
+    fn budget_transfer_rejects_unlimited_or_unconfigured_dimensions() {
+        let source = AgentId::from_u64(7);
+        let target = AgentId::from_u64(8);
+        let mut state = SchedulerState::default();
+        state
+            .apply(SchedulerTransition::BudgetConfigured {
+                agent_id: source,
+                limits: BudgetLimits::default(),
+            })
+            .unwrap();
+        state
+            .apply(SchedulerTransition::BudgetConfigured {
+                agent_id: target,
+                limits: BudgetLimits {
+                    max_tokens: Some(5),
+                    ..BudgetLimits::default()
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            state.apply(SchedulerTransition::BudgetTransferred {
+                from_agent: source,
+                to_agent: target,
+                limits: BudgetLimits {
+                    max_tokens: Some(1),
+                    ..BudgetLimits::default()
+                },
+            }),
+            Err(SchedulerError::Invalid(_))
+        ));
+
+        let mut finite_source = SchedulerState::default();
+        finite_source
+            .apply(SchedulerTransition::BudgetConfigured {
+                agent_id: source,
+                limits: BudgetLimits {
+                    max_tokens: Some(5),
+                    ..BudgetLimits::default()
+                },
+            })
+            .unwrap();
+        finite_source
+            .apply(SchedulerTransition::BudgetConfigured {
+                agent_id: target,
+                limits: BudgetLimits::default(),
+            })
+            .unwrap();
+        finite_source
+            .apply(SchedulerTransition::BudgetTransferred {
+                from_agent: source,
+                to_agent: target,
+                limits: BudgetLimits {
+                    max_tokens: Some(1),
+                    ..BudgetLimits::default()
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            finite_source.budget(source).unwrap().limits.max_tokens,
+            Some(4)
+        );
+        assert_eq!(
+            finite_source.budget(target).unwrap().limits.max_tokens,
+            None
+        );
+    }
+
+    #[test]
     fn cache_affinity_ranking_uses_only_explicit_observations() {
         let warm = ModelRef::new("provider-a", "warm", ModelClass::Strong);
         let cold = ModelRef::new("provider-b", "cold", ModelClass::Cheap);
@@ -1392,6 +1610,54 @@ mod tests {
         );
         assert!(!without_clock[0].cache_observation_fresh);
         assert_eq!(without_clock[0].effective_cost_micros, 100);
+
+        let disabled = rank_cache_aware_candidates_at(
+            [
+                CacheAwareRouteCandidate {
+                    model: fresh_route.model.clone(),
+                    estimated_cost_micros: 10,
+                    observed_cached_tokens: Some(50),
+                    observed_at_ms: Some(950),
+                },
+                CacheAwareRouteCandidate {
+                    model: stale_route.model.clone(),
+                    estimated_cost_micros: 10,
+                    observed_cached_tokens: Some(1),
+                    observed_at_ms: Some(899),
+                },
+            ],
+            CacheRoutingPolicy {
+                prefer_warm_cache: false,
+                cached_token_value_micros: 2,
+                max_observation_age_ms: Some(100),
+            },
+            1000,
+        );
+        assert_eq!(disabled[0].model.provider, "provider-a");
+
+        let stale_tie = rank_cache_aware_candidates_at(
+            [
+                CacheAwareRouteCandidate {
+                    model: ModelRef::new("provider-z", "warm", ModelClass::Cheap),
+                    estimated_cost_micros: 10,
+                    observed_cached_tokens: Some(50),
+                    observed_at_ms: Some(0),
+                },
+                CacheAwareRouteCandidate {
+                    model: ModelRef::new("provider-a", "cold", ModelClass::Cheap),
+                    estimated_cost_micros: 10,
+                    observed_cached_tokens: None,
+                    observed_at_ms: None,
+                },
+            ],
+            CacheRoutingPolicy {
+                prefer_warm_cache: true,
+                cached_token_value_micros: 1,
+                max_observation_age_ms: Some(1),
+            },
+            1000,
+        );
+        assert_eq!(stale_tie[0].model.provider, "provider-a");
     }
 
     #[test]
@@ -1497,6 +1763,58 @@ mod tests {
     }
 
     #[test]
+    fn health_history_remains_while_resolution_recovers_current_status() {
+        let agent_id = AgentId::from_u64(7);
+        let mut state = SchedulerState::default();
+        for _ in 0..3 {
+            state
+                .apply(SchedulerTransition::HealthSignaled {
+                    agent_id,
+                    signal: HealthSignal::Failure,
+                })
+                .unwrap();
+        }
+        assert_eq!(state.health(agent_id).status, HealthStatus::Blocked);
+        assert_eq!(state.health(agent_id).consecutive_failures, 3);
+        assert_eq!(state.health(agent_id).active_failures, 3);
+        state
+            .apply(SchedulerTransition::HealthSignaled {
+                agent_id,
+                signal: HealthSignal::Progress,
+            })
+            .unwrap();
+        assert_eq!(state.health(agent_id).status, HealthStatus::Healthy);
+        assert_eq!(state.health(agent_id).consecutive_failures, 0);
+        assert_eq!(state.health(agent_id).active_failures, 0);
+
+        for _ in 0..2 {
+            state
+                .apply(SchedulerTransition::HealthSignaled {
+                    agent_id,
+                    signal: HealthSignal::AssumptionConflict,
+                })
+                .unwrap();
+        }
+        assert_eq!(state.health(agent_id).status, HealthStatus::Blocked);
+        state
+            .apply(SchedulerTransition::HealthSignaled {
+                agent_id,
+                signal: HealthSignal::AssumptionConflictResolved,
+            })
+            .unwrap();
+        state
+            .apply(SchedulerTransition::HealthSignaled {
+                agent_id,
+                signal: HealthSignal::AssumptionConflictResolved,
+            })
+            .unwrap();
+        let health = state.health(agent_id);
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert_eq!(health.assumption_conflicts, 2);
+        assert_eq!(health.active_assumption_conflicts, 0);
+    }
+
+    #[test]
     fn transition_codec_rejects_trailing_bytes() {
         let mut payload = encode_transition(&SchedulerTransition::HealthSignaled {
             agent_id: AgentId::from_u64(7),
@@ -1547,6 +1865,74 @@ mod tests {
         );
         state.apply(transition).unwrap();
         assert_eq!(state.owner("repo:api"), None);
+    }
+
+    #[test]
+    fn ownership_policy_distinguishes_read_access_and_overlapping_writes() {
+        let owner = AgentId::from_u64(7);
+        let other = AgentId::from_u64(8);
+        let mut state = SchedulerState::default();
+        state
+            .apply(SchedulerTransition::OwnershipClaimed {
+                agent_id: owner,
+                resource: "workspace/src".to_owned(),
+            })
+            .unwrap();
+        assert!(
+            state
+                .authorize_ownership(owner, "workspace/src/lib.rs", OwnershipAccess::Write)
+                .is_ok()
+        );
+        assert!(
+            state
+                .authorize_ownership(other, "workspace/src/lib.rs", OwnershipAccess::Read)
+                .is_ok()
+        );
+        assert!(matches!(
+            state.authorize_ownership(other, "workspace/src/lib.rs", OwnershipAccess::Write),
+            Err(OwnershipError::Conflict { .. })
+        ));
+        assert!(matches!(
+            state.apply(SchedulerTransition::OwnershipClaimed {
+                agent_id: other,
+                resource: "workspace/src/auth".to_owned(),
+            }),
+            Err(SchedulerError::OwnershipConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn ownership_claims_use_one_canonical_identity_for_replay_and_release() {
+        let owner = AgentId::from_u64(7);
+        let mut state = SchedulerState::default();
+        state
+            .apply(SchedulerTransition::OwnershipClaimed {
+                agent_id: owner,
+                resource: "workspace/src/./auth/../lib.rs".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(state.owner("workspace/src/lib.rs"), Some(owner));
+        assert!(matches!(
+            state.apply(SchedulerTransition::OwnershipClaimed {
+                agent_id: AgentId::from_u64(8),
+                resource: "workspace/src/lib.rs".to_owned(),
+            }),
+            Err(SchedulerError::OwnershipConflict { .. })
+        ));
+        state
+            .apply(SchedulerTransition::OwnershipReleased {
+                agent_id: owner,
+                resource: "workspace/src/lib.rs".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(state.owner("workspace/src/lib.rs"), None);
+        assert!(matches!(
+            state.apply(SchedulerTransition::OwnershipClaimed {
+                agent_id: owner,
+                resource: "../../outside".to_owned(),
+            }),
+            Err(SchedulerError::Invalid(_))
+        ));
     }
 
     #[test]

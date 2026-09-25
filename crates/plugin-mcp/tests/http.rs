@@ -7,20 +7,40 @@ use std::{
 
 use orynth_kernel::{AgentId, PluginId, TrustOrigin};
 use orynth_plugin_api::{
-    PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginKind, PluginManifest, PluginRequest,
-    PluginResourceLimits, PluginTransport,
+    PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginError, PluginKind, PluginManifest,
+    PluginRequest, PluginResourceLimits, PluginTransport,
 };
 use orynth_plugin_mcp::{
     HttpMcpTransport, McpAdapter, McpClientInfo, McpConnectionContext, McpProtocolMode,
     McpServerInfo, SessionMcpInvoker,
 };
-use orynth_security::{CapabilityDomain, CapabilityLease, CapabilityPolicy};
+use orynth_security::{
+    AllowAllOwnership, CapabilityDomain, CapabilityLease, CapabilityPolicy, OwnershipAccess,
+    OwnershipError, ResourceOwnershipPolicy,
+};
+
+struct DenyOwnership;
+
+impl ResourceOwnershipPolicy for DenyOwnership {
+    fn authorize(
+        &self,
+        agent_id: AgentId,
+        resource: &str,
+        _access: OwnershipAccess,
+    ) -> Result<(), OwnershipError> {
+        Err(OwnershipError::Unowned {
+            agent_id,
+            resource: resource.to_owned(),
+        })
+    }
+}
 
 fn server() -> McpServerInfo {
     McpServerInfo {
         name: "http-fixture".to_owned(),
         version: "1".to_owned(),
         protocol_version: 1,
+        wire_protocol_version: Some(orynth_plugin_mcp::MCP_MODERN_PROTOCOL_VERSION.to_owned()),
         metadata: Default::default(),
     }
 }
@@ -59,6 +79,35 @@ fn policy(agent_id: AgentId, endpoint: &str) -> CapabilityPolicy {
         })
         .unwrap();
     policy
+}
+
+#[test]
+fn http_connection_rejects_missing_resource_ownership_before_network_io() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let manifest = manifest(&endpoint);
+    let agent_id = AgentId::from_u64(299);
+    let result = HttpMcpTransport::new(&endpoint, manifest.clone(), Duration::from_secs(2))
+        .unwrap()
+        .connect(
+            McpProtocolMode::Modern2026,
+            client(),
+            server(),
+            McpConnectionContext {
+                policy: &policy(agent_id, &endpoint),
+                ownership: &DenyOwnership,
+                agent_id,
+                task_id: None,
+                now_ms: 1,
+            },
+        );
+    assert!(matches!(
+        result,
+        Err(orynth_plugin_mcp::McpError::Plugin(
+            PluginError::CapabilityDenied(_)
+        ))
+    ));
+    drop(listener);
 }
 
 fn read_headers(stream: &mut TcpStream) -> String {
@@ -135,6 +184,7 @@ fn modern_http_session_round_trips_through_mcp_adapter() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &endpoint),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,
@@ -146,6 +196,7 @@ fn modern_http_session_round_trips_through_mcp_adapter() {
     let response = adapter
         .invoke(
             &policy(agent_id, &endpoint),
+            &AllowAllOwnership,
             agent_id,
             None,
             1,
@@ -227,6 +278,7 @@ fn modern_http_sse_handles_server_request_before_response() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &endpoint),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,
@@ -238,6 +290,7 @@ fn modern_http_sse_handles_server_request_before_response() {
     let response = adapter
         .invoke(
             &policy(agent_id, &endpoint),
+            &AllowAllOwnership,
             agent_id,
             None,
             1,
@@ -306,6 +359,7 @@ fn modern_http_sse_reconnects_active_request_from_event_cursor() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &endpoint),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,
@@ -317,6 +371,7 @@ fn modern_http_sse_reconnects_active_request_from_event_cursor() {
     let response = adapter
         .invoke(
             &policy(agent_id, &endpoint),
+            &AllowAllOwnership,
             agent_id,
             None,
             1,
@@ -401,6 +456,7 @@ fn http_get_sse_stream_handles_requests_and_resumption_cursor() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &endpoint),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,
@@ -474,6 +530,7 @@ fn http_get_sse_stream_reconnects_when_retry_is_advertised() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &endpoint),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,

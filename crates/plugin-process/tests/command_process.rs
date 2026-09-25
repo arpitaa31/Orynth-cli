@@ -14,7 +14,7 @@ use orynth_plugin_process::{
     CommandProcessInvoker, ProcessCommand, ProcessPlugin, ProcessState, ProcessSupervisor,
     activate_discovered_process,
 };
-use orynth_security::{CapabilityDomain, CapabilityLease, CapabilityPolicy};
+use orynth_security::{AllowAllOwnership, CapabilityDomain, CapabilityLease, CapabilityPolicy};
 
 fn fixture_path() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_orynth-process-fixture")
@@ -89,6 +89,7 @@ fn command_invoker_launches_bounded_process_and_round_trips_payload() {
     let response = orynth_plugin_api::PluginTransport::invoke(
         &mut plugin,
         &policy(agent_id, &program),
+        &AllowAllOwnership,
         agent_id,
         None,
         1,
@@ -129,6 +130,7 @@ fn command_invoker_enforces_effect_capability_at_spawn_boundary() {
     let error = orynth_plugin_api::PluginTransport::invoke(
         &mut plugin,
         &CapabilityPolicy::new(),
+        &AllowAllOwnership,
         agent_id,
         None,
         1,
@@ -154,7 +156,7 @@ fn supervisor_fails_closed_on_real_process_crash_and_timeout() {
         ProcessSupervisor::new(ProcessPlugin::new(crash_manifest.clone(), crash_invoker).unwrap());
     crash_supervisor.start().unwrap();
     let error = crash_supervisor
-        .invoke(&policy, agent_id, None, 1, request(3))
+        .invoke(&policy, &AllowAllOwnership, agent_id, None, 1, request(3))
         .expect_err("fixture should exit unsuccessfully");
     assert!(matches!(error, orynth_plugin_api::PluginError::Crashed(_)));
     assert_eq!(crash_supervisor.state(), ProcessState::Crashed);
@@ -172,7 +174,7 @@ fn supervisor_fails_closed_on_real_process_crash_and_timeout() {
         ProcessSupervisor::new(ProcessPlugin::new(timeout_manifest, timeout_invoker).unwrap());
     timeout_supervisor.start().unwrap();
     assert_eq!(
-        timeout_supervisor.invoke(&policy, agent_id, None, 1, request(4)),
+        timeout_supervisor.invoke(&policy, &AllowAllOwnership, agent_id, None, 1, request(4)),
         Err(orynth_plugin_api::PluginError::TimedOut)
     );
     assert_eq!(timeout_supervisor.state(), ProcessState::TimedOut);

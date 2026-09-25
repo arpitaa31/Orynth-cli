@@ -39,3 +39,12 @@ Significant decisions record context, decision, alternatives, consequences, and 
   question/answer envelopes.
 - ADR-0060 records bounded manager observability for context, cache, artifacts,
   and per-agent failure-memory identifiers.
+- ADR-0061 records Phase A audit remediation for effect-boundary path
+  confinement, durable undo identity, restart-safe IDs, filesystem batch
+  commits, and structured MCP endpoint authorization.
+- ADR-0062 records Phase B audit remediation for snapshot identity, context
+  freshness, cache and health evidence, validated runtime appends, typed tool
+  effects, schema-declared syntax normalization, and process allowlisting.
+- ADR-0063 records Phase C boundary hardening for bounded process I/O,
+  suspended-before-attach Windows containment, bounded discovery/WASM reads,
+  cumulative plugin admission, MCP wire negotiation, and enforced ownership.

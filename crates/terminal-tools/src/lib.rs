@@ -17,8 +17,8 @@ use std::{
 
 use orynth_security::CapabilityDomain;
 use orynth_tool_runtime::{
-    EffectClass, ToolDefinition, ToolExecution, ToolExecutor, ToolPlanner, ToolPreview,
-    ToolVerifier,
+    EffectClass, OwnershipRequirement, ToolDefinition, ToolEffectStatus, ToolExecution,
+    ToolExecutor, ToolPlanner, ToolPreview, ToolVerifier,
 };
 
 pub const FILESYSTEM_WRITE_TOOL: &str = "filesystem.write_text";
@@ -427,6 +427,7 @@ impl std::error::Error for FilesystemError {}
 pub enum ProcessError {
     InvalidInput(&'static str),
     UnsupportedTool(String),
+    ExecutableNotAllowed(String),
     ShellInterpreter,
     ShellMetacharacter,
     ArgumentIndex,
@@ -439,6 +440,12 @@ impl fmt::Display for ProcessError {
         match self {
             Self::InvalidInput(field) => write!(formatter, "invalid process input {field}"),
             Self::UnsupportedTool(name) => write!(formatter, "unsupported process tool {name:?}"),
+            Self::ExecutableNotAllowed(program) => {
+                write!(
+                    formatter,
+                    "process executable is not allowlisted: {program:?}"
+                )
+            }
             Self::ShellInterpreter => formatter.write_str("shell interpreters are not allowed"),
             Self::ShellMetacharacter => {
                 formatter.write_str("process input contains shell metacharacters")
@@ -459,10 +466,17 @@ pub fn write_text_definition() -> ToolDefinition {
         name: FILESYSTEM_WRITE_TOOL.to_owned(),
         version: "1".to_owned(),
         required_fields: vec!["path".to_owned(), "content".to_owned()],
+        syntax_fields: vec!["path".to_owned()],
         capability: Some(orynth_tool_runtime::CapabilityRequirement {
             domain: CapabilityDomain::Filesystem,
             resource: String::new(),
             input_field: Some("path".to_owned()),
+            input_fields: Vec::new(),
+        }),
+        ownership: Some(OwnershipRequirement {
+            access: orynth_security::OwnershipAccess::Write,
+            resource: String::new(),
+            input_fields: vec!["path".to_owned()],
         }),
         risk: orynth_tool_runtime::RiskLevel::Confirm,
         reversible: true,
@@ -474,10 +488,17 @@ pub fn move_definition() -> ToolDefinition {
         name: FILESYSTEM_MOVE_TOOL.to_owned(),
         version: "1".to_owned(),
         required_fields: vec!["from".to_owned(), "to".to_owned()],
+        syntax_fields: vec!["from".to_owned(), "to".to_owned()],
         capability: Some(orynth_tool_runtime::CapabilityRequirement {
             domain: CapabilityDomain::Filesystem,
-            resource: "filesystem".to_owned(),
+            resource: String::new(),
             input_field: None,
+            input_fields: vec!["from".to_owned(), "to".to_owned()],
+        }),
+        ownership: Some(OwnershipRequirement {
+            access: orynth_security::OwnershipAccess::Write,
+            resource: String::new(),
+            input_fields: vec!["from".to_owned(), "to".to_owned()],
         }),
         risk: orynth_tool_runtime::RiskLevel::Confirm,
         reversible: true,
@@ -493,10 +514,17 @@ pub fn find_files_definition() -> ToolDefinition {
             "pattern".to_owned(),
             "max_results".to_owned(),
         ],
+        syntax_fields: vec!["root".to_owned(), "pattern".to_owned()],
         capability: Some(orynth_tool_runtime::CapabilityRequirement {
             domain: CapabilityDomain::Filesystem,
             resource: String::new(),
             input_field: Some("root".to_owned()),
+            input_fields: Vec::new(),
+        }),
+        ownership: Some(OwnershipRequirement {
+            access: orynth_security::OwnershipAccess::Read,
+            resource: String::new(),
+            input_fields: vec!["root".to_owned()],
         }),
         risk: orynth_tool_runtime::RiskLevel::Safe,
         reversible: false,
@@ -508,10 +536,17 @@ pub fn copy_definition() -> ToolDefinition {
         name: FILESYSTEM_COPY_TOOL.to_owned(),
         version: "1".to_owned(),
         required_fields: vec!["from".to_owned(), "to".to_owned()],
+        syntax_fields: vec!["from".to_owned(), "to".to_owned()],
         capability: Some(orynth_tool_runtime::CapabilityRequirement {
             domain: CapabilityDomain::Filesystem,
-            resource: "filesystem".to_owned(),
+            resource: String::new(),
             input_field: None,
+            input_fields: vec!["from".to_owned(), "to".to_owned()],
+        }),
+        ownership: Some(OwnershipRequirement {
+            access: orynth_security::OwnershipAccess::Write,
+            resource: String::new(),
+            input_fields: vec!["from".to_owned(), "to".to_owned()],
         }),
         risk: orynth_tool_runtime::RiskLevel::Confirm,
         reversible: true,
@@ -523,10 +558,17 @@ pub fn remove_definition() -> ToolDefinition {
         name: FILESYSTEM_REMOVE_TOOL.to_owned(),
         version: "1".to_owned(),
         required_fields: vec!["path".to_owned()],
+        syntax_fields: vec!["path".to_owned()],
         capability: Some(orynth_tool_runtime::CapabilityRequirement {
             domain: CapabilityDomain::Filesystem,
-            resource: "filesystem".to_owned(),
-            input_field: None,
+            resource: String::new(),
+            input_field: Some("path".to_owned()),
+            input_fields: Vec::new(),
+        }),
+        ownership: Some(OwnershipRequirement {
+            access: orynth_security::OwnershipAccess::Write,
+            resource: String::new(),
+            input_fields: vec!["path".to_owned()],
         }),
         risk: orynth_tool_runtime::RiskLevel::High,
         reversible: true,
@@ -538,10 +580,17 @@ pub fn process_definition() -> ToolDefinition {
         name: PROCESS_RUN_TOOL.to_owned(),
         version: "1".to_owned(),
         required_fields: vec!["program".to_owned()],
+        syntax_fields: vec!["program".to_owned()],
         capability: Some(orynth_tool_runtime::CapabilityRequirement {
             domain: CapabilityDomain::Process,
             resource: String::new(),
             input_field: Some("program".to_owned()),
+            input_fields: Vec::new(),
+        }),
+        ownership: Some(OwnershipRequirement {
+            access: orynth_security::OwnershipAccess::Write,
+            resource: String::new(),
+            input_fields: vec!["program".to_owned()],
         }),
         risk: orynth_tool_runtime::RiskLevel::High,
         reversible: false,
@@ -554,7 +603,6 @@ pub struct FilesystemFixture {
     internal_root: PathBuf,
     quarantine_root: PathBuf,
     undo: BTreeMap<String, UndoRecord>,
-    next_undo: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -591,7 +639,6 @@ impl FilesystemFixture {
             quarantine_root: root.join(".orynth-quarantine"),
             root,
             undo: BTreeMap::new(),
-            next_undo: 1,
         })
     }
 
@@ -670,7 +717,7 @@ impl FilesystemFixture {
                             .to_string(),
                     );
                 }
-                fs::rename(quarantined, original).map_err(io_error)?;
+                link_then_remove(&quarantined, &original)?;
             }
         }
         Ok(())
@@ -701,6 +748,7 @@ impl FilesystemFixture {
             }
         }
         let candidate = self.root.join(path);
+        self.reject_reparse_components(path, relative)?;
         let parent = candidate
             .parent()
             .ok_or_else(|| FilesystemError::InvalidPath(relative.to_owned()).to_string())?;
@@ -729,9 +777,55 @@ impl FilesystemFixture {
     }
 
     fn token(&mut self) -> String {
-        let token = format!("fs-fixture-{}", self.next_undo);
-        self.next_undo = self.next_undo.saturating_add(1);
-        token
+        format!("fs-undo-{:016x}", orynth_kernel::new_durable_id())
+    }
+
+    fn reject_reparse_components(&self, path: &Path, original: &str) -> Result<(), String> {
+        let mut current = self.root.clone();
+        let components = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value),
+                Component::CurDir => None,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                        return Err(FilesystemError::InvalidPath(original.to_owned()).to_string());
+                    }
+                    if index + 1 < components.len() && !metadata.is_dir() {
+                        return Err(FilesystemError::MissingPath(original.to_owned()).to_string());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if index + 1 < components.len() {
+                        return Err(FilesystemError::MissingPath(original.to_owned()).to_string());
+                    }
+                    break;
+                }
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_quarantine_root(&self) -> Result<PathBuf, String> {
+        let relative = ".orynth-quarantine";
+        let path = self.checked_path(relative)?;
+        if path.exists() {
+            if !path.is_dir() {
+                return Err(
+                    FilesystemError::InvalidInput("quarantine path is not a directory").to_string(),
+                );
+            }
+            return Ok(path);
+        }
+        fs::create_dir(&path).map_err(io_error)?;
+        self.checked_path(relative)
     }
 
     fn relative(&self, path: &Path) -> String {
@@ -763,8 +857,9 @@ impl FilesystemFixture {
             },
         );
         Ok(ToolExecution {
-            output: token,
+            output: Some(token),
             compensation_available: true,
+            effect_status: ToolEffectStatus::Confirmed,
         })
     }
 
@@ -782,8 +877,9 @@ impl FilesystemFixture {
         self.undo
             .insert(token.clone(), UndoRecord::Move { from, to });
         Ok(ToolExecution {
-            output: token,
+            output: Some(token),
             compensation_available: true,
+            effect_status: ToolEffectStatus::Confirmed,
         })
     }
 
@@ -805,8 +901,9 @@ impl FilesystemFixture {
         self.undo
             .insert(token.clone(), UndoRecord::Copy { to, after });
         Ok(ToolExecution {
-            output: token,
+            output: Some(token),
             compensation_available: true,
+            effect_status: ToolEffectStatus::Confirmed,
         })
     }
 
@@ -825,15 +922,16 @@ impl FilesystemFixture {
         {
             return Err(FilesystemError::InvalidInput("path is already quarantined").to_string());
         }
-        fs::create_dir_all(&self.quarantine_root).map_err(io_error)?;
+        let quarantine_root = self.ensure_quarantine_root()?;
         let token = self.token();
         let name = original
             .file_name()
             .ok_or_else(|| FilesystemError::InvalidPath(self.relative(&original)).to_string())?;
-        let quarantined = self
-            .quarantine_root
-            .join(format!("{token}-{}", name.to_string_lossy()));
-        fs::rename(&original, &quarantined).map_err(io_error)?;
+        let quarantined = quarantine_root.join(format!("{token}-{}", name.to_string_lossy()));
+        fs::hard_link(&original, &quarantined).map_err(io_error)?;
+        if let Err(error) = fs::remove_file(&original) {
+            return Err(io_error(error));
+        }
         self.undo.insert(
             token.clone(),
             UndoRecord::Quarantine {
@@ -842,8 +940,9 @@ impl FilesystemFixture {
             },
         );
         Ok(ToolExecution {
-            output: token,
+            output: Some(token),
             compensation_available: true,
+            effect_status: ToolEffectStatus::Confirmed,
         })
     }
 
@@ -971,8 +1070,9 @@ impl ToolExecutor for FilesystemFixture {
                 let (root, pattern, max_results) = self.find_input(input)?;
                 let matches = self.find_files(&root, &pattern, max_results)?;
                 Ok(ToolExecution {
-                    output: matches.join("\n"),
+                    output: Some(matches.join("\n")),
                     compensation_available: false,
+                    effect_status: ToolEffectStatus::Confirmed,
                 })
             }
             other => Err(FilesystemError::UnsupportedTool(other.to_owned()).to_string()),
@@ -1112,14 +1212,43 @@ pub trait ProcessInvoker {
     fn run(&mut self, program: &str, args: &[String]) -> Result<String, String>;
 }
 
+/// Explicit process executable policy. An empty policy denies every process.
+/// The actual fixture checks it immediately before invoking the injected
+/// process boundary; shell names are not maintained as a security denylist.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProcessPolicy {
+    allowed_executables: BTreeSet<String>,
+}
+
+impl ProcessPolicy {
+    pub fn allow_executable(mut self, program: impl AsRef<str>) -> Self {
+        self.allowed_executables
+            .insert(process_identity(program.as_ref()));
+        self
+    }
+
+    pub fn allows(&self, program: &str) -> bool {
+        self.allowed_executables
+            .contains(&process_identity(program))
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessFixture<I> {
     invoker: I,
+    policy: ProcessPolicy,
 }
 
 impl<I> ProcessFixture<I> {
     pub fn new(invoker: I) -> Self {
-        Self { invoker }
+        Self {
+            invoker,
+            policy: ProcessPolicy::default(),
+        }
+    }
+
+    pub fn with_policy(invoker: I, policy: ProcessPolicy) -> Self {
+        Self { invoker, policy }
     }
 
     pub fn invoker(&self) -> &I {
@@ -1138,12 +1267,6 @@ impl<I> ProcessFixture<I> {
                 .any(|character| ";&|<>$`\n\r".contains(character))
         {
             return Err(ProcessError::ShellMetacharacter.to_string());
-        }
-        if matches!(
-            program.to_ascii_lowercase().as_str(),
-            "sh" | "bash" | "cmd" | "cmd.exe" | "powershell" | "pwsh"
-        ) {
-            return Err(ProcessError::ShellInterpreter.to_string());
         }
         let mut indexed = BTreeMap::new();
         for (key, value) in input {
@@ -1171,6 +1294,13 @@ impl<I> ProcessFixture<I> {
         }
         Ok((program.to_owned(), args))
     }
+
+    fn authorize(&self, program: &str) -> Result<(), String> {
+        self.policy
+            .allows(program)
+            .then_some(())
+            .ok_or_else(|| ProcessError::ExecutableNotAllowed(program.to_owned()).to_string())
+    }
 }
 
 impl<I: ProcessInvoker> ToolPlanner for ProcessFixture<I> {
@@ -1183,6 +1313,7 @@ impl<I: ProcessInvoker> ToolPlanner for ProcessFixture<I> {
             return Err(ProcessError::UnsupportedTool(definition.name.clone()).to_string());
         }
         let (program, args) = Self::request(input)?;
+        self.authorize(&program)?;
         Ok(ToolPreview {
             summary: format!("run {program} with {} argument(s)", args.len()),
             resources: vec![format!("process:{program}")],
@@ -1202,13 +1333,15 @@ impl<I: ProcessInvoker> ToolExecutor for ProcessFixture<I> {
             return Err(ProcessError::UnsupportedTool(definition.name.clone()).to_string());
         }
         let (program, args) = Self::request(input)?;
+        self.authorize(&program)?;
         let output = self
             .invoker
             .run(&program, &args)
             .map_err(|error| ProcessError::Invocation(error).to_string())?;
         Ok(ToolExecution {
-            output,
+            output: Some(output),
             compensation_available: false,
+            effect_status: ToolEffectStatus::Confirmed,
         })
     }
 
@@ -1219,6 +1352,17 @@ impl<I: ProcessInvoker> ToolExecutor for ProcessFixture<I> {
         _output: &str,
     ) -> Result<(), String> {
         Err("process effects are irreversible and have no compensation".to_owned())
+    }
+}
+
+fn process_identity(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        program.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        program.to_owned()
     }
 }
 
@@ -1242,6 +1386,27 @@ impl<I: ProcessInvoker> ToolVerifier for ProcessFixture<I> {
 
 fn io_error(error: std::io::Error) -> String {
     error.to_string()
+}
+
+fn link_then_remove(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::hard_link(source, destination).map_err(io_error)?;
+    if let Err(error) = fs::remove_file(source) {
+        return Err(io_error(error));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn content_digest(bytes: &[u8]) -> u64 {
@@ -1347,7 +1512,7 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 mod tests {
     use super::*;
     use orynth_kernel::{AgentId, RunId};
-    use orynth_security::CapabilityLease;
+    use orynth_security::{AllowAllOwnership, CapabilityLease};
     use orynth_tool_runtime::{
         ApprovalSource, CapabilityRequirement, RiskLevel, ToolProposal, ToolProvenance, ToolRuntime,
     };
@@ -1416,17 +1581,22 @@ mod tests {
         let mut fixture = FilesystemFixture::new(&root).unwrap();
         let agent_id = AgentId::from_u64(7);
         let runtime = runtime(agent_id);
+        let ownership = AllowAllOwnership;
         let mut transaction = runtime
-            .validate(&proposal(agent_id, "src/file.txt"), 50)
+            .validate_with_ownership(&proposal(agent_id, "src/file.txt"), 50, &ownership)
             .unwrap();
         let preview = runtime.preview(&transaction, &fixture).unwrap();
         assert_eq!(preview.effect, EffectClass::Reversible);
         runtime
             .approve(&mut transaction, ApprovalSource::User)
             .unwrap();
-        runtime.execute(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut transaction, &fixture).unwrap();
-        runtime.compensate(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .compensate_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         assert_eq!(
             fs::read_to_string(root.join("src/file.txt")).unwrap(),
             "old contents"
@@ -1457,17 +1627,26 @@ mod tests {
         let mut fixture = FilesystemFixture::new(&root).unwrap();
         let agent_id = AgentId::from_u64(7);
         let runtime = runtime(agent_id);
+        let ownership = AllowAllOwnership;
         let mut transaction = runtime
-            .validate(&proposal(agent_id, "src/file.txt"), 50)
+            .validate_with_ownership(&proposal(agent_id, "src/file.txt"), 50, &ownership)
             .unwrap();
         runtime
             .approve(&mut transaction, ApprovalSource::User)
             .unwrap();
-        runtime.execute(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         fs::write(root.join("src/file.txt"), "later change").unwrap();
-        assert!(runtime.compensate(&mut transaction, &mut fixture).is_err());
+        assert!(
+            runtime
+                .compensate_with_ownership(&mut transaction, &mut fixture, &ownership)
+                .is_err()
+        );
         fs::write(root.join("src/file.txt"), "new contents").unwrap();
-        runtime.compensate(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .compensate_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         assert_eq!(
             fs::read_to_string(root.join("src/file.txt")).unwrap(),
             "old contents"
@@ -1491,7 +1670,7 @@ mod tests {
                 agent_id,
                 task_id: None,
                 domain: CapabilityDomain::Filesystem,
-                resource: "filesystem".to_owned(),
+                resource: ".".to_owned(),
                 expires_at_ms: u128::MAX,
             })
             .unwrap();
@@ -1509,14 +1688,21 @@ mod tests {
             provenance: ToolProvenance::Agent,
             input_origins: Vec::new(),
         };
-        let mut transaction = runtime.validate(&proposal, 50).unwrap();
+        let ownership = AllowAllOwnership;
+        let mut transaction = runtime
+            .validate_with_ownership(&proposal, 50, &ownership)
+            .unwrap();
         runtime.preview(&transaction, &fixture).unwrap();
         runtime
             .approve(&mut transaction, ApprovalSource::User)
             .unwrap();
-        runtime.execute(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut transaction, &fixture).unwrap();
-        runtime.compensate(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .compensate_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         assert!(root.join("src/file.txt").exists());
         assert!(!root.join("dest/file.txt").exists());
         let _ = fs::remove_dir_all(root);
@@ -1564,22 +1750,67 @@ mod tests {
             provenance: ToolProvenance::Agent,
             input_origins: Vec::new(),
         };
-        let mut transaction = runtime.validate(&proposal, 50).unwrap();
-        let mut fixture = ProcessFixture::new(MockInvoker::default());
+        let ownership = AllowAllOwnership;
+        let mut transaction = runtime
+            .validate_with_ownership(&proposal, 50, &ownership)
+            .unwrap();
+        let mut fixture = ProcessFixture::with_policy(
+            MockInvoker::default(),
+            ProcessPolicy::default().allow_executable("cargo"),
+        );
         let preview = runtime.preview(&transaction, &fixture).unwrap();
         assert_eq!(preview.effect, EffectClass::Irreversible);
         runtime
             .approve(&mut transaction, ApprovalSource::User)
             .unwrap();
-        runtime.execute(&mut transaction, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut transaction, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut transaction, &fixture).unwrap();
-        assert!(runtime.compensate(&mut transaction, &mut fixture).is_err());
+        assert!(
+            runtime
+                .compensate_with_ownership(&mut transaction, &mut fixture, &ownership)
+                .is_err()
+        );
         assert_eq!(fixture.invoker().calls[0].0, "cargo");
         assert_eq!(fixture.invoker().calls[0].1, vec!["test"]);
 
         let mut shell = proposal.clone();
         shell.input.insert("program".to_owned(), "sh".to_owned());
         assert!(runtime.validate(&shell, 50).is_err());
+    }
+
+    #[test]
+    fn process_policy_allows_only_explicit_executables_at_the_effect_boundary() {
+        let fixture = ProcessFixture::with_policy(
+            MockInvoker::default(),
+            ProcessPolicy::default().allow_executable("cargo"),
+        );
+        let definition = process_definition();
+        let allowed = [("program".to_owned(), "cargo".to_owned())]
+            .into_iter()
+            .collect();
+        assert!(fixture.preview(&definition, &allowed).is_ok());
+        for program in [
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "bash",
+            "bash.exe",
+            "sh",
+            "zsh",
+            "unexpected",
+        ] {
+            let input = [("program".to_owned(), program.to_owned())]
+                .into_iter()
+                .collect();
+            assert!(
+                fixture.preview(&definition, &input).is_err(),
+                "{program} must be denied"
+            );
+        }
     }
 
     #[test]
@@ -1729,7 +1960,7 @@ mod tests {
                 agent_id,
                 task_id: None,
                 domain: CapabilityDomain::Filesystem,
-                resource: "filesystem".to_owned(),
+                resource: ".".to_owned(),
                 expires_at_ms: u128::MAX,
             })
             .unwrap();
@@ -1748,11 +1979,18 @@ mod tests {
             provenance: ToolProvenance::Agent,
             input_origins: Vec::new(),
         };
-        let mut copy = runtime.validate(&copy_proposal, 50).unwrap();
+        let ownership = AllowAllOwnership;
+        let mut copy = runtime
+            .validate_with_ownership(&copy_proposal, 50, &ownership)
+            .unwrap();
         runtime.approve(&mut copy, ApprovalSource::User).unwrap();
-        runtime.execute(&mut copy, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut copy, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut copy, &fixture).unwrap();
-        runtime.compensate(&mut copy, &mut fixture).unwrap();
+        runtime
+            .compensate_with_ownership(&mut copy, &mut fixture, &ownership)
+            .unwrap();
         assert!(!root.join("src/copy.txt").exists());
 
         let remove_proposal = ToolProposal {
@@ -1766,12 +2004,18 @@ mod tests {
             provenance: ToolProvenance::Agent,
             input_origins: Vec::new(),
         };
-        let mut remove = runtime.validate(&remove_proposal, 50).unwrap();
+        let mut remove = runtime
+            .validate_with_ownership(&remove_proposal, 50, &ownership)
+            .unwrap();
         runtime.approve(&mut remove, ApprovalSource::User).unwrap();
-        runtime.execute(&mut remove, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut remove, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut remove, &fixture).unwrap();
         assert!(!root.join("src/file.txt").exists());
-        runtime.compensate(&mut remove, &mut fixture).unwrap();
+        runtime
+            .compensate_with_ownership(&mut remove, &mut fixture, &ownership)
+            .unwrap();
         assert_eq!(
             fs::read_to_string(root.join("src/file.txt")).unwrap(),
             "copy me"
@@ -1795,7 +2039,7 @@ mod tests {
                 agent_id,
                 task_id: None,
                 domain: CapabilityDomain::Filesystem,
-                resource: "filesystem".to_owned(),
+                resource: ".".to_owned(),
                 expires_at_ms: u128::MAX,
             })
             .unwrap();
@@ -1814,9 +2058,14 @@ mod tests {
             provenance: ToolProvenance::User,
             input_origins: Vec::new(),
         };
-        let mut copy = runtime.validate(&copy_proposal, 50).unwrap();
+        let ownership = AllowAllOwnership;
+        let mut copy = runtime
+            .validate_with_ownership(&copy_proposal, 50, &ownership)
+            .unwrap();
         runtime.approve(&mut copy, ApprovalSource::User).unwrap();
-        runtime.execute(&mut copy, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut copy, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut copy, &fixture).unwrap();
         let record = fixture
             .export_undo(copy.output.as_deref().unwrap())
@@ -1836,9 +2085,13 @@ mod tests {
             provenance: ToolProvenance::User,
             input_origins: Vec::new(),
         };
-        let mut remove = runtime.validate(&remove_proposal, 50).unwrap();
+        let mut remove = runtime
+            .validate_with_ownership(&remove_proposal, 50, &ownership)
+            .unwrap();
         runtime.approve(&mut remove, ApprovalSource::User).unwrap();
-        runtime.execute(&mut remove, &mut fixture).unwrap();
+        runtime
+            .execute_with_ownership(&mut remove, &mut fixture, &ownership)
+            .unwrap();
         runtime.verify(&mut remove, &fixture).unwrap();
         let record = fixture
             .export_undo(remove.output.as_deref().unwrap())
@@ -1849,6 +2102,102 @@ mod tests {
             fs::read_to_string(root.join("source.txt")).unwrap(),
             "copy me"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_effects_reject_symlink_source_and_destination_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let outside = temp_root();
+        fs::create_dir_all(root.join("allowed")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        fs::write(root.join("allowed/source.txt"), "source").unwrap();
+        symlink(&outside, root.join("allowed/link")).unwrap();
+
+        let mut fixture = FilesystemFixture::new(&root).unwrap();
+        let remove_input = [("path".to_owned(), "allowed/link/secret.txt".to_owned())]
+            .into_iter()
+            .collect();
+        assert!(
+            fixture
+                .execute_remove(&remove_input)
+                .expect_err("symlink source must be rejected")
+                .contains("invalid filesystem path")
+        );
+
+        let copy_input = [
+            ("from".to_owned(), "allowed/source.txt".to_owned()),
+            ("to".to_owned(), "allowed/link/copied.txt".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            fixture
+                .execute_copy(&copy_input)
+                .expect_err("symlink destination must be rejected")
+                .contains("invalid filesystem path")
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "secret"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn quarantine_identity_is_unique_across_fixture_instances() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/same.txt"), "first").unwrap();
+        fs::write(root.join("b/same.txt"), "second").unwrap();
+
+        let first_record;
+        {
+            let mut fixture = FilesystemFixture::new(&root).unwrap();
+            let input = [("path".to_owned(), "a/same.txt".to_owned())]
+                .into_iter()
+                .collect();
+            let execution = fixture.execute_remove(&input).unwrap();
+            first_record = fixture
+                .export_undo(execution.output.as_deref().unwrap())
+                .unwrap();
+        }
+        let second_record;
+        {
+            let mut fixture = FilesystemFixture::new(&root).unwrap();
+            let input = [("path".to_owned(), "b/same.txt".to_owned())]
+                .into_iter()
+                .collect();
+            let execution = fixture.execute_remove(&input).unwrap();
+            second_record = fixture
+                .export_undo(execution.output.as_deref().unwrap())
+                .unwrap();
+        }
+        assert_ne!(first_record, second_record);
+        let quarantine_entries = fs::read_dir(root.join(".orynth-quarantine"))
+            .unwrap()
+            .count();
+        assert_eq!(quarantine_entries, 2);
+
+        let mut recovered = FilesystemFixture::new(&root).unwrap();
+        recovered.compensate_persisted(&second_record).unwrap();
+        recovered.compensate_persisted(&first_record).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("a/same.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("b/same.txt")).unwrap(),
+            "second"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -20,7 +20,7 @@ use orynth_plugin_mcp::{
 };
 use orynth_plugin_process::{CommandProcessInvoker, ProcessPlugin, activate_discovered_process};
 use orynth_plugin_wasm::{WasmPlugin, WasmiInvoker, activate_discovered_wasm};
-use orynth_security::CapabilityPolicy;
+use orynth_security::{CapabilityPolicy, ResourceOwnershipPolicy};
 
 const DEFAULT_ACTIVATED_KINDS: &[PluginKind] = &[PluginKind::Process, PluginKind::Wasm];
 
@@ -55,6 +55,7 @@ impl McpActivationSpec {
 #[derive(Clone, Copy)]
 pub struct McpActivationContext<'a> {
     pub policy: &'a CapabilityPolicy,
+    pub ownership: &'a dyn ResourceOwnershipPolicy,
     pub agent_id: AgentId,
     pub task_id: Option<TaskId>,
     pub now_ms: u128,
@@ -129,6 +130,7 @@ impl PluginTransport for ActivatedPlugin {
     fn invoke(
         &mut self,
         policy: &CapabilityPolicy,
+        ownership: &dyn ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -136,27 +138,46 @@ impl PluginTransport for ActivatedPlugin {
         request: PluginRequest,
     ) -> Result<PluginResponse, PluginError> {
         match self {
-            Self::Process(plugin) => {
-                plugin.invoke(policy, agent_id, task_id, now_ms, manifest, request)
-            }
-            Self::Mcp(plugin) => {
-                plugin.invoke(policy, agent_id, task_id, now_ms, manifest, request)
-            }
-            Self::Wasm(plugin) => {
-                plugin.invoke(policy, agent_id, task_id, now_ms, manifest, request)
-            }
+            Self::Process(plugin) => plugin.invoke(
+                policy, ownership, agent_id, task_id, now_ms, manifest, request,
+            ),
+            Self::Mcp(plugin) => plugin.invoke(
+                policy, ownership, agent_id, task_id, now_ms, manifest, request,
+            ),
+            Self::Wasm(plugin) => plugin.invoke(
+                policy, ownership, agent_id, task_id, now_ms, manifest, request,
+            ),
         }
     }
 }
 
-#[derive(Default)]
 pub struct PluginHost {
     plugins: BTreeMap<PluginId, ActivatedPlugin>,
+    max_plugins: usize,
+}
+
+impl Default for PluginHost {
+    fn default() -> Self {
+        Self {
+            plugins: BTreeMap::new(),
+            max_plugins: MAX_PLUGINS,
+        }
+    }
 }
 
 impl PluginHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_max_plugins(max_plugins: usize) -> Result<Self, PluginHostError> {
+        if max_plugins == 0 || max_plugins > MAX_PLUGINS {
+            return Err(PluginHostError::Invalid("host plugin limit is invalid"));
+        }
+        Ok(Self {
+            plugins: BTreeMap::new(),
+            max_plugins,
+        })
     }
 
     /// Discover and bind all candidates admitted by `activation_policy`.
@@ -209,9 +230,7 @@ impl PluginHost {
             .iter()
             .filter(|candidate| activation_policy.permits(candidate))
             .collect::<Vec<_>>();
-        if selected.len() > activation_policy.max_plugins {
-            return Err(PluginHostError::TooMany(selected.len()));
-        }
+        let cumulative_limit = activation_policy.max_plugins.min(self.max_plugins);
         if let Some(mcp_specs) = mcp_specs {
             if mcp_specs.len() > MAX_PLUGINS {
                 return Err(PluginHostError::TooMany(mcp_specs.len()));
@@ -228,6 +247,15 @@ impl PluginHost {
             }
         }
 
+        let incoming = selected.len();
+        let cumulative = self
+            .plugins
+            .len()
+            .checked_add(incoming)
+            .ok_or(PluginHostError::TooMany(usize::MAX))?;
+        if cumulative > cumulative_limit {
+            return Err(PluginHostError::TooMany(cumulative));
+        }
         let mut staged = BTreeMap::new();
         for candidate in selected {
             if self.plugins.contains_key(&candidate.manifest.id) {
@@ -259,10 +287,22 @@ impl PluginHost {
         self.plugins.is_empty()
     }
 
+    pub fn max_plugins(&self) -> usize {
+        self.max_plugins
+    }
+
+    /// Deactivate one active plugin. A removed adapter no longer consumes an
+    /// admission slot; failed staged activations never consume one.
+    pub fn deactivate(&mut self, id: PluginId) -> bool {
+        self.plugins.remove(&id).is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke(
         &mut self,
         id: PluginId,
         policy: &CapabilityPolicy,
+        ownership: &dyn ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -274,7 +314,9 @@ impl PluginHost {
             .ok_or(PluginHostError::NotActivated(id))?;
         let manifest = plugin.manifest().clone();
         plugin
-            .invoke(policy, agent_id, task_id, now_ms, &manifest, request)
+            .invoke(
+                policy, ownership, agent_id, task_id, now_ms, &manifest, request,
+            )
             .map_err(PluginHostError::Plugin)
     }
 }
@@ -317,6 +359,7 @@ fn activate_mcp_candidate(
             spec.server.clone(),
             McpConnectionContext {
                 policy: context.policy,
+                ownership: context.ownership,
                 agent_id: context.agent_id,
                 task_id: context.task_id,
                 now_ms: context.now_ms,
@@ -388,7 +431,7 @@ mod tests {
 
     use orynth_kernel::{PluginId, TrustOrigin};
     use orynth_plugin_api::PluginRequest;
-    use orynth_security::{CapabilityDomain, CapabilityLease};
+    use orynth_security::{AllowAllOwnership, CapabilityDomain, CapabilityLease};
 
     fn wasm_manifest_text(module: &std::path::Path) -> String {
         format!(
@@ -466,7 +509,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut host = PluginHost::new();
+        let mut host = PluginHost::with_max_plugins(1).unwrap();
         let activated = host
             .activate_directories(
                 std::slice::from_ref(&root),
@@ -481,6 +524,7 @@ mod tests {
             .invoke(
                 PluginId::from_u64(91),
                 &policy(agent_id),
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -493,6 +537,25 @@ mod tests {
             .unwrap();
         assert_eq!(response.payload, b"ok");
         assert_eq!(response.origin, TrustOrigin::External);
+        assert!(matches!(
+            host.activate_directories(
+                std::slice::from_ref(&root),
+                &DiscoveryPolicy::default(),
+                &ActivationPolicy::default(),
+            ),
+            Err(PluginHostError::TooMany(2))
+        ));
+        assert_eq!(host.len(), 1);
+        assert!(host.deactivate(PluginId::from_u64(91)));
+        assert_eq!(
+            host.activate_directories(
+                std::slice::from_ref(&root),
+                &DiscoveryPolicy::default(),
+                &ActivationPolicy::default(),
+            )
+            .unwrap(),
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -603,6 +666,7 @@ mod tests {
                     name: "host.mcp.http".to_owned(),
                     version: "1".to_owned(),
                     protocol_version: 1,
+                    wire_protocol_version: Some(McpProtocolMode::Modern2026.version().to_owned()),
                     metadata: BTreeMap::new(),
                 },
                 timeout: Duration::from_secs(2),
@@ -622,6 +686,7 @@ mod tests {
                 &mcp_specs,
                 McpActivationContext {
                     policy: &capability_policy,
+                    ownership: &AllowAllOwnership,
                     agent_id,
                     task_id: None,
                     now_ms: 1,
@@ -634,6 +699,7 @@ mod tests {
             .invoke(
                 PluginId::from_u64(93),
                 &capability_policy,
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,

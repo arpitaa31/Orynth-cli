@@ -852,17 +852,19 @@ fn parse_id_value(value: &str, prefix: &str) -> Result<u64, StoreError> {
 const SNAPSHOT_MAGIC_V1: &[u8] = b"ORYNTH-SNAPSHOT-1\n";
 const SNAPSHOT_MAGIC_V2: &[u8] = b"ORYNTH-SNAPSHOT-2\n";
 const SNAPSHOT_MAGIC_V3: &[u8] = b"ORYNTH-SNAPSHOT-3\n";
+const SNAPSHOT_MAGIC_V4: &[u8] = b"ORYNTH-SNAPSHOT-4\n";
 const MAX_SNAPSHOT_ITEMS: u32 = 1_000_000;
 
 #[derive(Clone, Copy)]
 struct SnapshotFeatures {
     has_cache_usage: bool,
     has_artifact_trust: bool,
+    has_effective_model: bool,
 }
 
 pub(crate) fn encode_snapshot_state(state: &RuntimeState) -> Result<Vec<u8>, String> {
     let mut writer = SnapshotWriter::new();
-    writer.bytes.extend_from_slice(SNAPSHOT_MAGIC_V3);
+    writer.bytes.extend_from_slice(SNAPSHOT_MAGIC_V4);
     writer.u64(state.run_id.value());
     writer.u8(run_status_tag(state.status));
     writer.u64(state.events_applied);
@@ -881,6 +883,7 @@ pub(crate) fn encode_snapshot_state(state: &RuntimeState) -> Result<Vec<u8>, Str
         writer.string(&agent.identity.name)?;
         writer.string(&agent.identity.mission)?;
         encode_model(&mut writer, &agent.identity.model)?;
+        encode_model(&mut writer, &agent.model)?;
         writer.u8(agent_status_tag(agent.status));
         writer.u32(agent.chunks_received);
         writer.u64(agent.usage.input_tokens);
@@ -934,7 +937,11 @@ pub(crate) fn decode_snapshot_state(bytes: &[u8]) -> Result<RuntimeState, String
             mission: reader.string()?,
             model: decode_model(&mut reader)?,
         };
-        let model = identity.model.clone();
+        let model = if features.has_effective_model {
+            decode_model(&mut reader)?
+        } else {
+            identity.model.clone()
+        };
         let status = decode_agent_status(reader.u8()?)?;
         let chunks_received = reader.u32()?;
         let input_tokens = reader.u64()?;
@@ -1147,11 +1154,20 @@ impl<'a> SnapshotReader<'a> {
     }
 
     fn snapshot_version(&mut self) -> Result<SnapshotFeatures, String> {
+        if self.bytes.starts_with(SNAPSHOT_MAGIC_V4) {
+            self.offset += SNAPSHOT_MAGIC_V4.len();
+            return Ok(SnapshotFeatures {
+                has_cache_usage: true,
+                has_artifact_trust: true,
+                has_effective_model: true,
+            });
+        }
         if self.bytes.starts_with(SNAPSHOT_MAGIC_V3) {
             self.offset += SNAPSHOT_MAGIC_V3.len();
             return Ok(SnapshotFeatures {
                 has_cache_usage: true,
                 has_artifact_trust: true,
+                has_effective_model: false,
             });
         }
         if self.bytes.starts_with(SNAPSHOT_MAGIC_V2) {
@@ -1159,6 +1175,7 @@ impl<'a> SnapshotReader<'a> {
             return Ok(SnapshotFeatures {
                 has_cache_usage: true,
                 has_artifact_trust: false,
+                has_effective_model: false,
             });
         }
         if self.bytes.starts_with(SNAPSHOT_MAGIC_V1) {
@@ -1166,6 +1183,7 @@ impl<'a> SnapshotReader<'a> {
             return Ok(SnapshotFeatures {
                 has_cache_usage: false,
                 has_artifact_trust: false,
+                has_effective_model: false,
             });
         }
         Err("snapshot magic is invalid".to_string())
@@ -1616,6 +1634,51 @@ mod tests {
             Some(12)
         );
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn switched_model_snapshot_recovers_after_sqlite_reopen() {
+        let path = temp_path("switched-model-snapshot");
+        let run_id = RunId::new();
+        let original = ModelRef::new("provider-a", "cheap", ModelClass::Cheap);
+        let switched = ModelRef::new("provider-b", "strong", ModelClass::Strong);
+        let agent = AgentIdentity::new("switchable", "reopen snapshot", original.clone());
+        let events = [
+            Event::new(run_id, EventKind::RunCreated { run_id }),
+            Event::new(
+                run_id,
+                EventKind::AgentCreated {
+                    agent: agent.clone(),
+                },
+            ),
+            Event::new(
+                run_id,
+                EventKind::ModelRequested {
+                    agent_id: agent.id,
+                    model: switched.clone(),
+                },
+            ),
+        ];
+        {
+            let mut store = SqliteEventStore::open(&path).expect("SQLite store should open");
+            store.append_batch(&events).expect("events should append");
+            let snapshot = store.snapshot(run_id).expect("snapshot should compute");
+            store
+                .save_snapshot(&snapshot)
+                .expect("snapshot should save");
+        }
+        let reopened = SqliteEventStore::open(&path).expect("SQLite store should reopen");
+        let snapshot = reopened
+            .load_snapshot(run_id, None)
+            .expect("snapshot should load")
+            .expect("snapshot should exist");
+        let recovered = reopened.reconstruct(run_id).expect("run should recover");
+        let snapshot_agent = snapshot.state.agents.get(&agent.id).unwrap();
+        let recovered_agent = recovered.agents.get(&agent.id).unwrap();
+        assert_eq!(snapshot_agent.identity.model, original);
+        assert_eq!(snapshot_agent.model, switched);
+        assert_eq!(recovered_agent.model, snapshot_agent.model);
         let _ = fs::remove_file(path);
     }
 

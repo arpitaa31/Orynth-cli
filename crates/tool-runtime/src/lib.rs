@@ -7,7 +7,10 @@ use std::{
 };
 
 use orynth_kernel::{AgentId, Event, EventKind, RunId, TaskId, ToolTransactionId};
-use orynth_security::{CapabilityDomain, CapabilityError, CapabilityPolicy};
+use orynth_security::{
+    CapabilityDomain, CapabilityError, CapabilityPolicy, OwnershipAccess, OwnershipError,
+    ResourceOwnershipPolicy,
+};
 
 pub use orynth_kernel::TrustOrigin;
 
@@ -75,11 +78,17 @@ pub struct CapabilityRequirement {
     pub domain: CapabilityDomain,
     pub resource: String,
     pub input_field: Option<String>,
+    /// Optional set of input paths that must each be authorized. The legacy
+    /// `input_field` form remains supported for schema compatibility.
+    pub input_fields: Vec<String>,
 }
 
 impl CapabilityRequirement {
     fn validate(&self) -> Result<(), ToolError> {
-        if self.resource.trim().is_empty() && self.input_field.is_none() {
+        if self.resource.trim().is_empty()
+            && self.input_field.is_none()
+            && self.input_fields.is_empty()
+        {
             return Err(ToolError::Invalid("capability resource must not be empty"));
         }
         if !self.resource.trim().is_empty() {
@@ -87,6 +96,37 @@ impl CapabilityRequirement {
         }
         if let Some(field) = &self.input_field {
             validate_text("capability input field", field)?;
+        }
+        if self.input_fields.len() > MAX_FIELDS {
+            return Err(ToolError::TooLarge(self.input_fields.len()));
+        }
+        for field in &self.input_fields {
+            validate_text("capability input field", field)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnershipRequirement {
+    pub access: OwnershipAccess,
+    pub resource: String,
+    pub input_fields: Vec<String>,
+}
+
+impl OwnershipRequirement {
+    fn validate(&self) -> Result<(), ToolError> {
+        if self.resource.trim().is_empty() && self.input_fields.is_empty() {
+            return Err(ToolError::Invalid("ownership resource must not be empty"));
+        }
+        if !self.resource.trim().is_empty() {
+            validate_text("ownership resource", &self.resource)?;
+        }
+        if self.input_fields.len() > MAX_FIELDS {
+            return Err(ToolError::TooLarge(self.input_fields.len()));
+        }
+        for field in &self.input_fields {
+            validate_text("ownership input field", field)?;
         }
         Ok(())
     }
@@ -97,7 +137,11 @@ pub struct ToolDefinition {
     pub name: String,
     pub version: String,
     pub required_fields: Vec<String>,
+    /// Fields whose values have an explicit syntax contract. Opaque values
+    /// are never normalized by the generic proposal repair pass.
+    pub syntax_fields: Vec<String>,
     pub capability: Option<CapabilityRequirement>,
+    pub ownership: Option<OwnershipRequirement>,
     pub risk: RiskLevel,
     pub reversible: bool,
 }
@@ -116,8 +160,17 @@ impl ToolDefinition {
                 return Err(ToolError::Invalid("duplicate required field"));
             }
         }
+        if self.syntax_fields.len() > MAX_FIELDS {
+            return Err(ToolError::TooLarge(self.syntax_fields.len()));
+        }
+        for field in &self.syntax_fields {
+            validate_text("syntax field", field)?;
+        }
         if let Some(capability) = &self.capability {
             capability.validate()?;
+        }
+        if let Some(ownership) = &self.ownership {
+            ownership.validate()?;
         }
         Ok(())
     }
@@ -202,19 +255,14 @@ impl ToolProposal {
         let mut input = BTreeMap::new();
         for (key, value) in &self.input {
             validate_text("input field", key)?;
-            validate_text("input value", value)?;
+            validate_opaque_text("input value", value)?;
             let normalized_key = key.trim().to_owned();
-            let normalized_value = value.trim().to_owned();
-            if normalized_key.is_empty() || normalized_value.is_empty() {
-                return Err(ToolError::Invalid("tool input must not be blank"));
+            let normalized_value = value.clone();
+            if normalized_key.is_empty() {
+                return Err(ToolError::Invalid("tool input field must not be blank"));
             }
             if normalized_key != *key {
                 changes.push(RepairChange::InputFieldNormalized {
-                    field: normalized_key.clone(),
-                });
-            }
-            if normalized_value != *value {
-                changes.push(RepairChange::InputValueTrimmed {
                     field: normalized_key.clone(),
                 });
             }
@@ -284,12 +332,21 @@ pub struct ToolTransaction {
     pub output: Option<String>,
     pub failure: Option<String>,
     pub compensation_available: bool,
+    pub effect_status: ToolEffectStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolExecution {
-    pub output: String,
+    pub output: Option<String>,
     pub compensation_available: bool,
+    pub effect_status: ToolEffectStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolEffectStatus {
+    NotAttempted,
+    MayHaveOccurred,
+    Confirmed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -678,6 +735,7 @@ pub enum ToolError {
     UnknownTool(String),
     MissingField(String),
     Capability(CapabilityError),
+    Ownership(OwnershipError),
     RiskBlocked(String),
     ApprovalRequired,
     InvalidState {
@@ -722,6 +780,7 @@ impl fmt::Display for ToolError {
                 write!(formatter, "required tool field {field:?} is missing")
             }
             Self::Capability(error) => write!(formatter, "tool capability denied: {error}"),
+            Self::Ownership(error) => write!(formatter, "tool ownership denied: {error}"),
             Self::RiskBlocked(name) => write!(formatter, "tool {name:?} is blocked by policy"),
             Self::ApprovalRequired => formatter.write_str("tool approval is required"),
             Self::InvalidState { expected, actual } => {
@@ -744,12 +803,37 @@ impl From<CapabilityError> for ToolError {
     }
 }
 
+impl From<OwnershipError> for ToolError {
+    fn from(error: OwnershipError) -> Self {
+        Self::Ownership(error)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ToolRuntime {
     definitions: BTreeMap<String, ToolDefinition>,
     additional_capabilities: BTreeMap<String, Vec<CapabilityRequirement>>,
     trust_policies: BTreeMap<String, TrustPolicy>,
     capabilities: CapabilityPolicy,
+}
+
+struct ImplicitOwnershipDenied;
+
+impl ResourceOwnershipPolicy for ImplicitOwnershipDenied {
+    fn authorize(
+        &self,
+        _agent_id: AgentId,
+        _resource: &str,
+        access: OwnershipAccess,
+    ) -> Result<(), OwnershipError> {
+        if access == OwnershipAccess::Read {
+            Ok(())
+        } else {
+            Err(OwnershipError::Invalid(
+                "explicit ownership policy is required for write effects",
+            ))
+        }
+    }
 }
 
 impl ToolRuntime {
@@ -819,12 +903,22 @@ impl ToolRuntime {
         proposal: &ToolProposal,
         now_ms: u128,
     ) -> Result<ToolTransaction, ToolError> {
-        let repair = proposal.repair_deterministic()?;
-        let proposal = repair.proposal.clone();
+        self.validate_with_ownership(proposal, now_ms, &ImplicitOwnershipDenied)
+    }
+
+    pub fn validate_with_ownership(
+        &self,
+        proposal: &ToolProposal,
+        now_ms: u128,
+        ownership: &dyn ResourceOwnershipPolicy,
+    ) -> Result<ToolTransaction, ToolError> {
+        let mut repair = proposal.repair_deterministic()?;
         let definition = self
-            .definition(&proposal.tool_name)
-            .ok_or_else(|| ToolError::UnknownTool(proposal.tool_name.clone()))?
+            .definition(&repair.proposal.tool_name)
+            .ok_or_else(|| ToolError::UnknownTool(repair.proposal.tool_name.clone()))?
             .clone();
+        normalize_syntax_fields(&mut repair, &definition.syntax_fields)?;
+        let proposal = repair.proposal.clone();
         for field in &definition.required_fields {
             if !proposal.input.contains_key(field) {
                 return Err(ToolError::MissingField(field.clone()));
@@ -837,6 +931,7 @@ impl ToolRuntime {
             &definition,
             &proposal.input,
             now_ms,
+            ownership,
         )?;
         let state = match definition.risk {
             RiskLevel::Safe => ToolState::Validated,
@@ -870,6 +965,7 @@ impl ToolRuntime {
             output: None,
             failure: None,
             compensation_available: false,
+            effect_status: ToolEffectStatus::NotAttempted,
         })
     }
 
@@ -934,6 +1030,15 @@ impl ToolRuntime {
         transaction: &mut ToolTransaction,
         executor: &mut E,
     ) -> Result<(), ToolError> {
+        self.execute_with_ownership(transaction, executor, &ImplicitOwnershipDenied)
+    }
+
+    pub fn execute_with_ownership<E: ToolExecutor>(
+        &self,
+        transaction: &mut ToolTransaction,
+        executor: &mut E,
+        ownership: &dyn ResourceOwnershipPolicy,
+    ) -> Result<(), ToolError> {
         if !matches!(
             transaction.state,
             ToolState::Validated | ToolState::Approved
@@ -957,20 +1062,36 @@ impl ToolRuntime {
             &transaction.definition,
             &transaction.proposal.input,
             current_time_ms(),
+            ownership,
         )?;
         transaction.state = ToolState::Executing;
         let result = match executor.execute(&transaction.definition, &transaction.proposal.input) {
             Ok(result) => result,
             Err(error) => {
                 transaction.failure = Some(error.clone());
+                transaction.effect_status = ToolEffectStatus::MayHaveOccurred;
                 transaction.state = ToolState::Failed;
                 return Err(ToolError::Execution(error));
             }
         };
-        validate_text("tool output", &result.output)?;
-        transaction.output = Some(result.output);
-        transaction.compensation_available =
-            result.compensation_available && transaction.definition.reversible;
+        if let Some(output) = &result.output {
+            validate_opaque_text("tool output", output).inspect_err(|error| {
+                transaction.failure = Some(error.to_string());
+                transaction.effect_status = result.effect_status;
+                transaction.state = ToolState::Failed;
+            })?;
+        }
+        transaction.output = result.output;
+        transaction.effect_status = result.effect_status;
+        transaction.compensation_available = result.compensation_available
+            && transaction.definition.reversible
+            && result.effect_status != ToolEffectStatus::NotAttempted;
+        if result.effect_status == ToolEffectStatus::NotAttempted {
+            let error = "executor reported that no effect was attempted".to_owned();
+            transaction.failure = Some(error.clone());
+            transaction.state = ToolState::Failed;
+            return Err(ToolError::Execution(error));
+        }
         transaction.state = ToolState::Executed;
         Ok(())
     }
@@ -981,10 +1102,7 @@ impl ToolRuntime {
         verifier: &V,
     ) -> Result<(), ToolError> {
         require_state(transaction, ToolState::Executed, "Executed")?;
-        let output = transaction
-            .output
-            .as_deref()
-            .ok_or(ToolError::Invalid("executed tool has no output"))?;
+        let output = transaction.output.as_deref().unwrap_or_default();
         verifier
             .verify(&transaction.definition, &transaction.proposal.input, output)
             .map_err(|error| {
@@ -1007,22 +1125,28 @@ impl ToolRuntime {
         transaction: &mut ToolTransaction,
         executor: &mut E,
     ) -> Result<(), ToolError> {
+        self.compensate_with_ownership(transaction, executor, &ImplicitOwnershipDenied)
+    }
+
+    pub fn compensate_with_ownership<E: ToolExecutor>(
+        &self,
+        transaction: &mut ToolTransaction,
+        executor: &mut E,
+        ownership: &dyn ResourceOwnershipPolicy,
+    ) -> Result<(), ToolError> {
         if !matches!(
             transaction.state,
-            ToolState::Executed | ToolState::Verified | ToolState::Committed
+            ToolState::Executed | ToolState::Verified | ToolState::Committed | ToolState::Failed
         ) {
             return Err(ToolError::InvalidState {
-                expected: "Executed, Verified, or Committed",
+                expected: "Executed, Verified, Committed, or Failed with a compensatable effect",
                 actual: transaction.state,
             });
         }
         if !transaction.compensation_available {
             return Err(ToolError::NotCompensatable);
         }
-        let output = transaction
-            .output
-            .as_deref()
-            .ok_or(ToolError::Invalid("compensation requires tool output"))?;
+        let output = transaction.output.as_deref().unwrap_or_default();
         self.authorize_requirements(
             transaction.proposal.agent_id,
             transaction.proposal.task_id,
@@ -1030,6 +1154,7 @@ impl ToolRuntime {
             &transaction.definition,
             &transaction.proposal.input,
             current_time_ms(),
+            ownership,
         )?;
         executor
             .compensate(&transaction.definition, &transaction.proposal.input, output)
@@ -1041,6 +1166,7 @@ impl ToolRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn authorize_requirements(
         &self,
         agent_id: AgentId,
@@ -1049,20 +1175,49 @@ impl ToolRuntime {
         definition: &ToolDefinition,
         input: &BTreeMap<String, String>,
         now_ms: u128,
+        ownership: &dyn ResourceOwnershipPolicy,
     ) -> Result<(), ToolError> {
         let mut requirements = definition.capability.iter().collect::<Vec<_>>();
         if let Some(additional) = self.additional_capabilities.get(tool_name) {
             requirements.extend(additional.iter());
         }
         for requirement in requirements {
-            let resource = requirement
-                .input_field
-                .as_ref()
-                .map_or(requirement.resource.as_str(), |field| {
-                    input.get(field).map_or("", String::as_str)
-                });
-            self.capabilities
-                .authorize(agent_id, task_id, requirement.domain, resource, now_ms)?;
+            let fields = if requirement.input_fields.is_empty() {
+                requirement.input_field.iter().collect::<Vec<_>>()
+            } else {
+                requirement.input_fields.iter().collect::<Vec<_>>()
+            };
+            if fields.is_empty() {
+                self.capabilities.authorize(
+                    agent_id,
+                    task_id,
+                    requirement.domain,
+                    &requirement.resource,
+                    now_ms,
+                )?;
+            } else {
+                for field in fields {
+                    let resource = input.get(field).map_or("", String::as_str);
+                    self.capabilities.authorize(
+                        agent_id,
+                        task_id,
+                        requirement.domain,
+                        resource,
+                        now_ms,
+                    )?;
+                }
+            }
+        }
+        if let Some(requirement) = &definition.ownership {
+            let fields = &requirement.input_fields;
+            if fields.is_empty() {
+                ownership.authorize(agent_id, &requirement.resource, requirement.access)?;
+            } else {
+                for field in fields {
+                    let resource = input.get(field).map_or("", String::as_str);
+                    ownership.authorize(agent_id, resource, requirement.access)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1529,10 +1684,44 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
+fn validate_opaque_text(field: &'static str, value: &str) -> Result<(), ToolError> {
+    if value.len() > MAX_TEXT_BYTES {
+        return Err(ToolError::TooLarge(value.len()));
+    }
+    if value.contains('\0') {
+        return Err(ToolError::Invalid(field));
+    }
+    Ok(())
+}
+
+fn normalize_syntax_fields(
+    repair: &mut RepairReport,
+    syntax_fields: &[String],
+) -> Result<(), ToolError> {
+    for field in syntax_fields {
+        let Some(value) = repair.proposal.input.get_mut(field) else {
+            continue;
+        };
+        let normalized = value.trim().to_owned();
+        if normalized.is_empty() {
+            return Err(ToolError::Invalid("syntax input must not be blank"));
+        }
+        if normalized != *value {
+            repair.changes.push(RepairChange::InputValueTrimmed {
+                field: field.clone(),
+            });
+            *value = normalized;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orynth_security::{CapabilityDomain, CapabilityLease};
+    use orynth_security::{
+        AllowAllOwnership, CapabilityDomain, CapabilityLease, ExclusiveOwnershipPolicy,
+    };
 
     struct MockExecutor {
         compensated: bool,
@@ -1545,8 +1734,9 @@ mod tests {
             _input: &BTreeMap<String, String>,
         ) -> Result<ToolExecution, String> {
             Ok(ToolExecution {
-                output: "created".to_owned(),
+                output: Some("created".to_owned()),
                 compensation_available: true,
+                effect_status: ToolEffectStatus::Confirmed,
             })
         }
 
@@ -1573,6 +1763,59 @@ mod tests {
             (output == "created")
                 .then_some(())
                 .ok_or_else(|| "unexpected output".to_owned())
+        }
+    }
+
+    struct FailingVerifier;
+
+    impl ToolVerifier for FailingVerifier {
+        fn verify(
+            &self,
+            _definition: &ToolDefinition,
+            _input: &BTreeMap<String, String>,
+            _output: &str,
+        ) -> Result<(), String> {
+            Err("verification unavailable".to_owned())
+        }
+    }
+
+    struct NoOutputExecutor;
+
+    impl ToolExecutor for NoOutputExecutor {
+        fn execute(
+            &mut self,
+            _definition: &ToolDefinition,
+            _input: &BTreeMap<String, String>,
+        ) -> Result<ToolExecution, String> {
+            Ok(ToolExecution {
+                output: None,
+                compensation_available: false,
+                effect_status: ToolEffectStatus::Confirmed,
+            })
+        }
+
+        fn compensate(
+            &mut self,
+            _definition: &ToolDefinition,
+            _input: &BTreeMap<String, String>,
+            _output: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct NoOutputVerifier;
+
+    impl ToolVerifier for NoOutputVerifier {
+        fn verify(
+            &self,
+            _definition: &ToolDefinition,
+            _input: &BTreeMap<String, String>,
+            output: &str,
+        ) -> Result<(), String> {
+            (output.is_empty())
+                .then_some(())
+                .ok_or_else(|| "expected no output".to_owned())
         }
     }
 
@@ -1614,11 +1857,14 @@ mod tests {
                 name: "fs.write".to_owned(),
                 version: "1".to_owned(),
                 required_fields: vec!["path".to_owned()],
+                syntax_fields: vec!["path".to_owned()],
                 capability: Some(CapabilityRequirement {
                     domain: CapabilityDomain::Filesystem,
                     resource: String::new(),
                     input_field: Some("path".to_owned()),
+                    input_fields: Vec::new(),
                 }),
+                ownership: None,
                 risk: RiskLevel::Confirm,
                 reversible: true,
             })
@@ -1634,6 +1880,61 @@ mod tests {
             })
             .unwrap();
         runtime
+    }
+
+    #[test]
+    fn ownership_is_rechecked_before_tool_effects() {
+        let agent_id = AgentId::from_u64(7);
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register(ToolDefinition {
+                name: "owned.write".to_owned(),
+                version: "1".to_owned(),
+                required_fields: vec!["path".to_owned()],
+                syntax_fields: vec!["path".to_owned()],
+                capability: None,
+                ownership: Some(OwnershipRequirement {
+                    access: OwnershipAccess::Write,
+                    resource: String::new(),
+                    input_fields: vec!["path".to_owned()],
+                }),
+                risk: RiskLevel::Safe,
+                reversible: false,
+            })
+            .unwrap();
+        let proposal = ToolProposal {
+            run_id: RunId::from_u64(1),
+            task_id: None,
+            agent_id,
+            tool_name: "owned.write".to_owned(),
+            input: [("path".to_owned(), "workspace/src/lib.rs".to_owned())]
+                .into_iter()
+                .collect(),
+            provenance: ToolProvenance::Agent,
+            input_origins: Vec::new(),
+        };
+        assert!(matches!(
+            runtime.validate(&proposal, 1),
+            Err(ToolError::Ownership(_))
+        ));
+        let ownership = ExclusiveOwnershipPolicy::new(agent_id, "workspace/src").unwrap();
+        let mut transaction = runtime
+            .validate_with_ownership(&proposal, 1, &ownership)
+            .unwrap();
+        runtime
+            .execute_with_ownership(&mut transaction, &mut NoOutputExecutor, &ownership)
+            .unwrap();
+        assert_eq!(transaction.state, ToolState::Executed);
+
+        let foreign = ExclusiveOwnershipPolicy::new(AgentId::from_u64(8), "workspace/src").unwrap();
+        let mut denied = runtime
+            .validate_with_ownership(&proposal, 1, &AllowAllOwnership)
+            .unwrap();
+        assert!(matches!(
+            runtime.execute_with_ownership(&mut denied, &mut NoOutputExecutor, &foreign),
+            Err(ToolError::Ownership(_))
+        ));
+        assert_eq!(denied.state, ToolState::Validated);
     }
 
     #[test]
@@ -1660,8 +1961,8 @@ mod tests {
             .expect("safe normalization should succeed");
         assert_eq!(report.tier, RepairTier::SyntaxSafe);
         assert_eq!(report.proposal.tool_name, "fs.write");
-        assert_eq!(report.proposal.input["path"], "workspace/src/lib.rs");
-        assert!(!report.changes.is_empty());
+        assert_eq!(report.proposal.input["path"], " workspace/src/lib.rs ");
+        assert!(report.changes.is_empty());
 
         let mut ambiguous = proposal(agent_id);
         ambiguous.input.insert("path".to_owned(), "one".to_owned());
@@ -1672,6 +1973,41 @@ mod tests {
             ambiguous.repair_deterministic(),
             Err(ToolError::AmbiguousRepair { field }) if field == "path"
         ));
+    }
+
+    #[test]
+    fn opaque_input_values_preserve_whitespace_while_syntax_fields_trim() {
+        let agent_id = AgentId::from_u64(7);
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register(ToolDefinition {
+                name: "content.write".to_owned(),
+                version: "1".to_owned(),
+                required_fields: vec!["path".to_owned(), "content".to_owned()],
+                syntax_fields: vec!["path".to_owned()],
+                capability: None,
+                ownership: None,
+                risk: RiskLevel::Safe,
+                reversible: false,
+            })
+            .unwrap();
+        let proposal = ToolProposal {
+            run_id: RunId::from_u64(1),
+            task_id: None,
+            agent_id,
+            tool_name: "content.write".to_owned(),
+            input: [
+                ("path".to_owned(), "  README.md  ".to_owned()),
+                ("content".to_owned(), "  indented\n".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            provenance: ToolProvenance::Agent,
+            input_origins: Vec::new(),
+        };
+        let transaction = runtime.validate(&proposal, 50).unwrap();
+        assert_eq!(transaction.proposal.input["path"], "README.md");
+        assert_eq!(transaction.proposal.input["content"], "  indented\n");
     }
 
     #[test]
@@ -1717,6 +2053,62 @@ mod tests {
     }
 
     #[test]
+    fn failed_verification_keeps_reversible_compensation_available() {
+        let agent_id = AgentId::from_u64(7);
+        let runtime = runtime(agent_id);
+        let mut transaction = runtime.validate(&proposal(agent_id), 50).unwrap();
+        runtime
+            .approve(&mut transaction, ApprovalSource::User)
+            .unwrap();
+        let mut executor = MockExecutor { compensated: false };
+        runtime.execute(&mut transaction, &mut executor).unwrap();
+        assert!(matches!(
+            runtime.verify(&mut transaction, &FailingVerifier),
+            Err(ToolError::Verification(_))
+        ));
+        assert_eq!(transaction.state, ToolState::Failed);
+        assert_eq!(transaction.effect_status, ToolEffectStatus::Confirmed);
+        runtime.compensate(&mut transaction, &mut executor).unwrap();
+        assert_eq!(transaction.state, ToolState::Compensated);
+        assert!(executor.compensated);
+    }
+
+    #[test]
+    fn typed_confirmed_no_output_reaches_a_terminal_verified_state() {
+        let agent_id = AgentId::from_u64(7);
+        let mut runtime = ToolRuntime::new();
+        runtime
+            .register(ToolDefinition {
+                name: "probe".to_owned(),
+                version: "1".to_owned(),
+                required_fields: Vec::new(),
+                syntax_fields: Vec::new(),
+                capability: None,
+                ownership: None,
+                risk: RiskLevel::Safe,
+                reversible: false,
+            })
+            .unwrap();
+        let proposal = ToolProposal {
+            run_id: RunId::from_u64(1),
+            task_id: None,
+            agent_id,
+            tool_name: "probe".to_owned(),
+            input: BTreeMap::new(),
+            provenance: ToolProvenance::Agent,
+            input_origins: Vec::new(),
+        };
+        let mut transaction = runtime.validate(&proposal, 50).unwrap();
+        runtime
+            .execute(&mut transaction, &mut NoOutputExecutor)
+            .unwrap();
+        assert_eq!(transaction.state, ToolState::Executed);
+        runtime.verify(&mut transaction, &NoOutputVerifier).unwrap();
+        runtime.commit(&mut transaction).unwrap();
+        assert_eq!(transaction.state, ToolState::Committed);
+    }
+
+    #[test]
     fn blocked_tools_and_expired_leases_are_rejected() {
         let agent_id = AgentId::from_u64(7);
         let mut runtime = ToolRuntime::new();
@@ -1725,11 +2117,14 @@ mod tests {
                 name: "process.shell".to_owned(),
                 version: "1".to_owned(),
                 required_fields: Vec::new(),
+                syntax_fields: Vec::new(),
                 capability: Some(CapabilityRequirement {
                     domain: CapabilityDomain::Process,
                     resource: "shell".to_owned(),
                     input_field: None,
+                    input_fields: Vec::new(),
                 }),
+                ownership: None,
                 risk: RiskLevel::Block,
                 reversible: false,
             })
@@ -1875,11 +2270,14 @@ mod tests {
                     name: "deploy.check".to_owned(),
                     version: "1".to_owned(),
                     required_fields: vec!["path".to_owned()],
+                    syntax_fields: Vec::new(),
                     capability: Some(CapabilityRequirement {
                         domain: CapabilityDomain::Filesystem,
                         resource: "workspace".to_owned(),
                         input_field: None,
+                        input_fields: Vec::new(),
                     }),
+                    ownership: None,
                     risk: RiskLevel::Safe,
                     reversible: false,
                 },
@@ -1887,6 +2285,7 @@ mod tests {
                     domain: CapabilityDomain::Process,
                     resource: "cargo".to_owned(),
                     input_field: None,
+                    input_fields: Vec::new(),
                 }],
             )
             .expect("definition should register");
@@ -1933,7 +2332,9 @@ mod tests {
                 name: "config.inspect".to_owned(),
                 version: "1".to_owned(),
                 required_fields: Vec::new(),
+                syntax_fields: Vec::new(),
                 capability: None,
+                ownership: None,
                 risk: RiskLevel::Safe,
                 reversible: false,
             })

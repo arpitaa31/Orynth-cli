@@ -8,7 +8,8 @@ use std::{
 use super::sqlite::{decode_snapshot_state, encode_snapshot_state};
 use super::*;
 
-const EVENT_MAGIC: &[u8] = b"ORYNTH-EVENT-1\n";
+const EVENT_MAGIC: &[u8] = b"ORYNTH-EVENT-2\n";
+const EVENT_MAGIC_V1: &[u8] = b"ORYNTH-EVENT-1\n";
 const METADATA_MAGIC: &[u8] = b"ORYNTH-META-1\n";
 const ARTIFACT_MAGIC: &[u8] = b"ORYNTH-BLOB-1\n";
 const ARTIFACT_MAGIC_V2: &[u8] = b"ORYNTH-BLOB-2\n";
@@ -16,14 +17,20 @@ const CHECKSUM_BYTES: usize = 32;
 const FRAME_HEADER_BYTES: usize = 12;
 const METADATA_FRAME_HEADER_BYTES: usize = 5;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BATCH_EVENTS: usize = 4096;
+const BATCH_BEGIN: u8 = 1;
+const BATCH_EVENT: u8 = 2;
+const BATCH_COMMIT: u8 = 3;
 
 type FileMetadata = (
     BTreeMap<BranchId, BranchMetadata>,
     BTreeMap<(RunId, Sequence), RuntimeSnapshot>,
 );
+type EventFrame<'a> = (usize, Sequence, &'a [u8]);
 
 pub struct FileEventStore {
     path: PathBuf,
+    format_version: u8,
     metadata_path: PathBuf,
     _lock_file: File,
     memory: InMemoryEventStore,
@@ -64,69 +71,26 @@ impl FileEventStore {
             bytes.extend_from_slice(EVENT_MAGIC);
         }
 
-        if !bytes.starts_with(EVENT_MAGIC) {
+        let version = if bytes.starts_with(EVENT_MAGIC) {
+            2
+        } else if bytes.starts_with(EVENT_MAGIC_V1) {
+            1
+        } else {
+            0
+        };
+        if version == 0 {
             return Err(StoreError::Corrupt(
                 "event store header is invalid".to_string(),
             ));
         }
 
-        let mut memory = InMemoryEventStore::new();
-        let mut offset = EVENT_MAGIC.len();
-        let mut needs_repair = false;
+        let (memory, repair_offset) = if version == 1 {
+            recover_legacy_events(&bytes, EVENT_MAGIC_V1)?
+        } else {
+            recover_batched_events(&bytes, EVENT_MAGIC)?
+        };
 
-        while offset < bytes.len() {
-            let frame_start = offset;
-            if bytes.len() - offset < FRAME_HEADER_BYTES {
-                needs_repair = true;
-                offset = frame_start;
-                break;
-            }
-
-            let sequence = read_u64(&bytes[offset..offset + 8]);
-            let payload_len = read_u32(&bytes[offset + 8..offset + 12]) as usize;
-            if payload_len > MAX_FRAME_BYTES {
-                return Err(StoreError::Corrupt(format!(
-                    "event frame is too large: {payload_len} bytes"
-                )));
-            }
-
-            let frame_len = FRAME_HEADER_BYTES
-                .checked_add(payload_len)
-                .and_then(|length| length.checked_add(CHECKSUM_BYTES))
-                .ok_or_else(|| StoreError::Corrupt("event frame length overflow".to_string()))?;
-            let frame_end = frame_start
-                .checked_add(frame_len)
-                .ok_or_else(|| StoreError::Corrupt("event frame offset overflow".to_string()))?;
-
-            if frame_end > bytes.len() {
-                needs_repair = true;
-                offset = frame_start;
-                break;
-            }
-
-            let payload_start = frame_start + FRAME_HEADER_BYTES;
-            let payload_end = payload_start + payload_len;
-            let payload = &bytes[payload_start..payload_end];
-            let stored_checksum = &bytes[payload_end..frame_end];
-            let actual_checksum = DeterministicContentHasher.hash(payload).as_bytes();
-            if stored_checksum != actual_checksum {
-                return Err(StoreError::Corrupt(format!(
-                    "checksum mismatch at byte offset {frame_start}"
-                )));
-            }
-
-            let event = decode_event(payload).map_err(StoreError::Corrupt)?;
-            let assigned = memory.append(event)?;
-            if assigned != sequence {
-                return Err(StoreError::Corrupt(format!(
-                    "expected sequence {}, found {}",
-                    assigned, sequence
-                )));
-            }
-            offset = frame_end;
-        }
-
-        if needs_repair {
+        if let Some(offset) = repair_offset {
             let file = OpenOptions::new()
                 .write(true)
                 .open(&path)
@@ -140,6 +104,7 @@ impl FileEventStore {
 
         Ok(Self {
             path,
+            format_version: version,
             metadata_path,
             _lock_file: lock_file,
             memory,
@@ -162,14 +127,27 @@ impl FileEventStore {
 
     fn append_frames(&self, frames: &[(Sequence, Vec<u8>)]) -> Result<(), StoreError> {
         let mut bytes = Vec::new();
+        let count = u32::try_from(frames.len())
+            .map_err(|_| StoreError::Storage("event batch is too large".to_string()))?;
+        append_frame(
+            &mut bytes,
+            frames[0].0,
+            &encode_control_payload(BATCH_BEGIN, count, &[0_u8; 32]),
+        )?;
         for (sequence, payload) in frames {
-            let payload_len = u32::try_from(payload.len())
-                .map_err(|_| StoreError::Storage("event payload exceeds u32::MAX".to_string()))?;
-            bytes.extend_from_slice(&sequence.to_le_bytes());
-            bytes.extend_from_slice(&payload_len.to_le_bytes());
-            bytes.extend_from_slice(payload);
-            bytes.extend_from_slice(&DeterministicContentHasher.hash(payload).as_bytes());
+            let mut event_payload = Vec::with_capacity(payload.len() + 1);
+            event_payload.push(BATCH_EVENT);
+            event_payload.extend_from_slice(payload);
+            append_frame(&mut bytes, *sequence, &event_payload)?;
         }
+        let digest = batch_digest(frames.iter().map(|(_, payload)| payload.as_slice()));
+        append_frame(
+            &mut bytes,
+            frames
+                .last()
+                .map_or(frames[0].0, |(sequence, _)| *sequence + 1),
+            &encode_control_payload(BATCH_COMMIT, count, &digest),
+        )?;
         let mut file = OpenOptions::new()
             .append(true)
             .open(&self.path)
@@ -181,6 +159,233 @@ impl FileEventStore {
     }
 }
 
+fn append_frame(bytes: &mut Vec<u8>, sequence: Sequence, payload: &[u8]) -> Result<(), StoreError> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(StoreError::Storage(format!(
+            "event payload exceeds maximum frame size: {} bytes",
+            payload.len()
+        )));
+    }
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| StoreError::Storage("event payload exceeds u32::MAX".to_string()))?;
+    bytes.extend_from_slice(&sequence.to_le_bytes());
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&DeterministicContentHasher.hash(payload).as_bytes());
+    Ok(())
+}
+
+fn encode_control_payload(kind: u8, count: u32, digest: &[u8; 32]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 4 + digest.len());
+    payload.push(kind);
+    payload.extend_from_slice(&count.to_le_bytes());
+    if kind == BATCH_COMMIT {
+        payload.extend_from_slice(digest);
+    }
+    payload
+}
+
+fn batch_digest<'a>(payloads: impl Iterator<Item = &'a [u8]>) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    for payload in payloads {
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
+    DeterministicContentHasher.hash(&bytes).as_bytes()
+}
+
+fn recover_legacy_events(
+    bytes: &[u8],
+    magic: &[u8],
+) -> Result<(InMemoryEventStore, Option<usize>), StoreError> {
+    let mut memory = InMemoryEventStore::new();
+    let mut offset = magic.len();
+    let mut repair_offset = None;
+    while offset < bytes.len() {
+        let frame_start = offset;
+        let Some((frame_end, sequence, payload)) = read_frame(bytes, offset)? else {
+            repair_offset = Some(frame_start);
+            break;
+        };
+        let event = decode_event(payload).map_err(StoreError::Corrupt)?;
+        let assigned = memory.append(event)?;
+        if assigned != sequence {
+            return Err(StoreError::Corrupt(format!(
+                "expected sequence {}, found {}",
+                assigned, sequence
+            )));
+        }
+        offset = frame_end;
+    }
+    Ok((memory, repair_offset))
+}
+
+fn recover_batched_events(
+    bytes: &[u8],
+    magic: &[u8],
+) -> Result<(InMemoryEventStore, Option<usize>), StoreError> {
+    let mut memory = InMemoryEventStore::new();
+    let mut offset = magic.len();
+    let mut pending_start = None;
+    let mut pending = Vec::<(Sequence, Vec<u8>)>::new();
+    let mut expected_count = 0_usize;
+    let mut repair_offset = None;
+
+    while offset < bytes.len() {
+        let frame_start = offset;
+        let frame = match read_frame(bytes, offset) {
+            Ok(frame) => frame,
+            Err(_error) if is_final_frame(bytes, offset) => {
+                repair_offset = Some(pending_start.unwrap_or(frame_start));
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((frame_end, sequence, payload)) = frame else {
+            repair_offset = Some(pending_start.unwrap_or(frame_start));
+            break;
+        };
+        let kind = payload.first().copied();
+        let result = match (pending_start, kind) {
+            (None, Some(BATCH_BEGIN)) => {
+                if payload.len() != 5 {
+                    Err("invalid batch begin marker".to_string())
+                } else {
+                    let count = read_u32(&payload[1..5]) as usize;
+                    if count == 0 || count > MAX_BATCH_EVENTS {
+                        Err("invalid event batch size".to_string())
+                    } else {
+                        pending_start = Some(frame_start);
+                        expected_count = count;
+                        pending.clear();
+                        if sequence != memory.next_sequence() {
+                            Err("batch begin sequence is invalid".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            (Some(_), Some(BATCH_EVENT)) => {
+                if sequence != memory.next_sequence() + pending.len() as u64
+                    || payload.len() < 2
+                    || pending.len() >= expected_count
+                {
+                    Err("event batch sequence or count is invalid".to_string())
+                } else {
+                    pending.push((sequence, payload[1..].to_vec()));
+                    Ok(())
+                }
+            }
+            (Some(start), Some(BATCH_COMMIT)) => {
+                if payload.len() != 37
+                    || pending.len() != expected_count
+                    || sequence != memory.next_sequence() + pending.len() as u64
+                    || read_u32(&payload[1..5]) as usize != expected_count
+                    || payload[5..]
+                        != batch_digest(pending.iter().map(|(_, payload)| payload.as_slice()))
+                {
+                    if frame_end == bytes.len() {
+                        repair_offset = Some(start);
+                        break;
+                    }
+                    return Err(StoreError::Corrupt(
+                        "invalid event batch commit marker".into(),
+                    ));
+                }
+                let events = pending
+                    .iter()
+                    .map(|(_, payload)| decode_event(payload).map_err(StoreError::Corrupt))
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(events) = events else {
+                    if frame_end == bytes.len() {
+                        repair_offset = Some(start);
+                        break;
+                    }
+                    return Err(StoreError::Corrupt(
+                        "invalid event in committed batch".into(),
+                    ));
+                };
+                let sequences = memory.append_batch(&events)?;
+                if sequences
+                    != pending
+                        .iter()
+                        .map(|(sequence, _)| *sequence)
+                        .collect::<Vec<_>>()
+                {
+                    return Err(StoreError::Corrupt(
+                        "committed batch sequence mismatch".into(),
+                    ));
+                }
+                pending_start = None;
+                pending.clear();
+                expected_count = 0;
+                Ok(())
+            }
+            _ => Err("invalid event batch marker ordering".to_string()),
+        };
+        if let Err(message) = result {
+            if frame_end == bytes.len() && pending_start.is_some() {
+                repair_offset = Some(pending_start.unwrap_or(frame_start));
+                break;
+            }
+            return Err(StoreError::Corrupt(message));
+        }
+        offset = frame_end;
+    }
+    if pending_start.is_some() && repair_offset.is_none() {
+        repair_offset = pending_start;
+    }
+    Ok((memory, repair_offset))
+}
+
+fn read_frame(bytes: &[u8], offset: usize) -> Result<Option<EventFrame<'_>>, StoreError> {
+    if bytes.len() - offset < FRAME_HEADER_BYTES {
+        return Ok(None);
+    }
+    let sequence = read_u64(&bytes[offset..offset + 8]);
+    let payload_len = read_u32(&bytes[offset + 8..offset + 12]) as usize;
+    if payload_len > MAX_FRAME_BYTES {
+        return Err(StoreError::Corrupt(format!(
+            "event frame is too large: {payload_len} bytes"
+        )));
+    }
+    let frame_len = FRAME_HEADER_BYTES
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+        .ok_or_else(|| StoreError::Corrupt("event frame length overflow".to_string()))?;
+    let frame_end = offset
+        .checked_add(frame_len)
+        .ok_or_else(|| StoreError::Corrupt("event frame offset overflow".to_string()))?;
+    if frame_end > bytes.len() {
+        return Ok(None);
+    }
+    let payload_start = offset + FRAME_HEADER_BYTES;
+    let payload_end = payload_start + payload_len;
+    let payload = &bytes[payload_start..payload_end];
+    if bytes[payload_end..frame_end] != DeterministicContentHasher.hash(payload).as_bytes()[..] {
+        return Err(StoreError::Corrupt(format!(
+            "checksum mismatch at byte offset {offset}"
+        )));
+    }
+    Ok(Some((frame_end, sequence, payload)))
+}
+
+fn is_final_frame(bytes: &[u8], offset: usize) -> bool {
+    if bytes.len().saturating_sub(offset) < FRAME_HEADER_BYTES {
+        return true;
+    }
+    let payload_len = read_u32(&bytes[offset + 8..offset + 12]) as usize;
+    if payload_len > MAX_FRAME_BYTES {
+        return false;
+    }
+    FRAME_HEADER_BYTES
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+        .and_then(|length| offset.checked_add(length))
+        .is_some_and(|end| end == bytes.len())
+}
+
 impl EventStore for FileEventStore {
     fn append(&mut self, event: Event) -> Result<Sequence, StoreError> {
         self.append_batch(std::slice::from_ref(&event))
@@ -188,6 +393,14 @@ impl EventStore for FileEventStore {
     }
 
     fn append_batch(&mut self, events: &[Event]) -> Result<Vec<Sequence>, StoreError> {
+        if self.format_version == 1 {
+            return Err(StoreError::Storage(
+                "legacy v1 event stores are read-only; migrate before appending".to_string(),
+            ));
+        }
+        if events.len() > MAX_BATCH_EVENTS {
+            return Err(StoreError::Storage("event batch is too large".to_string()));
+        }
         let mut new_ids = std::collections::BTreeSet::new();
         for event in events {
             if self.memory.contains_event_id(event.id) || !new_ids.insert(event.id) {
@@ -1657,6 +1870,53 @@ mod tests {
             Some(snapshot)
         );
 
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(metadata);
+    }
+
+    #[test]
+    fn switched_model_snapshot_recovers_after_filesystem_reopen() {
+        let path = temp_path("switched-model-snapshot");
+        let metadata = metadata_path(&path);
+        let run_id = RunId::new();
+        let original = ModelRef::new("provider-a", "cheap", ModelClass::Cheap);
+        let switched = ModelRef::new("provider-b", "strong", ModelClass::Strong);
+        let agent = AgentIdentity::new("switchable", "reopen snapshot", original.clone());
+        let events = [
+            Event::new(run_id, EventKind::RunCreated { run_id }),
+            Event::new(
+                run_id,
+                EventKind::AgentCreated {
+                    agent: agent.clone(),
+                },
+            ),
+            Event::new(
+                run_id,
+                EventKind::ModelRequested {
+                    agent_id: agent.id,
+                    model: switched.clone(),
+                },
+            ),
+        ];
+        {
+            let mut store = FileEventStore::open(&path).expect("file store should open");
+            store.append_batch(&events).expect("events should append");
+            let snapshot = store.snapshot(run_id).expect("snapshot should compute");
+            store
+                .save_snapshot(&snapshot)
+                .expect("snapshot should save");
+        }
+        let reopened = FileEventStore::open(&path).expect("file store should reopen");
+        let snapshot = reopened
+            .load_snapshot(run_id, None)
+            .expect("snapshot should load")
+            .expect("snapshot should exist");
+        let recovered = reopened.reconstruct(run_id).expect("run should recover");
+        let snapshot_agent = snapshot.state.agents.get(&agent.id).unwrap();
+        let recovered_agent = recovered.agents.get(&agent.id).unwrap();
+        assert_eq!(snapshot_agent.identity.model, original);
+        assert_eq!(snapshot_agent.model, switched);
+        assert_eq!(recovered_agent.model, snapshot_agent.model);
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(metadata);
     }
@@ -1776,7 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_batch_preserves_complete_prefix_and_resumes_sequences() {
+    fn interrupted_batch_discards_partial_batch_and_resumes_sequences() {
         let path = temp_path("interrupted-batch");
         let trace = successful_trace();
         let run_id = run_id(&trace);
@@ -1789,17 +2049,22 @@ mod tests {
         }
 
         let payload = encode_event(&trace.events()[1]).expect("event should encode");
-        let mut partial_frame = Vec::new();
-        partial_frame.extend_from_slice(&2_u64.to_le_bytes());
-        partial_frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        partial_frame.extend_from_slice(&payload);
-        partial_frame.extend_from_slice(&DeterministicContentHasher.hash(&payload).as_bytes());
-        partial_frame.truncate(FRAME_HEADER_BYTES + payload.len() / 2);
+        let mut partial_batch = Vec::new();
+        append_frame(
+            &mut partial_batch,
+            2,
+            &encode_control_payload(BATCH_BEGIN, 1, &[0_u8; 32]),
+        )
+        .expect("begin marker should encode");
+        let mut event_payload = vec![BATCH_EVENT];
+        event_payload.extend_from_slice(&payload);
+        append_frame(&mut partial_batch, 2, &event_payload).expect("event should encode");
+        partial_batch.truncate(partial_batch.len() - 1);
         let mut file = OpenOptions::new()
             .append(true)
             .open(&path)
             .expect("event file should open");
-        file.write_all(&partial_frame)
+        file.write_all(&partial_batch)
             .expect("partial batch frame should write");
         file.sync_all().expect("partial batch frame should flush");
 
@@ -1819,6 +2084,55 @@ mod tests {
         );
 
         drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path(&path));
+    }
+
+    #[test]
+    fn every_batch_crash_point_recovers_old_or_new_complete_state() {
+        let path = temp_path("batch-crash-points");
+        let trace = successful_trace();
+        let first = trace.events()[0].clone();
+        let second = trace.events()[1].clone();
+        let base;
+        {
+            let mut store = FileEventStore::open(&path).expect("file store should open");
+            store.append(first).expect("first event should persist");
+            drop(store);
+            base = fs::read(&path).expect("base event file should read");
+        }
+
+        let payload = encode_event(&second).expect("event should encode");
+        let mut batch = Vec::new();
+        append_frame(
+            &mut batch,
+            2,
+            &encode_control_payload(BATCH_BEGIN, 1, &[0_u8; 32]),
+        )
+        .expect("begin marker should encode");
+        let mut event_payload = vec![BATCH_EVENT];
+        event_payload.extend_from_slice(&payload);
+        append_frame(&mut batch, 2, &event_payload).expect("event should encode");
+        let digest = batch_digest([payload.as_slice()].into_iter());
+        append_frame(
+            &mut batch,
+            3,
+            &encode_control_payload(BATCH_COMMIT, 1, &digest),
+        )
+        .expect("commit marker should encode");
+
+        let mut cut_points = vec![0, FRAME_HEADER_BYTES + 1, batch.len() / 2, batch.len() - 1];
+        cut_points.push(batch.len());
+        cut_points.sort_unstable();
+        cut_points.dedup();
+        for cut in cut_points {
+            fs::write(&path, [&base, &batch[..cut]].concat()).expect("fault image should write");
+            let reopened = FileEventStore::open(&path).expect("fault image should recover");
+            let expected = if cut == batch.len() { 2 } else { 1 };
+            assert_eq!(reopened.all_events().len(), expected, "cut point {cut}");
+            drop(reopened);
+        }
+
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(lock_path(&path));
     }

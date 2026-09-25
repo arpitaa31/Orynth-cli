@@ -6,12 +6,13 @@
 //! filesystem/network sandboxing remains a separate platform boundary.
 
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs,
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::mpsc,
+    process::{Child, ChildStdout, Command, Stdio},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -19,10 +20,10 @@ use std::{
 use orynth_kernel::{AgentId, PluginId, TaskId};
 use orynth_plugin_api::{
     MAX_NAME_BYTES, PluginCapability, PluginError, PluginManifest, PluginRequest, PluginResponse,
-    PluginTransport, authorize_manifest,
+    PluginTransport, authorize_manifest_with_ownership,
 };
 use orynth_plugin_discovery::{DiscoveredPlugin, revalidate_discovered_plugin};
-use orynth_security::{CapabilityDomain, CapabilityPolicy};
+use orynth_security::{CapabilityDomain, CapabilityPolicy, ResourceOwnershipPolicy};
 
 pub trait ProcessInvoker {
     /// Capabilities required by the concrete effect, in addition to those
@@ -117,6 +118,7 @@ impl<I: ProcessInvoker> ProcessSupervisor<I> {
     pub fn invoke(
         &mut self,
         policy: &CapabilityPolicy,
+        ownership: &dyn ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -128,9 +130,9 @@ impl<I: ProcessInvoker> ProcessSupervisor<I> {
             ));
         }
         let manifest = self.plugin.manifest().clone();
-        let result = self
-            .plugin
-            .invoke(policy, agent_id, task_id, now_ms, &manifest, request);
+        let result = self.plugin.invoke(
+            policy, ownership, agent_id, task_id, now_ms, &manifest, request,
+        );
         match &result {
             Err(PluginError::Crashed(_)) => self.state = ProcessState::Crashed,
             Err(PluginError::TimedOut) => self.state = ProcessState::TimedOut,
@@ -151,7 +153,7 @@ impl<I: ProcessInvoker> ProcessPlugin<I> {
         for required in invoker.effect_capabilities() {
             if !manifest.capabilities.iter().any(|declared| {
                 declared.domain == required.domain
-                    && resource_matches(&declared.resource, &required.resource)
+                    && orynth_security::resource_matches(&declared.resource, &required.resource)
             }) {
                 return Err(PluginError::Invalid(
                     "process effect capability is missing from the manifest",
@@ -174,6 +176,7 @@ impl<I: ProcessInvoker> PluginTransport for ProcessPlugin<I> {
     fn invoke(
         &mut self,
         policy: &orynth_security::CapabilityPolicy,
+        ownership: &dyn ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -185,7 +188,14 @@ impl<I: ProcessInvoker> PluginTransport for ProcessPlugin<I> {
                 "invocation manifest does not match the bound process plugin".to_owned(),
             ));
         }
-        authorize_manifest(policy, agent_id, task_id, now_ms, &self.manifest)?;
+        authorize_manifest_with_ownership(
+            policy,
+            ownership,
+            agent_id,
+            task_id,
+            now_ms,
+            &self.manifest,
+        )?;
         for capability in self.invoker.effect_capabilities() {
             policy
                 .authorize(
@@ -194,6 +204,13 @@ impl<I: ProcessInvoker> PluginTransport for ProcessPlugin<I> {
                     capability.domain,
                     &capability.resource,
                     now_ms,
+                )
+                .map_err(|error| PluginError::CapabilityDenied(error.to_string()))?;
+            ownership
+                .authorize(
+                    agent_id,
+                    &capability.resource,
+                    orynth_security::OwnershipAccess::Write,
                 )
                 .map_err(|error| PluginError::CapabilityDenied(error.to_string()))?;
         }
@@ -316,28 +333,143 @@ pub struct CommandProcessInvoker {
 /// bounded line I/O, and timeout cleanup.
 pub struct ProcessSession {
     child: Child,
-    stdin: ChildStdin,
-    responses: mpsc::Receiver<Result<Vec<u8>, String>>,
+    responses: Arc<BoundedResponseQueue>,
     reader: Option<thread::JoinHandle<()>>,
+    writer: Option<WriterThread>,
     isolation: ProcessIsolation,
     max_frame_bytes: usize,
+    io_timeout: Duration,
+}
+
+const MAX_RESPONSE_QUEUE_FRAMES: usize = 8;
+const MAX_RESPONSE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+struct WriteRequest {
+    bytes: Vec<u8>,
+    completion: mpsc::SyncSender<Result<(), String>>,
+}
+
+struct WriterThread {
+    sender: mpsc::SyncSender<WriteRequest>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+struct BoundedResponseQueue {
+    state: Mutex<ResponseQueueState>,
+    changed: Condvar,
+    max_frames: usize,
+    max_bytes: usize,
+}
+
+struct ResponseQueueState {
+    items: VecDeque<Result<Vec<u8>, String>>,
+    bytes: usize,
+    closed: bool,
+}
+
+impl BoundedResponseQueue {
+    fn new(max_frame_bytes: usize) -> Self {
+        let max_bytes = max_frame_bytes
+            .saturating_mul(MAX_RESPONSE_QUEUE_FRAMES)
+            .min(MAX_RESPONSE_QUEUE_BYTES)
+            .max(max_frame_bytes);
+        Self {
+            state: Mutex::new(ResponseQueueState {
+                items: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+            max_frames: MAX_RESPONSE_QUEUE_FRAMES,
+            max_bytes,
+        }
+    }
+
+    fn push(&self, item: Result<Vec<u8>, String>) -> bool {
+        let item_bytes = item.as_ref().map_or(0, Vec::len);
+        let mut state = self.state.lock().expect("response queue mutex poisoned");
+        while !state.closed
+            && (state.items.len() >= self.max_frames
+                || state.bytes.saturating_add(item_bytes) > self.max_bytes)
+        {
+            state = self
+                .changed
+                .wait(state)
+                .expect("response queue mutex poisoned");
+        }
+        if state.closed {
+            return false;
+        }
+        state.bytes = state.bytes.saturating_add(item_bytes);
+        state.items.push_back(item);
+        self.changed.notify_all();
+        true
+    }
+
+    fn pop(&self, timeout: Duration) -> Result<Result<Vec<u8>, String>, QueuePopError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().expect("response queue mutex poisoned");
+        loop {
+            if let Some(item) = state.items.pop_front() {
+                state.bytes = state
+                    .bytes
+                    .saturating_sub(item.as_ref().map_or(0, Vec::len));
+                self.changed.notify_all();
+                return Ok(item);
+            }
+            if state.closed {
+                return Err(QueuePopError::Closed);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(QueuePopError::Timeout);
+            }
+            let (next, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("response queue mutex poisoned");
+            state = next;
+            if wait.timed_out() && state.items.is_empty() {
+                return Err(QueuePopError::Timeout);
+            }
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("response queue mutex poisoned");
+        state.closed = true;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn metrics(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("response queue mutex poisoned");
+        (state.items.len(), state.bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuePopError {
+    Closed,
+    Timeout,
 }
 
 pub fn spawn_process_session(
     command: &ProcessCommand,
     manifest: &PluginManifest,
     policy: &CapabilityPolicy,
+    ownership: &dyn ResourceOwnershipPolicy,
     agent_id: AgentId,
     task_id: Option<TaskId>,
     now_ms: u128,
 ) -> Result<ProcessSession, PluginError> {
     validate_program_path(command.program())?;
-    authorize_manifest(policy, agent_id, task_id, now_ms, manifest)?;
+    authorize_manifest_with_ownership(policy, ownership, agent_id, task_id, now_ms, manifest)?;
     let effect = CommandProcessInvoker::new(command.clone());
     for capability in effect.effect_capabilities() {
         if !manifest.capabilities.iter().any(|declared| {
             declared.domain == capability.domain
-                && resource_matches(&declared.resource, &capability.resource)
+                && orynth_security::resource_matches(&declared.resource, &capability.resource)
         }) {
             return Err(PluginError::Invalid(
                 "process session capability is missing from the manifest",
@@ -350,6 +482,13 @@ pub fn spawn_process_session(
                 capability.domain,
                 &capability.resource,
                 now_ms,
+            )
+            .map_err(|error| PluginError::CapabilityDenied(error.to_string()))?;
+        ownership
+            .authorize(
+                agent_id,
+                &capability.resource,
+                orynth_security::OwnershipAccess::Write,
             )
             .map_err(|error| PluginError::CapabilityDenied(error.to_string()))?;
     }
@@ -366,6 +505,11 @@ pub fn spawn_process_session(
             return Err(error);
         }
     };
+    if let Err(error) = isolation.resume(&process) {
+        let _ = process.kill();
+        let _ = process.wait();
+        return Err(error);
+    }
     let stdin = process
         .stdin
         .take()
@@ -375,63 +519,139 @@ pub fn spawn_process_session(
         .take()
         .ok_or_else(|| PluginError::Protocol("process session stdout was not piped".to_owned()))?;
     let max_frame_bytes = manifest.limits.max_message_bytes as usize;
-    let (sender, responses) = mpsc::channel();
+    let responses = Arc::new(BoundedResponseQueue::new(max_frame_bytes));
+    let reader_queue = Arc::clone(&responses);
     let reader = thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_bounded_line(&mut reader, max_frame_bytes) {
                 Ok(Some(line)) => {
-                    if sender.send(Ok(line)).is_err() {
+                    if !reader_queue.push(Ok(line)) {
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    reader_queue.close();
+                    break;
+                }
                 Err(error) => {
-                    let _ = sender.send(Err(error.to_string()));
+                    let _ = reader_queue.push(Err(error.to_string()));
+                    reader_queue.close();
                     break;
                 }
             }
         }
     });
+    let (writer_sender, writer_receiver) = mpsc::sync_channel::<WriteRequest>(1);
+    let writer = thread::spawn(move || {
+        let mut stdin = stdin;
+        while let Ok(request) = writer_receiver.recv() {
+            let result = stdin
+                .write_all(&request.bytes)
+                .and_then(|_| stdin.flush())
+                .map_err(|error| error.to_string());
+            let failed = result.is_err();
+            let _ = request.completion.send(result);
+            if failed {
+                break;
+            }
+        }
+    });
     Ok(ProcessSession {
         child: process,
-        stdin,
         responses,
         reader: Some(reader),
+        writer: Some(WriterThread {
+            sender: writer_sender,
+            join: Some(writer),
+        }),
         isolation,
         max_frame_bytes,
+        io_timeout: command
+            .timeout
+            .min(Duration::from_millis(manifest.limits.max_wall_time_ms)),
     })
 }
 
 impl ProcessSession {
     pub fn write_line(&mut self, line: &[u8]) -> Result<(), PluginError> {
-        if line.is_empty() || line.len() > self.max_frame_bytes {
-            return Err(PluginError::MessageTooLarge(line.len()));
-        }
-        self.stdin
-            .write_all(line)
-            .and_then(|_| {
-                if line.last() == Some(&b'\n') {
-                    Ok(())
-                } else {
-                    self.stdin.write_all(b"\n")
-                }
-            })
-            .and_then(|_| self.stdin.flush())
-            .map_err(|error| PluginError::Crashed(format!("MCP process write failed: {error}")))
+        self.write_line_with_timeout(line, self.io_timeout)
     }
 
-    pub fn read_line(&mut self, timeout: Duration) -> Result<Vec<u8>, PluginError> {
-        match self.responses.recv_timeout(timeout) {
-            Ok(Ok(line)) => Ok(line),
-            Ok(Err(error)) => Err(PluginError::Crashed(format!(
-                "MCP process read failed: {error}"
-            ))),
+    fn write_line_with_timeout(
+        &mut self,
+        line: &[u8],
+        timeout: Duration,
+    ) -> Result<(), PluginError> {
+        let total_len = if line.last() == Some(&b'\n') {
+            line.len()
+        } else {
+            line.len().saturating_add(1)
+        };
+        if line.is_empty() || total_len > self.max_frame_bytes {
+            return Err(PluginError::MessageTooLarge(line.len()));
+        }
+        let mut bytes = line.to_vec();
+        if bytes.last() != Some(&b'\n') {
+            bytes.push(b'\n');
+        }
+        let (completion, result) = mpsc::sync_channel(0);
+        let Some(writer) = self.writer.as_ref() else {
+            return Err(PluginError::Crashed(
+                "MCP process writer is stopped".to_owned(),
+            ));
+        };
+        match writer.sender.try_send(WriteRequest { bytes, completion }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(PluginError::Crashed("MCP process writer exited".to_owned()));
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.terminate();
+                return Err(PluginError::TimedOut);
+            }
+        }
+        match result.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.terminate();
+                Err(PluginError::Crashed(format!(
+                    "MCP process write failed: {error}"
+                )))
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.terminate();
                 Err(PluginError::TimedOut)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.terminate();
+                Err(PluginError::Crashed("MCP process writer exited".to_owned()))
+            }
+        }
+    }
+
+    /// Send one request and receive its corresponding line under one
+    /// deadline. A write that consumes the entire deadline cannot leave a
+    /// separate response timeout behind it.
+    pub fn request_line(&mut self, line: &[u8], timeout: Duration) -> Result<Vec<u8>, PluginError> {
+        let deadline = Instant::now() + timeout;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.write_line_with_timeout(line, remaining)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.read_line(remaining)
+    }
+
+    pub fn read_line(&mut self, timeout: Duration) -> Result<Vec<u8>, PluginError> {
+        match self.responses.pop(timeout) {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(PluginError::Crashed(format!(
+                "MCP process read failed: {error}"
+            ))),
+            Err(QueuePopError::Timeout) => {
+                self.terminate();
+                Err(PluginError::TimedOut)
+            }
+            Err(QueuePopError::Closed) => {
                 self.terminate();
                 Err(PluginError::Crashed("MCP process output closed".to_owned()))
             }
@@ -439,9 +659,21 @@ impl ProcessSession {
     }
 
     pub fn terminate(&mut self) {
-        let _ = &self.isolation;
+        self.responses.close();
+        let writer = self.writer.take();
+        // Closing the containment handle is part of cancellation. On
+        // Windows, KILL_ON_JOB_CLOSE is what terminates descendants; merely
+        // killing and waiting for the direct child leaves that policy dormant
+        // while this session remains alive.
+        self.isolation.close();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(mut writer) = writer {
+            drop(writer.sender);
+            if let Some(join) = writer.join.take() {
+                let _ = join.join();
+            }
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -461,6 +693,7 @@ fn build_child(command: &ProcessCommand) -> Result<Child, PluginError> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    platform_isolation::configure_command(&mut process, command.isolation.require_containment);
     if command.clear_environment {
         process.env_clear();
     }
@@ -553,27 +786,7 @@ impl ProcessInvoker for CommandProcessInvoker {
         request: &PluginRequest,
     ) -> Result<Vec<u8>, PluginError> {
         validate_program_path(&self.command.program)?;
-        let mut command = Command::new(&self.command.program);
-        command
-            .args(&self.command.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if self.command.clear_environment {
-            command.env_clear();
-        }
-        command.envs(
-            self.command
-                .environment
-                .iter()
-                .map(|(key, value)| (key, value)),
-        );
-        if let Some(directory) = &self.command.current_dir {
-            command.current_dir(directory);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| PluginError::Crashed(format!("could not launch process: {error}")))?;
+        let mut child = build_child(&self.command)?;
         let isolation = match ProcessIsolation::attach(
             &child,
             self.command.isolation,
@@ -586,6 +799,11 @@ impl ProcessInvoker for CommandProcessInvoker {
                 return Err(error);
             }
         };
+        if let Err(error) = isolation.resume(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let mut stdin = child
             .stdin
             .take()
@@ -600,7 +818,7 @@ impl ProcessInvoker for CommandProcessInvoker {
             .command
             .timeout
             .min(Duration::from_millis(manifest.limits.max_wall_time_ms));
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let io_thread = thread::spawn(move || {
             let result = (|| {
                 wire::write_request(&mut stdin, &manifest, &request)?;
@@ -670,6 +888,14 @@ impl ProcessIsolation {
         let platform = platform_isolation::attach(child, policy, memory_limit_bytes)?;
         Ok(Self { platform })
     }
+
+    fn resume(&self, child: &Child) -> Result<(), PluginError> {
+        platform_isolation::resume(&self.platform, child)
+    }
+
+    fn close(&mut self) {
+        platform_isolation::close(&mut self.platform);
+    }
 }
 
 impl Drop for ProcessIsolation {
@@ -688,6 +914,9 @@ mod platform_isolation {
     const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0008;
     const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0100;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -725,6 +954,18 @@ mod platform_isolation {
         peak_job_memory_used: usize,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ThreadEntry32 {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_thread_id: u32,
+        th32_owner_process_id: u32,
+        tp_base_pri: i32,
+        tp_delta_pri: i32,
+        dw_flags: u32,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
@@ -735,6 +976,11 @@ mod platform_isolation {
             information_length: u32,
         ) -> i32;
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(desired_access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
+        fn ResumeThread(thread: Handle) -> u32;
         fn CloseHandle(handle: Handle) -> i32;
     }
 
@@ -801,6 +1047,64 @@ mod platform_isolation {
         Ok(job)
     }
 
+    pub fn resume(handle: &Handle, child: &Child) -> Result<(), PluginError> {
+        if handle.is_null() {
+            return Ok(());
+        }
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == (-1isize as Handle) {
+            return Err(PluginError::Crashed(format!(
+                "could not enumerate suspended process threads: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut entry = ThreadEntry32 {
+            dw_size: std::mem::size_of::<ThreadEntry32>() as u32,
+            ..ThreadEntry32::default()
+        };
+        let mut found = false;
+        let mut result = Ok(());
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) != 0 };
+        while has_entry {
+            if entry.th32_owner_process_id == child.id() {
+                found = true;
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32_thread_id) };
+                if thread.is_null() {
+                    result = Err(PluginError::Crashed(format!(
+                        "could not open suspended process thread: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                    break;
+                }
+                let resumed = unsafe { ResumeThread(thread) };
+                unsafe { CloseHandle(thread) };
+                if resumed == u32::MAX {
+                    result = Err(PluginError::Crashed(format!(
+                        "could not resume contained process: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                break;
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) != 0 };
+        }
+        unsafe { CloseHandle(snapshot) };
+        if result.is_ok() && !found {
+            Err(PluginError::Crashed(
+                "contained process has no resumable thread".to_owned(),
+            ))
+        } else {
+            result
+        }
+    }
+
+    pub fn configure_command(command: &mut Command, containment: bool) {
+        if containment {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_SUSPENDED);
+        }
+    }
+
     pub fn close(handle: &mut Handle) {
         if !handle.is_null() {
             unsafe { CloseHandle(*handle) };
@@ -830,6 +1134,12 @@ mod platform_isolation {
     }
 
     pub fn close(_handle: &mut Handle) {}
+
+    pub fn resume(_handle: &Handle, _child: &Child) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    pub fn configure_command(_command: &mut Command, _containment: bool) {}
 }
 
 fn wait_for_exit(
@@ -1130,15 +1440,6 @@ pub mod wire {
     }
 }
 
-fn resource_matches(granted: &str, requested: &str) -> bool {
-    granted == requested
-        || (requested.starts_with(granted)
-            && requested
-                .as_bytes()
-                .get(granted.len())
-                .is_some_and(|separator| *separator == b'/' || *separator == b'\\'))
-}
-
 impl<I: ProcessInvoker> ProcessPlugin<I> {
     fn invoke_unchecked(&mut self, request: PluginRequest) -> Result<PluginResponse, PluginError> {
         let request_id = request.request_id;
@@ -1158,6 +1459,7 @@ mod tests {
     use super::*;
     use orynth_kernel::PluginId;
     use orynth_plugin_api::{PluginCapability, PluginKind, PluginResourceLimits};
+    use orynth_security::AllowAllOwnership;
     use orynth_security::{CapabilityDomain, CapabilityLease, CapabilityPolicy};
 
     #[derive(Default)]
@@ -1236,6 +1538,7 @@ mod tests {
         let response = plugin
             .invoke(
                 &policy,
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -1261,6 +1564,7 @@ mod tests {
         assert!(matches!(
             plugin.invoke(
                 &CapabilityPolicy::new(),
+                &AllowAllOwnership,
                 orynth_kernel::AgentId::from_u64(9),
                 None,
                 1,
@@ -1282,6 +1586,7 @@ mod tests {
         let error = plugin
             .invoke(
                 &CapabilityPolicy::new(),
+                &AllowAllOwnership,
                 orynth_kernel::AgentId::from_u64(9),
                 None,
                 1,
@@ -1315,6 +1620,7 @@ mod tests {
         assert_eq!(
             supervisor.invoke(
                 &policy,
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -1330,6 +1636,7 @@ mod tests {
         assert!(matches!(
             supervisor.invoke(
                 &policy,
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -1359,6 +1666,7 @@ mod tests {
             supervisor
                 .invoke(
                     &policy,
+                    &AllowAllOwnership,
                     agent_id,
                     None,
                     1,
@@ -1388,6 +1696,7 @@ mod tests {
         assert_eq!(
             supervisor.invoke(
                 &policy,
+                &AllowAllOwnership,
                 agent_id,
                 None,
                 1,
@@ -1400,5 +1709,50 @@ mod tests {
             Err(PluginError::TimedOut)
         );
         assert_eq!(supervisor.state(), ProcessState::TimedOut);
+    }
+
+    #[test]
+    fn response_queue_backpressure_keeps_frames_and_bytes_bounded() {
+        let queue = Arc::new(BoundedResponseQueue::new(4));
+        for _ in 0..MAX_RESPONSE_QUEUE_FRAMES {
+            assert!(queue.push(Ok(vec![1, 2, 3, 4])));
+        }
+        assert_eq!(queue.metrics(), (MAX_RESPONSE_QUEUE_FRAMES, 32));
+
+        let (done_sender, done_receiver) = mpsc::sync_channel(0);
+        let producer_queue = Arc::clone(&queue);
+        let producer = thread::spawn(move || {
+            assert!(producer_queue.push(Ok(vec![5, 6, 7, 8])));
+            done_sender.send(()).unwrap();
+        });
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(10))
+                .is_err()
+        );
+
+        assert_eq!(
+            queue.pop(Duration::from_secs(1)).unwrap().unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        done_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.join().unwrap();
+        let (frames, bytes) = queue.metrics();
+        assert!(frames <= MAX_RESPONSE_QUEUE_FRAMES);
+        assert!(bytes <= MAX_RESPONSE_QUEUE_BYTES);
+    }
+
+    #[test]
+    fn response_queue_close_unblocks_a_full_reader() {
+        let queue = Arc::new(BoundedResponseQueue::new(4));
+        for _ in 0..MAX_RESPONSE_QUEUE_FRAMES {
+            assert!(queue.push(Ok(vec![0; 4])));
+        }
+        let producer_queue = Arc::clone(&queue);
+        let producer = thread::spawn(move || producer_queue.push(Ok(vec![1, 2, 3, 4])));
+        thread::sleep(Duration::from_millis(5));
+        queue.close();
+        assert!(!producer.join().unwrap());
+        assert_eq!(queue.pop(Duration::from_millis(1)), Ok(Ok(vec![0; 4])));
     }
 }

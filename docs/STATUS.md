@@ -6,6 +6,35 @@ Blueprint: SUPPLIED IN CURRENT RESEARCH BRIEF
 Implementation: Phase 2 runtime core hardened; Phase 3 context slice complete; Phase 4A/4B plus budget/health projections complete; Phase 5 security/tools slice complete; Phase 6 plugin/protocol contracts active; Phase 7 terminal planning and rooted execution active; Phase 8 inspector slice active
 Current Phase: 8 - TUI/debugger
 
+Phase A audit remediation: ORY-AUDIT-001 through ORY-AUDIT-005 have been
+addressed in the current worktree with focused regression coverage. The
+filesystem boundary now rejects symlink/reparse traversal and authorizes
+concrete source/destination paths; terminal undo uses unique quarantine
+objects and validated internal state; durable IDs use a process-unique
+restart-safe prefix; filesystem event batches use commit markers; and MCP
+HTTP authorization uses normalized structured destinations with redirects
+disabled. Remaining limitations are documented in
+`docs/CODE_AUDIT_REMEDIATION.md`.
+
+Phase B audit remediation: ORY-AUDIT-006 through ORY-AUDIT-018 have been
+addressed in the current worktree. Snapshot identity/effective-model
+separation, archived-stale context propagation, active health resolution,
+cache/budget evidence gates, centralized runtime mutation validation, typed
+tool-effect outcomes, schema-declared syntax normalization, CLI preservation,
+and deny-by-default process executable policy are covered by focused tests.
+Details and limitations are recorded in `docs/CODE_AUDIT_REMEDIATION.md` and
+ADR-0062.
+
+Phase C audit remediation: ORY-AUDIT-019 through ORY-AUDIT-025 are fixed in
+the current worktree. Process response and stdin I/O are bounded and
+deadline-cleaned; Windows contained processes are suspended before Job Object
+assignment and containment closes on cancellation; manifest, WASM, and
+directory discovery reads are bounded; plugin activation limits are
+cumulative; MCP wire negotiation and HTTP ownership admission are validated;
+and scheduler-backed ownership is enforced at tool, terminal, plugin, and
+cancellation boundaries. Details, tests, and residual limitations are
+recorded in `docs/CODE_AUDIT_REMEDIATION.md` and ADR-0063.
+
 Completed:
 - repository bootstrap and workspace validation;
 - canonical specification and dependency direction;
@@ -235,10 +264,10 @@ Evidence:
   transactional verification/compensation, effect-boundary capability
   rechecks, versioned audit transition replay,
   deterministic repair, validated previews, provenance policy, and codec
-  preservation; twelve terminal-tool tests pass for rooted filesystem effects,
+  preservation; thirteen terminal-tool tests pass for rooted filesystem effects,
   traversal rejection, compensation conflict handling, injected process policy,
   bounded environment discovery, and terminal-plan risk/confirmation/path/Git
-  validation; fourteen CLI tests pass for bounded runtime configuration, typed
+  validation; fifteen CLI tests pass for bounded runtime configuration, typed
   plan/execute parsing, confirmation gating, verified rooted filesystem
   execution, conservative local phrase translation, and cross-process undo;
 - four cache tests pass for explicit metadata recording, absent metadata,
@@ -260,6 +289,9 @@ Evidence:
   breakpoint scanning, and bounded pane/item navigation;
 - cargo fmt, cargo check, cargo clippy, and the full workspace test suite pass;
   the full run includes all library, command-host integration, and doc tests.
+- `cargo build --release --workspace` was previously blocked by Windows
+  Application Control with OS error 4551 during an earlier Phase A attempt;
+  the final Phase B release validation now passes.
 - the supplied research brief is preserved in BLUEPRINT.md;
 - canonical docs and phase plans are present.
 
@@ -269,3 +301,15 @@ Next gate:
   model policy, provider-specific cache adapters, scheduling,
   child-agent policy, fault-injection, directory durability, context archival,
   and artifact retention remain later lifecycle work.
+
+Audit gate:
+- Phase A and Phase B remediation are complete for the scoped findings.
+- Final Phase B validation passes: format check, workspace check, Clippy with
+  warnings denied, all-features workspace tests, and release workspace build.
+- Phase C remediation is complete: 7/7 scoped findings pass the Phase C gate.
+- `cargo fmt --all -- --check`, workspace check, Clippy with warnings denied,
+  and release workspace build pass. The exact all-features workspace test
+  command is ENVIRONMENT-BLOCKED when Windows Application Control launches
+  generated test binaries (OS error 4551); focused executable suites that
+  launch successfully pass.
+- Do not begin Phase D from this handoff.

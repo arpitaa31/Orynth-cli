@@ -3,7 +3,12 @@
 //! Discovery validates metadata and returns candidates. It never launches a
 //! command, grants a capability, or activates a plugin by itself.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use orynth_kernel::PluginId;
 use orynth_plugin_api::{
@@ -68,6 +73,10 @@ impl DiscoveryPolicy {
 pub struct DiscoveredPlugin {
     pub manifest: PluginManifest,
     pub source: PathBuf,
+    /// The manifest admission limit used to produce this candidate. Keeping
+    /// it with the candidate prevents a later activation revalidation from
+    /// silently widening the policy to the process-wide maximum.
+    pub manifest_limit: usize,
     /// Present for command-backed process plugins. Discovery never launches it.
     pub entrypoint: Option<PathBuf>,
 }
@@ -79,6 +88,11 @@ pub struct DiscoveredPlugin {
 pub fn revalidate_discovered_plugin(
     candidate: &DiscoveredPlugin,
 ) -> Result<(PluginManifest, Option<PathBuf>), DiscoveryError> {
+    if candidate.manifest_limit == 0 || candidate.manifest_limit > MAX_MANIFEST_BYTES {
+        return Err(DiscoveryError::Invalid(
+            "discovered manifest limit is invalid",
+        ));
+    }
     let metadata = fs::symlink_metadata(&candidate.source)
         .map_err(|error| DiscoveryError::Io(candidate.source.clone(), error.to_string()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -86,8 +100,7 @@ pub fn revalidate_discovered_plugin(
             "discovered plugin manifest is not a regular file",
         ));
     }
-    let bytes = fs::read(&candidate.source)
-        .map_err(|error| DiscoveryError::Io(candidate.source.clone(), error.to_string()))?;
+    let bytes = read_bounded_file(&candidate.source, candidate.manifest_limit)?;
     let parsed = parse_manifest_with_entrypoint(&bytes)?;
     if parsed.0 != candidate.manifest || parsed.1 != candidate.entrypoint {
         return Err(DiscoveryError::Invalid(
@@ -105,25 +118,31 @@ pub fn discover_directories(
     let mut candidates = Vec::new();
     let mut ids = BTreeSet::new();
     for root in roots {
-        let mut entries = fs::read_dir(root)
+        let mut manifest_paths = Vec::new();
+        for entry in fs::read_dir(root)
             .map_err(|error| DiscoveryError::Io(root.clone(), error.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| DiscoveryError::Io(root.clone(), error.to_string()))?;
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries {
+        {
+            let entry =
+                entry.map_err(|error| DiscoveryError::Io(root.clone(), error.to_string()))?;
+            if entry.file_name() != MANIFEST_FILE_NAME {
+                continue;
+            }
             let path = entry.path();
             let file_type = entry
                 .file_type()
                 .map_err(|error| DiscoveryError::Io(path.clone(), error.to_string()))?;
-            if file_type.is_symlink()
-                || !file_type.is_file()
-                || entry.file_name() != MANIFEST_FILE_NAME
-            {
+            if file_type.is_symlink() || !file_type.is_file() {
                 continue;
             }
-            if candidates.len() >= policy.max_files {
-                return Err(DiscoveryError::TooMany(candidates.len() + 1));
+            if candidates.len().saturating_add(manifest_paths.len()) >= policy.max_files {
+                return Err(DiscoveryError::TooMany(
+                    candidates.len().saturating_add(manifest_paths.len()) + 1,
+                ));
             }
+            manifest_paths.push(path);
+        }
+        manifest_paths.sort();
+        for path in manifest_paths {
             let metadata = fs::metadata(&path)
                 .map_err(|error| DiscoveryError::Io(path.clone(), error.to_string()))?;
             let size = usize::try_from(metadata.len())
@@ -131,11 +150,7 @@ pub fn discover_directories(
             if size > policy.max_manifest_bytes {
                 return Err(DiscoveryError::TooLarge(size));
             }
-            let bytes = fs::read(&path)
-                .map_err(|error| DiscoveryError::Io(path.clone(), error.to_string()))?;
-            if bytes.len() > policy.max_manifest_bytes {
-                return Err(DiscoveryError::TooLarge(bytes.len()));
-            }
+            let bytes = read_bounded_file(&path, policy.max_manifest_bytes)?;
             let (manifest, entrypoint) = parse_manifest_with_entrypoint(&bytes)?;
             if !policy.permits(manifest.kind) {
                 continue;
@@ -146,11 +161,31 @@ pub fn discover_directories(
             candidates.push(DiscoveredPlugin {
                 manifest,
                 source: path,
+                manifest_limit: policy.max_manifest_bytes,
                 entrypoint,
             });
         }
     }
     Ok(candidates)
+}
+
+/// Read at most `max_bytes + 1` bytes so the limit remains authoritative even
+/// when a file grows after its metadata was inspected. The returned buffer is
+/// never larger than the configured limit on success.
+pub fn read_bounded_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, DiscoveryError> {
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or(DiscoveryError::TooLarge(max_bytes))?;
+    let file =
+        File::open(path).map_err(|error| DiscoveryError::Io(path.to_owned(), error.to_string()))?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    file.take(read_limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| DiscoveryError::Io(path.to_owned(), error.to_string()))?;
+    if bytes.len() > max_bytes {
+        return Err(DiscoveryError::TooLarge(bytes.len()));
+    }
+    Ok(bytes)
 }
 
 /// Parse the strict line-oriented manifest format used for discovery.
@@ -437,6 +472,51 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_file_reader_rejects_only_after_the_configured_limit() {
+        let root = std::env::temp_dir().join(format!("orynth-bounded-file-{}", PluginId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("payload");
+        fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_bounded_file(&path, 4).unwrap(), b"abcd");
+        assert!(matches!(
+            read_bounded_file(&path, 3),
+            Err(DiscoveryError::TooLarge(4))
+        ));
+        assert!(matches!(
+            read_bounded_file(&path, 0),
+            Err(DiscoveryError::TooLarge(1))
+        ));
+        fs::write(&path, b"ab").unwrap();
+        assert_eq!(read_bounded_file(&path, 2).unwrap(), b"ab");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revalidation_preserves_the_original_manifest_limit() {
+        let root =
+            std::env::temp_dir().join(format!("orynth-plugin-revalidate-{}", PluginId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(MANIFEST_FILE_NAME);
+        let original = manifest_text(11, "revalidate");
+        let limit = original.len() + 1;
+        fs::write(&path, &original).unwrap();
+        let policy = DiscoveryPolicy {
+            max_manifest_bytes: limit,
+            ..DiscoveryPolicy::default()
+        };
+        let candidate = discover_directories(std::slice::from_ref(&root), &policy)
+            .unwrap()
+            .pop()
+            .unwrap();
+        fs::write(&path, format!("{original}##")).unwrap();
+        assert!(matches!(
+            revalidate_discovered_plugin(&candidate),
+            Err(DiscoveryError::TooLarge(_))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 }

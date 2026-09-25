@@ -13,7 +13,7 @@ use orynth_plugin_mcp::{
     SessionMcpInvoker, StdioMcpTransport,
 };
 use orynth_plugin_process::ProcessCommand;
-use orynth_security::{CapabilityDomain, CapabilityLease, CapabilityPolicy};
+use orynth_security::{AllowAllOwnership, CapabilityDomain, CapabilityLease, CapabilityPolicy};
 
 fn fixture_path() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_orynth-mcp-fixture")
@@ -56,6 +56,7 @@ fn server() -> McpServerInfo {
         name: "fixture".to_owned(),
         version: "1".to_owned(),
         protocol_version: 1,
+        wire_protocol_version: Some(orynth_plugin_mcp::MCP_LEGACY_PROTOCOL_VERSION.to_owned()),
         metadata: Default::default(),
     }
 }
@@ -93,6 +94,7 @@ fn legacy_stdio_session_round_trips_through_mcp_adapter() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &program),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,
@@ -104,6 +106,7 @@ fn legacy_stdio_session_round_trips_through_mcp_adapter() {
     let response = adapter
         .invoke(
             &policy(agent_id, &program),
+            &AllowAllOwnership,
             agent_id,
             None,
             1,
@@ -134,6 +137,7 @@ fn modern_stdio_session_adds_per_request_metadata_without_legacy_handshake() {
             server(),
             McpConnectionContext {
                 policy: &policy(agent_id, &program),
+                ownership: &AllowAllOwnership,
                 agent_id,
                 task_id: None,
                 now_ms: 1,
@@ -145,6 +149,7 @@ fn modern_stdio_session_adds_per_request_metadata_without_legacy_handshake() {
     let response = adapter
         .invoke(
             &policy(agent_id, &program),
+            &AllowAllOwnership,
             agent_id,
             None,
             1,

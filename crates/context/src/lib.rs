@@ -17,7 +17,6 @@ pub const CONTEXT_TRANSITION_VERSION: u16 = 1;
 const MAX_CONTEXT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTEXT_ITEMS: usize = 1_000_000;
 
-static NEXT_CONTEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -25,7 +24,7 @@ pub struct ContextBlockId(u64);
 
 impl ContextBlockId {
     pub fn new() -> Self {
-        Self(NEXT_CONTEXT_BLOCK_ID.fetch_add(1, Ordering::Relaxed))
+        Self(orynth_kernel::new_durable_id())
     }
 
     pub const fn from_u64(value: u64) -> Self {
@@ -168,6 +167,9 @@ pub enum ContextLifecycle {
     Stale,
     Superseded,
     Archived,
+    /// Archived content whose dependency truth changed while unavailable.
+    /// Restoring it must return it to `Stale`, never directly to `Active`.
+    ArchivedStale,
     Invalidated,
 }
 
@@ -657,7 +659,9 @@ impl ContextGraph {
                     active_tokens = active_tokens.saturating_add(block.token_estimate);
                 }
                 ContextLifecycle::Stale => stale_blocks += 1,
-                ContextLifecycle::Archived => archived_blocks += 1,
+                ContextLifecycle::Archived | ContextLifecycle::ArchivedStale => {
+                    archived_blocks += 1
+                }
                 ContextLifecycle::Invalidated => invalidated_blocks += 1,
                 ContextLifecycle::Superseded => {}
             }
@@ -746,7 +750,9 @@ impl ContextGraph {
             let lifecycle_visible = match block.lifecycle {
                 ContextLifecycle::Active => true,
                 ContextLifecycle::Stale => request.include_stale,
-                ContextLifecycle::Archived => request.include_archived,
+                ContextLifecycle::Archived | ContextLifecycle::ArchivedStale => {
+                    request.include_archived
+                }
                 ContextLifecycle::Superseded | ContextLifecycle::Invalidated => false,
             };
             if !lifecycle_visible {
@@ -1066,20 +1072,33 @@ impl ContextGraph {
 
     /// Restore an archived block to the active projection set.
     pub fn restore(&mut self, reference: ContextRef) -> Result<ContextTransition, ContextError> {
-        let block = self
-            .blocks
+        let dependencies_fresh = {
+            let block = self
+                .blocks
+                .get(&reference.block_id)
+                .ok_or(ContextError::UnknownBlock(reference))?;
+            if block.revision != reference.revision {
+                return Err(ContextError::UnknownBlock(reference));
+            }
+            if !matches!(
+                block.lifecycle,
+                ContextLifecycle::Archived | ContextLifecycle::ArchivedStale
+            ) {
+                return Err(ContextError::InvalidLifecycle {
+                    block: reference,
+                    operation: "restore",
+                });
+            }
+            self.dependencies_are_fresh(block)
+        };
+        self.blocks
             .get_mut(&reference.block_id)
-            .ok_or(ContextError::UnknownBlock(reference))?;
-        if block.revision != reference.revision {
-            return Err(ContextError::UnknownBlock(reference));
-        }
-        if block.lifecycle != ContextLifecycle::Archived {
-            return Err(ContextError::InvalidLifecycle {
-                block: reference,
-                operation: "restore",
-            });
-        }
-        block.lifecycle = ContextLifecycle::Active;
+            .expect("validated context block must remain present")
+            .lifecycle = if dependencies_fresh {
+            ContextLifecycle::Active
+        } else {
+            ContextLifecycle::Stale
+        };
         Ok(ContextTransition::Restored(reference))
     }
 
@@ -1158,6 +1177,7 @@ impl ContextGraph {
                     block.lifecycle,
                     ContextLifecycle::Superseded
                         | ContextLifecycle::Archived
+                        | ContextLifecycle::ArchivedStale
                         | ContextLifecycle::Invalidated
                 )
                 || !request.trust_policy.allows(block.trust)
@@ -1214,6 +1234,12 @@ impl ContextGraph {
                 if !can_view(principal, block) {
                     return Err(ContextError::NotVisible(*reference));
                 }
+                if block.lifecycle != ContextLifecycle::Active {
+                    return Err(ContextError::InvalidLifecycle {
+                        block: *reference,
+                        operation: "render_prompt",
+                    });
+                }
                 if !trust_policy.allows(block.trust) {
                     return Err(ContextError::NotTrusted(*reference));
                 }
@@ -1256,23 +1282,49 @@ impl ContextGraph {
                 .map(ContextBlock::reference)
                 .collect::<Vec<_>>();
             for dependent in dependents {
-                if let Some(block) = self.blocks.get_mut(&dependent.block_id)
-                    && matches!(
-                        block.lifecycle,
-                        ContextLifecycle::Active | ContextLifecycle::Stale
-                    )
-                {
-                    block.lifecycle = ContextLifecycle::Stale;
-                    invalidations.push(Invalidation {
-                        block: dependent,
-                        dependency: Some(dependency),
-                        reason: reason.clone(),
-                    });
+                if let Some(block) = self.blocks.get_mut(&dependent.block_id) {
+                    let affected = match block.lifecycle {
+                        ContextLifecycle::Active | ContextLifecycle::Stale => {
+                            block.lifecycle = ContextLifecycle::Stale;
+                            true
+                        }
+                        ContextLifecycle::Archived => {
+                            block.lifecycle = ContextLifecycle::ArchivedStale;
+                            true
+                        }
+                        ContextLifecycle::ArchivedStale
+                        | ContextLifecycle::Superseded
+                        | ContextLifecycle::Invalidated => false,
+                    };
+                    if affected {
+                        invalidations.push(Invalidation {
+                            block: dependent,
+                            dependency: Some(dependency),
+                            reason: reason.clone(),
+                        });
+                    }
+                    // A stale or archived node can still have dependents;
+                    // dependency truth is independent of availability.
                     queue.push(dependent);
                 }
             }
         }
         invalidations
+    }
+
+    fn dependencies_are_fresh(&self, block: &ContextBlock) -> bool {
+        block
+            .dependencies
+            .iter()
+            .chain(block.sources.iter())
+            .all(|reference| {
+                self.blocks
+                    .get(&reference.block_id)
+                    .is_some_and(|dependency| {
+                        dependency.revision == reference.revision
+                            && dependency.lifecycle == ContextLifecycle::Active
+                    })
+            })
     }
 
     fn apply_transition_with_content<F>(
@@ -1324,20 +1376,33 @@ impl ContextGraph {
                 block.lifecycle = ContextLifecycle::Archived;
             }
             ContextTransition::Restored(reference) => {
-                let block = self
-                    .blocks
+                let dependencies_fresh = {
+                    let block = self
+                        .blocks
+                        .get(&reference.block_id)
+                        .ok_or(ContextError::UnknownBlock(reference))?;
+                    if block.revision != reference.revision {
+                        return Err(ContextError::UnknownBlock(reference));
+                    }
+                    if !matches!(
+                        block.lifecycle,
+                        ContextLifecycle::Archived | ContextLifecycle::ArchivedStale
+                    ) {
+                        return Err(ContextError::InvalidLifecycle {
+                            block: reference,
+                            operation: "restore",
+                        });
+                    }
+                    self.dependencies_are_fresh(block)
+                };
+                self.blocks
                     .get_mut(&reference.block_id)
-                    .ok_or(ContextError::UnknownBlock(reference))?;
-                if block.revision != reference.revision {
-                    return Err(ContextError::UnknownBlock(reference));
-                }
-                if block.lifecycle != ContextLifecycle::Archived {
-                    return Err(ContextError::InvalidLifecycle {
-                        block: reference,
-                        operation: "restore",
-                    });
-                }
-                block.lifecycle = ContextLifecycle::Active;
+                    .expect("validated context block must remain present")
+                    .lifecycle = if dependencies_fresh {
+                    ContextLifecycle::Active
+                } else {
+                    ContextLifecycle::Stale
+                };
             }
             ContextTransition::Pinned(reference) => {
                 let block = self
@@ -1377,8 +1442,8 @@ impl ContextGraph {
             }
             ContextTransition::Invalidated {
                 block: reference,
-                dependency: Some(_),
-                ..
+                dependency: Some(dependency),
+                reason,
             } => {
                 let block = self
                     .blocks
@@ -1387,12 +1452,22 @@ impl ContextGraph {
                 if block.revision != reference.revision {
                     return Err(ContextError::UnknownBlock(reference));
                 }
-                block.lifecycle = ContextLifecycle::Stale;
+                block.lifecycle = match block.lifecycle {
+                    ContextLifecycle::Archived | ContextLifecycle::ArchivedStale => {
+                        ContextLifecycle::ArchivedStale
+                    }
+                    _ => ContextLifecycle::Stale,
+                };
+                self.invalidations.push(Invalidation {
+                    block: reference,
+                    dependency: Some(dependency),
+                    reason,
+                });
             }
             ContextTransition::Invalidated {
                 block: reference,
                 dependency: None,
-                ..
+                reason,
             } => {
                 let block = self
                     .blocks
@@ -1402,6 +1477,11 @@ impl ContextGraph {
                     return Err(ContextError::UnknownBlock(reference));
                 }
                 block.lifecycle = ContextLifecycle::Invalidated;
+                self.invalidations.push(Invalidation {
+                    block: reference,
+                    dependency: None,
+                    reason,
+                });
             }
         }
         Ok(())
@@ -1856,6 +1936,7 @@ fn lifecycle_tag(lifecycle: ContextLifecycle) -> u8 {
         ContextLifecycle::Superseded => 2,
         ContextLifecycle::Archived => 3,
         ContextLifecycle::Invalidated => 4,
+        ContextLifecycle::ArchivedStale => 5,
     }
 }
 
@@ -1866,6 +1947,7 @@ fn decode_lifecycle(tag: u8) -> Result<ContextLifecycle, ContextError> {
         2 => ContextLifecycle::Superseded,
         3 => ContextLifecycle::Archived,
         4 => ContextLifecycle::Invalidated,
+        5 => ContextLifecycle::ArchivedStale,
         tag => {
             return Err(ContextError::InvalidEncoding(format!(
                 "unknown context lifecycle tag {tag}"
@@ -2169,6 +2251,185 @@ mod tests {
         assert_eq!(
             replayed.block(reference).expect("replayed block").lifecycle,
             ContextLifecycle::Active
+        );
+    }
+
+    #[test]
+    fn invalidation_history_replays_without_duplication() {
+        let owner = agent();
+        let mut graph = ContextGraph::new();
+        let base = graph
+            .publish(draft(
+                "schema.users",
+                ContextOwner::Runtime,
+                ContextScope::Global,
+                "v1",
+            ))
+            .expect("base should publish");
+        let dependent = graph
+            .publish(
+                draft(
+                    "query.users",
+                    ContextOwner::Agent(owner),
+                    ContextScope::Private(owner),
+                    "uses users",
+                )
+                .with_dependency(base.block.reference()),
+            )
+            .expect("dependent should publish");
+        let replacement = graph
+            .publish(draft(
+                "schema.users",
+                ContextOwner::Runtime,
+                ContextScope::Global,
+                "v2",
+            ))
+            .expect("replacement should publish");
+        assert_eq!(
+            graph.block(dependent.block.reference()).unwrap().lifecycle,
+            ContextLifecycle::Stale
+        );
+        assert_eq!(graph.invalidation_count(), 1);
+        let transitions = base
+            .transitions
+            .into_iter()
+            .chain(dependent.transitions)
+            .chain(replacement.transitions)
+            .collect::<Vec<_>>();
+        let replayed = ContextGraph::replay(transitions.clone()).expect("replay should succeed");
+        let replayed_again =
+            ContextGraph::replay(transitions).expect("second replay should succeed");
+        assert_eq!(replayed.invalidations(), graph.invalidations());
+        assert_eq!(replayed_again.invalidations(), graph.invalidations());
+        assert_eq!(replayed.invalidation_count(), 1);
+    }
+
+    #[test]
+    fn archived_dependency_chains_remain_stale_and_restore_is_not_fresh() {
+        let owner = agent();
+        let mut graph = ContextGraph::new();
+        let a = graph
+            .publish(draft(
+                "a",
+                ContextOwner::Runtime,
+                ContextScope::Global,
+                "a1",
+            ))
+            .expect("a should publish");
+        let b = graph
+            .publish(
+                draft("b", ContextOwner::Runtime, ContextScope::Global, "b1")
+                    .with_dependency(a.block.reference()),
+            )
+            .expect("b should publish");
+        let c = graph
+            .publish(
+                draft(
+                    "c",
+                    ContextOwner::Agent(owner),
+                    ContextScope::Private(owner),
+                    "c1",
+                )
+                .with_dependency(b.block.reference()),
+            )
+            .expect("c should publish");
+        let archived = graph
+            .archive(b.block.reference())
+            .expect("b should archive");
+        assert_eq!(
+            graph.block(b.block.reference()).unwrap().lifecycle,
+            ContextLifecycle::Archived
+        );
+
+        let replacement_a = graph
+            .publish(draft(
+                "a",
+                ContextOwner::Runtime,
+                ContextScope::Global,
+                "a2",
+            ))
+            .expect("a replacement should publish");
+        assert_eq!(
+            graph.block(b.block.reference()).unwrap().lifecycle,
+            ContextLifecycle::ArchivedStale
+        );
+        assert_eq!(
+            graph.block(c.block.reference()).unwrap().lifecycle,
+            ContextLifecycle::Stale
+        );
+
+        let restored = graph
+            .restore(b.block.reference())
+            .expect("b should restore");
+        assert_eq!(
+            graph.block(b.block.reference()).unwrap().lifecycle,
+            ContextLifecycle::Stale
+        );
+        let replayed = ContextGraph::replay(
+            a.transitions
+                .into_iter()
+                .chain(b.transitions)
+                .chain(c.transitions)
+                .chain([archived])
+                .chain(replacement_a.transitions)
+                .chain([restored]),
+        )
+        .expect("archived dependency replay should succeed");
+        assert_eq!(
+            replayed.block(b.block.reference()).unwrap().lifecycle,
+            ContextLifecycle::Stale
+        );
+    }
+
+    #[test]
+    fn prompt_rendering_rejects_non_active_refs_but_preserves_private_scope() {
+        let owner = agent();
+        let other = agent();
+        let mut graph = ContextGraph::new();
+        let private = graph
+            .publish(draft(
+                "private.note",
+                ContextOwner::Agent(owner),
+                ContextScope::Private(owner),
+                "secret",
+            ))
+            .expect("private block should publish");
+        let layers = vec![PromptLayer::stable(
+            "context",
+            vec![private.block.reference()],
+        )];
+        assert!(
+            graph
+                .render_prompt(ContextPrincipal::Agent(owner), &layers, "task")
+                .is_ok()
+        );
+        assert!(matches!(
+            graph.render_prompt(ContextPrincipal::Agent(other), &layers, "task"),
+            Err(ContextError::NotVisible(_))
+        ));
+        graph
+            .archive(private.block.reference())
+            .expect("archive should succeed");
+        assert!(matches!(
+            graph.render_prompt(ContextPrincipal::Agent(owner), &layers, "task"),
+            Err(ContextError::InvalidLifecycle { .. })
+        ));
+        let replacement = graph
+            .publish(draft(
+                "private.note",
+                ContextOwner::Agent(owner),
+                ContextScope::Private(owner),
+                "replacement",
+            ))
+            .expect("replacement should publish");
+        let current = vec![PromptLayer::stable(
+            "context",
+            vec![replacement.block.reference()],
+        )];
+        assert!(
+            graph
+                .render_prompt(ContextPrincipal::Agent(owner), &current, "task")
+                .is_ok()
         );
     }
 

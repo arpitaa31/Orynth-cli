@@ -4,8 +4,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use orynth_kernel::{AgentId, RunId};
-use orynth_security::{CapabilityDomain, CapabilityLease};
+use orynth_kernel::{AgentId, RunId, new_durable_id};
+use orynth_security::{CapabilityDomain, CapabilityLease, ExclusiveOwnershipPolicy};
 use orynth_terminal_tools::{
     FILESYSTEM_COPY_TOOL, FILESYSTEM_FIND_TOOL, FILESYSTEM_MOVE_TOOL, FILESYSTEM_REMOVE_TOOL,
     FilesystemFixture, FilesystemUndoRecord, TerminalEnvironment, TerminalOperation, TerminalPlan,
@@ -73,6 +73,11 @@ where
             "expected `plan`, `execute`, `help`, or `--help`".to_owned(),
         ));
     }
+    if args.len() < 2 {
+        return Err(TerminalCliError(
+            "terminal command requires an operation".to_owned(),
+        ));
+    }
     let executing = args[0] == "execute";
     let mut operation_args = args[2..].to_vec();
     let confirmed = if executing {
@@ -95,9 +100,7 @@ where
     } else {
         false
     };
-    let operation_name = args
-        .get(1)
-        .ok_or_else(|| TerminalCliError("terminal command requires an operation".to_owned()))?;
+    let operation_name = &args[1];
     let operation = parse_terminal_operation(operation_name, &operation_args)?;
     TerminalPlan::build(vec![operation.clone()])
         .map_err(|error| TerminalCliError(error.to_string()))?;
@@ -119,11 +122,12 @@ pub fn translate_terminal_text(text: &str) -> Result<TerminalOperation, Terminal
             "terminal translation text is empty or too large".to_owned(),
         ));
     }
-    let normalized = text.trim().to_ascii_lowercase();
+    let original = text.trim();
+    let normalized = original.to_ascii_lowercase();
     let operation = if matches!(normalized.as_str(), "list processes" | "show processes") {
         TerminalOperation::ListProcesses
-    } else if let Some(rest) = normalized.strip_prefix("find files matching ") {
-        let (pattern, root) = rest.split_once(" under ").ok_or_else(|| {
+    } else if let Some(rest) = strip_prefix_ci(original, "find files matching ") {
+        let (pattern, root) = split_once_ci(rest, " under ").ok_or_else(|| {
             TerminalCliError("expected `find files matching <pattern> under <root>`".to_owned())
         })?;
         TerminalOperation::FindFiles {
@@ -131,39 +135,37 @@ pub fn translate_terminal_text(text: &str) -> Result<TerminalOperation, Terminal
             pattern: translated_value(pattern)?,
             max_results: 128,
         }
-    } else if let Some(rest) = normalized.strip_prefix("find ") {
-        let (pattern, root) = rest
-            .split_once(" under ")
+    } else if let Some(rest) = strip_prefix_ci(original, "find ") {
+        let (pattern, root) = split_once_ci(rest, " under ")
             .ok_or_else(|| TerminalCliError("expected `find <pattern> under <root>`".to_owned()))?;
         TerminalOperation::FindFiles {
             root: translated_value(root)?,
             pattern: translated_value(pattern)?,
             max_results: 128,
         }
-    } else if let Some(rest) = normalized.strip_prefix("copy ") {
-        let (from, to) = rest.split_once(" to ").ok_or_else(|| {
+    } else if let Some(rest) = strip_prefix_ci(original, "copy ") {
+        let (from, to) = split_once_ci(rest, " to ").ok_or_else(|| {
             TerminalCliError("expected `copy <source> to <destination>`".to_owned())
         })?;
         TerminalOperation::CopyFile {
             from: translated_value(from)?,
             to: translated_value(to)?,
         }
-    } else if let Some(rest) = normalized.strip_prefix("move ") {
-        let (from, to) = rest.split_once(" to ").ok_or_else(|| {
+    } else if let Some(rest) = strip_prefix_ci(original, "move ") {
+        let (from, to) = split_once_ci(rest, " to ").ok_or_else(|| {
             TerminalCliError("expected `move <source> to <destination>`".to_owned())
         })?;
         TerminalOperation::MoveFile {
             from: translated_value(from)?,
             to: translated_value(to)?,
         }
-    } else if let Some(path) = normalized
-        .strip_prefix("remove ")
-        .or_else(|| normalized.strip_prefix("delete "))
+    } else if let Some(path) =
+        strip_prefix_ci(original, "remove ").or_else(|| strip_prefix_ci(original, "delete "))
     {
         TerminalOperation::RemoveFile {
             path: translated_value(path)?,
         }
-    } else if let Some(rest) = normalized.strip_prefix("git ") {
+    } else if let Some(rest) = strip_prefix_ci(original, "git ") {
         let mut words = rest.split_whitespace();
         let action = words
             .next()
@@ -180,6 +182,19 @@ pub fn translate_terminal_text(text: &str) -> Result<TerminalOperation, Terminal
     TerminalPlan::build(vec![operation.clone()])
         .map_err(|error| TerminalCliError(error.to_string()))?;
     Ok(operation)
+}
+
+fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn split_once_ci<'a>(value: &'a str, separator: &str) -> Option<(&'a str, &'a str)> {
+    let lower = value.to_ascii_lowercase();
+    let index = lower.find(separator)?;
+    Some((&value[..index], &value[index + separator.len()..]))
 }
 
 fn translated_value(value: &str) -> Result<String, TerminalCliError> {
@@ -345,7 +360,7 @@ pub fn execute_terminal_operation(
             ]
             .into_iter()
             .collect(),
-            "filesystem".to_owned(),
+            ".".to_owned(),
         ),
         TerminalOperation::CopyFile { from, to } => (
             copy_definition(),
@@ -355,12 +370,12 @@ pub fn execute_terminal_operation(
             ]
             .into_iter()
             .collect(),
-            "filesystem".to_owned(),
+            ".".to_owned(),
         ),
         TerminalOperation::RemoveFile { path } => (
             remove_definition(),
             [("path".to_owned(), path.clone())].into_iter().collect(),
-            "filesystem".to_owned(),
+            ".".to_owned(),
         ),
         TerminalOperation::ListProcesses
         | TerminalOperation::GitOperation { .. }
@@ -386,6 +401,8 @@ pub fn execute_terminal_operation(
             expires_at_ms: u128::MAX,
         })
         .map_err(|error| TerminalCliError(error.to_string()))?;
+    let ownership = ExclusiveOwnershipPolicy::new(agent_id, ".")
+        .map_err(|error| TerminalCliError(error.to_string()))?;
 
     let proposal = ToolProposal {
         run_id: RunId::new(),
@@ -397,7 +414,7 @@ pub fn execute_terminal_operation(
         input_origins: Vec::new(),
     };
     let mut transaction = runtime
-        .validate(&proposal, current_time_ms())
+        .validate_with_ownership(&proposal, current_time_ms(), &ownership)
         .map_err(|error| TerminalCliError(error.to_string()))?;
     let mut fixture = FilesystemFixture::new(&environment.working_directory)
         .map_err(|error| TerminalCliError(error.to_string()))?;
@@ -413,7 +430,7 @@ pub fn execute_terminal_operation(
             .map_err(|error| TerminalCliError(error.to_string()))?;
     }
     runtime
-        .execute(&mut transaction, &mut fixture)
+        .execute_with_ownership(&mut transaction, &mut fixture, &ownership)
         .map_err(|error| TerminalCliError(error.to_string()))?;
     runtime
         .verify(&mut transaction, &fixture)
@@ -429,7 +446,9 @@ pub fn execute_terminal_operation(
             .and_then(|output| fixture.export_undo(output).map_err(TerminalCliError))
         {
             Ok(record) => {
-                match TerminalUndoJournal::new(&environment.working_directory).append(record) {
+                match TerminalUndoJournal::new(&environment.working_directory)
+                    .and_then(|journal| journal.append(record))
+                {
                     Ok(()) => "persistent undo available".to_owned(),
                     Err(error) => format!("persistent undo unavailable: {error}"),
                 }
@@ -469,11 +488,24 @@ fn current_time_ms() -> u128 {
         .as_millis()
 }
 
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 /// Undo the most recent persisted rooted filesystem compensation record.
 pub fn undo_terminal_operation(
     environment: &TerminalEnvironment,
 ) -> Result<String, TerminalCliError> {
-    let journal = TerminalUndoJournal::new(&environment.working_directory);
+    let journal = TerminalUndoJournal::new(&environment.working_directory)?;
     let record = journal
         .latest()?
         .ok_or_else(|| TerminalCliError("no persisted terminal undo is available".to_owned()))?;
@@ -485,7 +517,7 @@ pub fn undo_terminal_operation(
             agent_id,
             task_id: None,
             domain: CapabilityDomain::Filesystem,
-            resource: "filesystem".to_owned(),
+            resource: ".".to_owned(),
             expires_at_ms: u128::MAX,
         })
         .map_err(|error| TerminalCliError(error.to_string()))?;
@@ -495,7 +527,7 @@ pub fn undo_terminal_operation(
             agent_id,
             None,
             CapabilityDomain::Filesystem,
-            "filesystem",
+            ".",
             current_time_ms(),
         )
         .map_err(|error| TerminalCliError(error.to_string()))?;
@@ -519,20 +551,89 @@ struct TerminalUndoJournal {
     path: PathBuf,
 }
 
+struct JournalRecord {
+    transaction_id: String,
+    operation_id: String,
+    record: FilesystemUndoRecord,
+}
+
 impl TerminalUndoJournal {
-    fn new(root: &Path) -> Self {
-        Self {
-            path: root.join(".orynth").join("terminal-undo.log"),
+    fn new(root: &Path) -> Result<Self, TerminalCliError> {
+        let root = root
+            .canonicalize()
+            .map_err(|error| TerminalCliError(format!("could not resolve undo root: {error}")))?;
+        let internal = root.join(".orynth");
+        match fs::symlink_metadata(&internal) {
+            Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
+                return Err(TerminalCliError(
+                    "terminal state directory is a symlink/reparse point".to_owned(),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(TerminalCliError(
+                    "terminal state path is not a directory".to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&internal).map_err(|error| {
+                    TerminalCliError(format!(
+                        "could not create terminal state directory: {error}"
+                    ))
+                })?;
+            }
+            Err(error) => return Err(TerminalCliError(error.to_string())),
         }
+        let internal = internal.canonicalize().map_err(|error| {
+            TerminalCliError(format!(
+                "could not resolve terminal state directory: {error}"
+            ))
+        })?;
+        if !internal.starts_with(&root) {
+            return Err(TerminalCliError(
+                "terminal state directory escapes the working root".to_owned(),
+            ));
+        }
+        Ok(Self {
+            path: internal.join("terminal-undo.log"),
+        })
+    }
+
+    fn validate_path(&self) -> Result<(), TerminalCliError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| TerminalCliError("terminal undo journal has no parent".to_owned()))?;
+        let metadata = fs::symlink_metadata(parent).map_err(|error| {
+            TerminalCliError(format!("could not inspect terminal state: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) || !metadata.is_dir() {
+            return Err(TerminalCliError(
+                "terminal state directory is no longer safe".to_owned(),
+            ));
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && (metadata.file_type().is_symlink() || is_reparse_point(&metadata))
+        {
+            return Err(TerminalCliError(
+                "terminal undo journal is a symlink/reparse point".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn latest(&self) -> Result<Option<FilesystemUndoRecord>, TerminalCliError> {
-        Ok(self.load()?.pop())
+        self.validate_path()?;
+        Ok(self.load()?.pop().map(|record| record.record))
     }
 
     fn append(&self, record: FilesystemUndoRecord) -> Result<(), TerminalCliError> {
         let mut records = self.load()?;
-        records.push(record);
+        records.push(JournalRecord {
+            transaction_id: format!("tx-{:016x}", new_durable_id()),
+            operation_id: format!("op-{:016x}", new_durable_id()),
+            record,
+        });
         if records.len() > MAX_UNDO_ENTRIES {
             records.remove(0);
         }
@@ -540,6 +641,7 @@ impl TerminalUndoJournal {
     }
 
     fn remove_latest(&self) -> Result<(), TerminalCliError> {
+        self.validate_path()?;
         let mut records = self.load()?;
         if records.pop().is_none() {
             return Err(TerminalCliError(
@@ -555,7 +657,8 @@ impl TerminalUndoJournal {
         self.write(&records)
     }
 
-    fn load(&self) -> Result<Vec<FilesystemUndoRecord>, TerminalCliError> {
+    fn load(&self) -> Result<Vec<JournalRecord>, TerminalCliError> {
+        self.validate_path()?;
         self.recover_atomic_files()?;
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -588,23 +691,17 @@ impl TerminalUndoJournal {
         Ok(records)
     }
 
-    fn write(&self, records: &[FilesystemUndoRecord]) -> Result<(), TerminalCliError> {
+    fn write(&self, records: &[JournalRecord]) -> Result<(), TerminalCliError> {
+        self.validate_path()?;
         if records.len() > MAX_UNDO_ENTRIES {
             return Err(TerminalCliError(
                 "terminal undo journal has too many records".to_owned(),
             ));
         }
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| TerminalCliError("terminal undo journal has no parent".to_owned()))?;
-        fs::create_dir_all(parent).map_err(|error| {
-            TerminalCliError(format!(
-                "could not create terminal state directory: {error}"
-            ))
-        })?;
         let temporary = self.path.with_extension("log.tmp");
         let backup = self.path.with_extension("log.bak");
+        self.validate_auxiliary_path(&temporary)?;
+        self.validate_auxiliary_path(&backup)?;
         let source = records
             .iter()
             .map(encode_undo_record)
@@ -650,8 +747,11 @@ impl TerminalUndoJournal {
     }
 
     fn recover_atomic_files(&self) -> Result<(), TerminalCliError> {
+        self.validate_path()?;
         let temporary = self.path.with_extension("log.tmp");
         let backup = self.path.with_extension("log.bak");
+        self.validate_auxiliary_path(&temporary)?;
+        self.validate_auxiliary_path(&backup)?;
         if !self.path.exists() && backup.exists() {
             fs::rename(&backup, &self.path).map_err(|error| {
                 TerminalCliError(format!("could not recover undo journal: {error}"))
@@ -668,50 +768,121 @@ impl TerminalUndoJournal {
         }
         Ok(())
     }
+
+    fn validate_auxiliary_path(&self, path: &Path) -> Result<(), TerminalCliError> {
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && (metadata.file_type().is_symlink() || is_reparse_point(&metadata))
+        {
+            return Err(TerminalCliError(
+                "terminal undo auxiliary file is a symlink/reparse point".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
-fn encode_undo_record(record: &FilesystemUndoRecord) -> String {
-    match record {
+fn encode_undo_record(record: &JournalRecord) -> String {
+    let prefix = format!(
+        "v2|{}|{}|",
+        encode_hex(&record.transaction_id),
+        encode_hex(&record.operation_id)
+    );
+    match &record.record {
         FilesystemUndoRecord::Move { from, to } => {
-            format!("v1|move|{}|{}", encode_hex(from), encode_hex(to))
+            format!("{prefix}move|{}|{}", encode_hex(from), encode_hex(to))
         }
         FilesystemUndoRecord::Copy {
             to,
             content_digest,
             content_len,
         } => format!(
-            "v1|copy|{}|{content_digest:016x}|{content_len}",
+            "{prefix}copy|{}|{content_digest:016x}|{content_len}",
             encode_hex(to)
         ),
         FilesystemUndoRecord::Quarantine {
             original,
             quarantined,
         } => format!(
-            "v1|quarantine|{}|{}",
+            "{prefix}quarantine|{}|{}",
             encode_hex(original),
             encode_hex(quarantined)
         ),
     }
 }
 
-fn decode_undo_record(line: &str) -> Result<FilesystemUndoRecord, TerminalCliError> {
+fn decode_undo_record(line: &str) -> Result<JournalRecord, TerminalCliError> {
     let fields = line.split('|').collect::<Vec<_>>();
     match fields.as_slice() {
-        ["v1", "move", from, to] => Ok(FilesystemUndoRecord::Move {
-            from: decode_hex(from)?,
-            to: decode_hex(to)?,
+        ["v2", transaction_id, operation_id, "move", from, to] => Ok(JournalRecord {
+            transaction_id: decode_hex(transaction_id)?,
+            operation_id: decode_hex(operation_id)?,
+            record: FilesystemUndoRecord::Move {
+                from: decode_hex(from)?,
+                to: decode_hex(to)?,
+            },
         }),
-        ["v1", "copy", to, digest, length] => Ok(FilesystemUndoRecord::Copy {
-            to: decode_hex(to)?,
-            content_digest: u64::from_str_radix(digest, 16)
-                .map_err(|_| TerminalCliError("invalid copy undo digest".to_owned()))?,
-            content_len: length
-                .parse::<u64>()
-                .map_err(|_| TerminalCliError("invalid copy undo length".to_owned()))?,
+        [
+            "v2",
+            transaction_id,
+            operation_id,
+            "copy",
+            to,
+            digest,
+            length,
+        ] => Ok(JournalRecord {
+            transaction_id: decode_hex(transaction_id)?,
+            operation_id: decode_hex(operation_id)?,
+            record: FilesystemUndoRecord::Copy {
+                to: decode_hex(to)?,
+                content_digest: u64::from_str_radix(digest, 16)
+                    .map_err(|_| TerminalCliError("invalid copy undo digest".to_owned()))?,
+                content_len: length
+                    .parse::<u64>()
+                    .map_err(|_| TerminalCliError("invalid copy undo length".to_owned()))?,
+            },
         }),
-        ["v1", "quarantine", original, quarantined] => Ok(FilesystemUndoRecord::Quarantine {
-            original: decode_hex(original)?,
-            quarantined: decode_hex(quarantined)?,
+        [
+            "v2",
+            transaction_id,
+            operation_id,
+            "quarantine",
+            original,
+            quarantined,
+        ] => Ok(JournalRecord {
+            transaction_id: decode_hex(transaction_id)?,
+            operation_id: decode_hex(operation_id)?,
+            record: FilesystemUndoRecord::Quarantine {
+                original: decode_hex(original)?,
+                quarantined: decode_hex(quarantined)?,
+            },
+        }),
+        ["v1", "move", from, to] => Ok(JournalRecord {
+            transaction_id: "legacy-v1".to_owned(),
+            operation_id: "legacy-v1".to_owned(),
+            record: FilesystemUndoRecord::Move {
+                from: decode_hex(from)?,
+                to: decode_hex(to)?,
+            },
+        }),
+        ["v1", "copy", to, digest, length] => Ok(JournalRecord {
+            transaction_id: "legacy-v1".to_owned(),
+            operation_id: "legacy-v1".to_owned(),
+            record: FilesystemUndoRecord::Copy {
+                to: decode_hex(to)?,
+                content_digest: u64::from_str_radix(digest, 16)
+                    .map_err(|_| TerminalCliError("invalid copy undo digest".to_owned()))?,
+                content_len: length
+                    .parse::<u64>()
+                    .map_err(|_| TerminalCliError("invalid copy undo length".to_owned()))?,
+            },
+        }),
+        ["v1", "quarantine", original, quarantined] => Ok(JournalRecord {
+            transaction_id: "legacy-v1".to_owned(),
+            operation_id: "legacy-v1".to_owned(),
+            record: FilesystemUndoRecord::Quarantine {
+                original: decode_hex(original)?,
+                quarantined: decode_hex(quarantined)?,
+            },
         }),
         _ => Err(TerminalCliError("invalid terminal undo record".to_owned())),
     }
@@ -1342,6 +1513,39 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_plan_and_execute_are_errors_without_panics() {
+        for args in [["plan".to_owned()], ["execute".to_owned()]] {
+            let result = std::panic::catch_unwind(|| parse_terminal_cli(args));
+            assert!(result.is_ok(), "incomplete CLI input must not panic");
+            assert!(result.unwrap().is_err());
+        }
+        assert!(parse_terminal_cli(["plan", "copy"]).is_err());
+        assert!(parse_terminal_cli(["execute", "copy", "--from", "a"]).is_err());
+        assert!(
+            parse_terminal_cli(["plan", "copy", "--from", "a", "--to", "b", "--extra", "x"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_translation_preserves_case_sensitive_paths_and_unicode() {
+        assert_eq!(
+            translate_terminal_text("CoPy README.md to MyFolder/File.TXT").unwrap(),
+            TerminalOperation::CopyFile {
+                from: "README.md".to_owned(),
+                to: "MyFolder/File.TXT".to_owned(),
+            }
+        );
+        assert_eq!(
+            translate_terminal_text("move \"Résumé.TXT\" to \"Archive/Résumé.TXT\"").unwrap(),
+            TerminalOperation::MoveFile {
+                from: "Résumé.TXT".to_owned(),
+                to: "Archive/Résumé.TXT".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn unsupported_local_translation_is_rejected_without_guessing() {
         assert!(translate_terminal_text("clean up my downloads folder").is_err());
         assert!(translate_terminal_text("remove ../outside.txt").is_err());
@@ -1424,5 +1628,23 @@ mod tests {
         assert!(report.contains("State: Compensated"));
         assert!(!root.join("copy.txt").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn undo_journal_round_trip_preserves_transaction_and_operation_identity() {
+        let record = JournalRecord {
+            transaction_id: "tx-test".to_owned(),
+            operation_id: "op-test".to_owned(),
+            record: FilesystemUndoRecord::Quarantine {
+                original: "a/same.txt".to_owned(),
+                quarantined: ".orynth-quarantine/tx-test-same.txt".to_owned(),
+            },
+        };
+        let encoded = encode_undo_record(&record);
+        assert!(encoded.starts_with("v2|"));
+        let decoded = decode_undo_record(&encoded).unwrap();
+        assert_eq!(decoded.transaction_id, record.transaction_id);
+        assert_eq!(decoded.operation_id, record.operation_id);
+        assert_eq!(encode_undo_record(&decoded), encoded);
     }
 }

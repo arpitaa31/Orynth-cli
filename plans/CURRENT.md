@@ -191,3 +191,50 @@ Remaining Phase 9 work includes richer profile-driven specialist selection,
 provider-specific cache adapters and automatic expiry selection, automatic
 routing policy, semantic failure classification, cross-run memory, automatic
 context refresh/archive policy, and deeper active supervision/consultation.
+
+## Phase A: deep-audit remediation - complete
+
+The five S1 findings in `docs/CODE_AUDIT.md` were remediated in the current
+worktree before any Phase B feature work. Shared resource matching now
+normalizes traversal and all process/WASM callers use it; rooted filesystem
+effects reject symlink/reparse components and authorize every concrete path;
+quarantine and the persistent undo journal use unique durable transaction and
+operation identities with no-overwrite allocation; durable IDs use a
+process-unique random prefix; the filesystem event adapter persists
+begin/event/commit batches and recovers only committed batches; and the MCP
+HTTP transport binds normalized structured endpoint authority to a capability
+context for POST, GET, and reconnect operations.
+
+Validation and residual limitations are tracked in
+`docs/CODE_AUDIT_REMEDIATION.md`.
+
+## Phase B: deep-audit remediation - complete
+
+ORY-AUDIT-006 through ORY-AUDIT-018 are remediated in the current worktree.
+The implementation preserves Phase A and adds focused coverage for snapshot
+identity, context freshness and replay, cache/budget evidence, health
+resolution, validated runtime mutation boundaries, typed tool effects, CLI
+translation, schema-declared syntax fields, and process executable policy.
+The Phase B validation matrix and explicit remaining limitations are recorded
+in `docs/CODE_AUDIT_REMEDIATION.md`; the architecture choices are recorded in
+ADR-0062.
+
+## Phase C: deep-audit remediation - complete
+
+ORY-AUDIT-019 through ORY-AUDIT-025 are remediated in the current worktree.
+The process adapter has bounded response and stdin I/O with timeout cleanup
+and suspended-before-attach Windows containment; discovery and WASM activation
+are bounded before allocation; plugin activation limits are cumulative; MCP
+wire versions are negotiated and checked; and ownership is enforced as a
+separate scheduler-backed policy across tools, terminal effects, plugin
+adapters, and cancellation cleanup. The complete matrix and residual
+limitations are in `docs/CODE_AUDIT_REMEDIATION.md`; the architecture record
+is ADR-0063.
+
+Phase C validation is complete for all seven scoped findings. Formatting,
+workspace check, Clippy, release build, and the focused executable suites
+that the host policy allowed all pass. The exact all-features workspace test
+gate is ENVIRONMENT-BLOCKED by Windows Application Control (OS error 4551)
+for generated test binaries; this is recorded in the remediation matrix.
+Do not begin Phase D from this plan. Further work requires a separately
+authorized phase.

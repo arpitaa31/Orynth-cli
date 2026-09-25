@@ -7,7 +7,9 @@
 use std::{collections::BTreeMap, fmt};
 
 use orynth_kernel::{AgentId, PluginId, TaskId, TrustOrigin};
-use orynth_security::{CapabilityDomain, CapabilityPolicy};
+use orynth_security::{
+    CapabilityDomain, CapabilityPolicy, OwnershipAccess, ResourceOwnershipPolicy,
+};
 
 pub const PLUGIN_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_NAME_BYTES: usize = 256;
@@ -196,9 +198,11 @@ impl PluginResponse {
 }
 
 pub trait PluginTransport {
+    #[allow(clippy::too_many_arguments)]
     fn invoke(
         &mut self,
         policy: &CapabilityPolicy,
+        ownership: &dyn ResourceOwnershipPolicy,
         agent_id: AgentId,
         task_id: Option<TaskId>,
         now_ms: u128,
@@ -223,6 +227,23 @@ pub fn authorize_manifest(
                 &capability.resource,
                 now_ms,
             )
+            .map_err(|error| PluginError::CapabilityDenied(error.to_string()))?;
+    }
+    Ok(())
+}
+
+pub fn authorize_manifest_with_ownership(
+    policy: &CapabilityPolicy,
+    ownership: &dyn ResourceOwnershipPolicy,
+    agent_id: AgentId,
+    task_id: Option<TaskId>,
+    now_ms: u128,
+    manifest: &PluginManifest,
+) -> Result<(), PluginError> {
+    authorize_manifest(policy, agent_id, task_id, now_ms, manifest)?;
+    for capability in &manifest.capabilities {
+        ownership
+            .authorize(agent_id, &capability.resource, OwnershipAccess::Write)
             .map_err(|error| PluginError::CapabilityDenied(error.to_string()))?;
     }
     Ok(())

@@ -740,7 +740,7 @@ impl EventStore for InMemoryEventStore {
 
         let mut state = RuntimeState::new(run_id);
         for stored in &events {
-            state.apply(&stored.event)?;
+            state.apply_event(&stored.event)?;
         }
         state.events_applied = events.len() as u64;
         Ok(state)
@@ -876,7 +876,7 @@ fn validate_snapshot(events: &[StoredEvent], snapshot: &RuntimeSnapshot) -> Resu
     }
     let mut expected_state = RuntimeState::new(snapshot.run_id);
     for event in &prefix {
-        expected_state.apply(&event.event)?;
+        expected_state.apply_event(&event.event)?;
     }
     if expected_state != snapshot.state {
         return Err(StoreError::InvalidTransition(format!(
@@ -972,7 +972,10 @@ impl RuntimeState {
         }
     }
 
-    fn apply(&mut self, event: &Event) -> Result<(), StoreError> {
+    /// Validate and apply one event to a recovered runtime projection.
+    /// Runtime mutation APIs call this before appending because stores persist
+    /// opaque domain payloads and cannot validate every cross-domain rule.
+    pub fn apply_event(&mut self, event: &Event) -> Result<(), StoreError> {
         if event.run_id != self.run_id {
             return Err(StoreError::InvalidTransition(format!(
                 "event {} belongs to run {}, expected {}",
@@ -1429,6 +1432,62 @@ mod tests {
                 .events_since(run_id, snapshot.at_sequence)
                 .expect("incremental read should succeed")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshots_preserve_logical_identity_and_effective_model_after_switches() {
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        let original = ModelRef::new("provider-a", "cheap", ModelClass::Cheap);
+        let promoted = ModelRef::new("provider-b", "strong", ModelClass::Strong);
+        let demoted = ModelRef::new("provider-c", "local", ModelClass::Local);
+        let events = [
+            Event::new(run_id, EventKind::RunCreated { run_id }),
+            Event::new(
+                run_id,
+                EventKind::AgentCreated {
+                    agent: AgentIdentity {
+                        id: agent_id,
+                        name: "switchable".to_owned(),
+                        mission: "snapshot identity".to_owned(),
+                        model: original.clone(),
+                    },
+                },
+            ),
+            Event::new(
+                run_id,
+                EventKind::ModelRequested {
+                    agent_id,
+                    model: promoted,
+                },
+            ),
+            Event::new(
+                run_id,
+                EventKind::ModelRequested {
+                    agent_id,
+                    model: demoted.clone(),
+                },
+            ),
+        ];
+        let mut store = InMemoryEventStore::new();
+        store
+            .append_batch(&events)
+            .expect("switch events should append");
+        let snapshot = store.snapshot(run_id).expect("snapshot should exist");
+        let encoded =
+            sqlite::encode_snapshot_state(&snapshot.state).expect("snapshot should encode");
+        let decoded = sqlite::decode_snapshot_state(&encoded).expect("snapshot should decode");
+        let agent = decoded.agents.get(&agent_id).expect("agent should recover");
+        assert_eq!(agent.identity.id, agent_id);
+        assert_eq!(agent.identity.model, original);
+        assert_eq!(agent.model, demoted);
+        store
+            .save_snapshot(&snapshot)
+            .expect("snapshot should save");
+        assert_eq!(
+            store.load_snapshot(run_id, None).unwrap().unwrap().state,
+            decoded
         );
     }
 

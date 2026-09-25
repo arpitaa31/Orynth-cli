@@ -21,6 +21,123 @@ pub enum CapabilityDomain {
     ExternalServices,
 }
 
+/// The access mode checked against scheduler-owned resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnershipAccess {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipError {
+    Invalid(&'static str),
+    Unowned {
+        agent_id: AgentId,
+        resource: String,
+    },
+    Conflict {
+        agent_id: AgentId,
+        resource: String,
+        owner: AgentId,
+    },
+}
+
+impl fmt::Display for OwnershipError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(formatter, "invalid ownership request: {message}"),
+            Self::Unowned { agent_id, resource } => {
+                write!(
+                    formatter,
+                    "agent {agent_id} does not own writable resource {resource:?}"
+                )
+            }
+            Self::Conflict {
+                agent_id,
+                resource,
+                owner,
+            } => write!(
+                formatter,
+                "agent {agent_id} cannot write resource {resource:?}; overlapping owner is {owner}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OwnershipError {}
+
+/// Authoritative ownership checks are injected by the scheduler/runtime.
+/// Capability authorization and ownership authorization are deliberately
+/// separate: a lease grants a kind of effect, while a claim grants exclusive
+/// write authority over a concrete resource identity.
+pub trait ResourceOwnershipPolicy {
+    fn authorize(
+        &self,
+        agent_id: AgentId,
+        resource: &str,
+        access: OwnershipAccess,
+    ) -> Result<(), OwnershipError>;
+}
+
+/// Explicit adapter for single-owner hosts and isolated unit tests. Multi-agent
+/// runtime paths must pass the scheduler-backed implementation instead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllowAllOwnership;
+
+impl ResourceOwnershipPolicy for AllowAllOwnership {
+    fn authorize(
+        &self,
+        _agent_id: AgentId,
+        _resource: &str,
+        _access: OwnershipAccess,
+    ) -> Result<(), OwnershipError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExclusiveOwnershipPolicy {
+    owner: AgentId,
+    root: String,
+}
+
+impl ExclusiveOwnershipPolicy {
+    pub fn new(owner: AgentId, root: impl Into<String>) -> Result<Self, OwnershipError> {
+        let root = canonical_resource(&root.into()).ok_or(OwnershipError::Invalid(
+            "ownership root must be a canonical resource",
+        ))?;
+        Ok(Self { owner, root })
+    }
+}
+
+impl ResourceOwnershipPolicy for ExclusiveOwnershipPolicy {
+    fn authorize(
+        &self,
+        agent_id: AgentId,
+        resource: &str,
+        access: OwnershipAccess,
+    ) -> Result<(), OwnershipError> {
+        if access == OwnershipAccess::Read {
+            return Ok(());
+        }
+        if agent_id != self.owner {
+            return Err(OwnershipError::Conflict {
+                agent_id,
+                resource: resource.to_owned(),
+                owner: self.owner,
+            });
+        }
+        if resource_matches(&self.root, resource) {
+            Ok(())
+        } else {
+            Err(OwnershipError::Unowned {
+                agent_id,
+                resource: resource.to_owned(),
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityLease {
     pub agent_id: AgentId,
@@ -163,7 +280,8 @@ impl CapabilityPolicy {
             if lease.agent_id != agent_id
                 || lease.domain != domain
                 || !(lease.task_id.is_none() || lease.task_id == task_id)
-                || !resource_matches(&lease.resource, resource)
+                || !(domain == CapabilityDomain::Filesystem && lease.resource == "."
+                    || resource_matches(&lease.resource, resource))
             {
                 continue;
             }
@@ -591,13 +709,64 @@ impl Reader<'_> {
     }
 }
 
-fn resource_matches(granted: &str, requested: &str) -> bool {
-    granted == requested
-        || (requested.starts_with(granted)
+/// Match a capability subtree after deterministic lexical normalization.
+/// Filesystem effect adapters must still validate the final object and reject
+/// symlinks/reparse points; this helper is not a substitute for that boundary.
+pub fn resource_matches(granted: &str, requested: &str) -> bool {
+    let Some(granted) = canonical_resource(granted) else {
+        return false;
+    };
+    let Some(requested) = canonical_resource(requested) else {
+        return false;
+    };
+    granted == "."
+        || granted == "/"
+        || granted == requested
+        || (requested.starts_with(&granted)
             && requested
                 .as_bytes()
                 .get(granted.len())
-                .is_some_and(|separator| *separator == b'/' || *separator == b'\\'))
+                .is_some_and(|separator| *separator == b'/'))
+}
+
+/// Return true when two normalized resource identities overlap. This is used
+/// for claims: a claim on a parent resource conflicts with a claim on any
+/// descendant, even when the requested effect targets the parent.
+pub fn resources_overlap(left: &str, right: &str) -> bool {
+    resource_matches(left, right) || resource_matches(right, left)
+}
+
+/// Return the canonical identity used by both capability and ownership
+/// authorization. Invalid traversal that escapes a relative root is rejected
+/// instead of being silently converted into a different resource.
+pub fn canonical_resource(resource: &str) -> Option<String> {
+    if resource.trim().is_empty() || resource.contains('\0') {
+        return None;
+    }
+    let resource = if cfg!(windows) {
+        resource.to_ascii_lowercase()
+    } else {
+        resource.to_owned()
+    };
+    let absolute = resource.starts_with('/') || resource.starts_with('\\');
+    let mut components = Vec::new();
+    for component in resource.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            value => components.push(value),
+        }
+    }
+    let mut normalized = components.join("/");
+    if absolute {
+        normalized.insert(0, '/');
+    }
+    if normalized.is_empty() {
+        normalized.push(if absolute { '/' } else { '.' });
+    }
+    Some(normalized)
 }
 
 #[cfg(test)]
@@ -667,6 +836,64 @@ mod tests {
                 10
             ),
             Err(CapabilityError::Expired { .. })
+        ));
+    }
+
+    #[test]
+    fn resource_authorization_normalizes_traversal_and_boundaries() {
+        let agent_id = AgentId::from_u64(70);
+        let mut policy = CapabilityPolicy::new();
+        policy
+            .grant(CapabilityLease {
+                agent_id,
+                task_id: None,
+                domain: CapabilityDomain::Filesystem,
+                resource: "workspace/allowed".to_owned(),
+                expires_at_ms: u128::MAX,
+            })
+            .unwrap();
+        assert!(
+            policy
+                .authorize(
+                    agent_id,
+                    None,
+                    CapabilityDomain::Filesystem,
+                    "workspace/allowed/./nested.txt",
+                    1,
+                )
+                .is_ok()
+        );
+        #[cfg(windows)]
+        assert!(
+            policy
+                .authorize(
+                    agent_id,
+                    None,
+                    CapabilityDomain::Filesystem,
+                    "WORKSPACE\\ALLOWED\\FILE.TXT",
+                    1,
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            policy.authorize(
+                agent_id,
+                None,
+                CapabilityDomain::Filesystem,
+                "workspace/allowed/../private.txt",
+                1,
+            ),
+            Err(CapabilityError::Missing { .. })
+        ));
+        assert!(matches!(
+            policy.authorize(
+                agent_id,
+                None,
+                CapabilityDomain::Filesystem,
+                "workspace/allowed-sibling/file.txt",
+                1,
+            ),
+            Err(CapabilityError::Missing { .. })
         ));
     }
 

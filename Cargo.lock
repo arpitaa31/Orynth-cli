@@ -669,6 +669,9 @@ dependencies = [
 [[package]]
 name = "orynth-kernel"
 version = "0.1.0"
+dependencies = [
+ "getrandom",
+]
 
 [[package]]
 name = "orynth-plugin-api"
@@ -775,6 +778,7 @@ name = "orynth-scheduler"
 version = "0.1.0"
 dependencies = [
  "orynth-kernel",
+ "orynth-security",
 ]
 
 [[package]]
