@@ -15,10 +15,14 @@ use orynth_security::CapabilityTransition;
 use orynth_tool_runtime::{ToolState, ToolTransition};
 
 mod fullscreen;
+mod presentation;
+mod workspace;
 
 pub use fullscreen::{
-    RunSummary, TuiDataSource, TuiSnapshot, render_snapshot_for_terminal, run_fullscreen,
+    RunSummary, TuiDataSource, TuiPresentation, TuiSnapshot, render_snapshot_for_terminal,
+    run_fullscreen,
 };
+pub use workspace::{render_workspace_for_terminal, run_workspace};
 
 const MAX_RECENT_EVENTS: usize = 8;
 const MAX_EVENT_DETAIL_CHARS: usize = 512;

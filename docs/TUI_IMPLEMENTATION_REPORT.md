@@ -1,140 +1,199 @@
 # Orynth TUI Implementation Report
 
+## Phase F.3 chat-first Workspace: in progress
+
+The primary CLI entry now opens a Workspace shell over the same authoritative
+`TuiDataSource` used by the Phase F.2 debugger. A 75/25 wide layout gives the
+Coordinator pane priority. The right side shows worker names, roles, status,
+health, and effective models. Worker views expose Work, read-only
+Conversation, agent-visible Context, Tools, and Access. Runtime conflicts open
+a human-readable overlay. Ctrl+K shows implemented navigation commands, and
+`/debug` switches to the preserved Advanced Debugger.
+
+The Workspace currently narrates selected structured runtime events. It does
+not yet persist user/Coordinator turns or stream a provider response.
+Natural-language input is rejected transparently offline. This phase is not
+complete; manual visual passes, full interaction coverage, and fresh
+Workspace-specific memory measurements remain.
+
+## Phase F.2 redesign
+
+The second UX pass turns the F.1 debugger into one connected control room.
+The header now separates product identity, human run name, status, and
+runtime counters from technical identity. Navigation reads Overview, Team,
+Activity, Knowledge, Messages, Tools, Access, Conflicts, and Runs. Overview
+is composed as a single showcase: AI Team and Needs Attention share the main
+work area, with Recent Activity below; normal-width terminals stack the same
+three sections in the same reading order.
+
+The reusable event presentation model now carries severity, actor, related
+entities, sequence, and occurrence metadata in addition to its deterministic
+title, summary, explanation, and technical kind. Activity rows use that model
+for readable titles and restrained severity color. Optional human run names
+are kept separate from authoritative `RunId` values.
+
+The demo publishes its authentication schema as shared project knowledge so
+the default manager view has a meaningful Knowledge screen; private-context
+visibility rules remain unchanged for real runs. Common namespaces are also
+given readable names in the human view, with their raw namespace retained in
+the inspector.
+
 ## Implemented Views
 
-The full-screen client has dashboard, agent tree, selected agent, bounded
-event timeline/details, context, typed IPC/messages, tools/transactions,
-permissions/ownership/budgets, assumptions/conflicts, persisted runs, and
-help views. The header reports the real run identity, lifecycle state, total
-events applied, agent count, and warning count. Empty and small-terminal
-states are explicit.
+The Phase F.2 control room uses Ratatui bordered panels, tables, lists, tabs,
+wrapping, selection highlights, and centered overlays. The screens are
+Overview, Team, Activity, Knowledge, Messages, Tools, Access,
+Conflicts, and Runs. Primary views use plain language; technical values are
+kept in detail overlays.
 
 ## Keyboard Controls
 
-`1`-`9` select numbered views; `Tab`/`Shift-Tab` cycles views; arrows and
-`j`/`k` move; `Home`/`End` jump; `Enter` selects a run or opens event details;
-`/` starts filtering; `r` refreshes; `R` opens runs; `?` opens help; `Esc`
-closes help/details; `q` and `Ctrl-C` exit. `[` loads an older event page and
-`]` returns to the newest page.
+`↑`/`↓` and `j`/`k` navigate; `Enter` opens the selected item; `Tab` and
+`Shift-Tab` change screens; `1`-`9` jump; `/` filters; `r` refreshes; `[`/`]`
+page older/newest Activity; `a` toggles Conflicts/Assumptions; `s` selects a
+run; `?` opens contextual help; `Esc` closes overlays; `q` and `Ctrl-C` exit.
+The footer is dynamic and does not advertise unavailable actions.
 
 ## Runtime Integration
 
-`orynth tui` passes a `TuiDataSource` into `orynth-tui`. The SQLite source
-lists persisted run IDs, recovers the selected event stream through
-`RuntimeService`, and refreshes from the event store. The TUI itself owns no
-runtime authority and has no provider, tool-effect, permission, or event
-append path.
+`orynth tui` supplies a `TuiDataSource` to `orynth-tui`. SQLite recovery uses
+the authoritative event store and `RuntimeService`; the TUI owns only
+selection, filtering, pagination, and presentation state. It cannot call a
+provider, append an event, execute a tool, or change runtime authority.
 
 ## Demo Mode
 
-`orynth tui --demo` builds a deterministic in-memory runtime with real
-events and projections: one manager, three specialists, model selection and
-switching, context visibility, IPC, assumptions and a conflict notification,
-health, budgets, ownership, a capability lease, cache telemetry, and a
-proposed/approved/verified read-only tool transaction. The optional
-`ORYNTH_TUI_DEMO_AGENTS=10` scenario adds bounded specialists for responsiveness
-measurement without inventing a separate UI data model.
+`orynth tui --demo` presents **Authentication Migration Demo** with a compact
+first-run overlay. The description explains the real scenario: MANAGER
+coordinates authentication/database work, AUTH-01 handles authentication,
+DB-02 checks migration constraints, and SEC-03 reviews security. AUTH-01 and
+DB-02 have recorded conflicting `users.id` assumptions. The runtime also
+contains real model selection/switching, knowledge, messages, health, budgets,
+ownership, a capability lease, cache telemetry, and a verified read-only tool
+transaction. `ORYNTH_TUI_DEMO_AGENTS=10` is the bounded stress scenario.
 
 ## Interactive Actions
 
-Supported actions are view navigation, run selection, refresh, filtering,
-event detail inspection, and event page navigation. These are client-side
-read-only operations.
+All advertised actions do something: navigation changes screen or selection;
+Enter opens an inspector for agents, events, messages, knowledge blocks,
+tools, permissions, conflicts, assumptions, and runs; `s` selects a run; `r`
+refreshes; paging changes the visible event window; and help/Esc/q behave as
+shown. Run selection remains an explicit read-only source operation.
 
 ## Read-only Areas
 
 Pause/resume/cancel, model switching, capability grants, ownership changes,
-tool approval/execution, replay execution, fork execution, live breakpoint
-actions, and provider calls are intentionally unavailable. Existing replay,
-fork, diff, and debug CLI commands remain separate, explicit workflows.
+tool approval/execution, provider calls, live breakpoint actions, replay
+execution, and fork execution are not exposed. The existing CLI commands
+remain explicit workflows.
 
 ## Event Paging
 
-The selected recovery retains the newest bounded event window (512 records).
-The event view requests older pages from SQLite on demand, each bounded to
-512 records, and can return to the newest window. Rendering caps visible rows
-and detail text; it never formats the entire history per frame. Demo and
-non-paging sources retain the bounded snapshot behavior.
+Activity uses a newest 512-event display window and requests older bounded
+pages from SQLite only on demand. `]` returns to the newest page. Each frame
+renders only bounded visible rows and the selected detail; large raw payloads
+are truncated in the inspector.
 
 ## Context Inspection
 
-Context inspection projects through the selected logical agent or runtime
-principal with the context graph's existing visibility and trust rules. The
-TUI requests bounded namespace/block and token limits and displays freshness,
-active/stale state, and pressure without changing the graph.
+Knowledge projects through the selected logical agent or runtime principal
+using the context graph's existing visibility, trust, block, and token rules.
+Lifecycle labels are translated to Active, Outdated, Archived, Invalid, and
+Replaced, with technical lifecycle values available in details.
 
 ## IPC Inspection
 
-Messages are decoded from the recovered runtime projection and displayed with
-sender, receiver, message kind, subject/detail, and provenance. The TUI does
-not enqueue, acknowledge, or send messages.
+Messages are presented as routes such as `MANAGER → AUTH-01`, with QUESTION,
+CONFLICT WARNING, ANSWER, or other readable message kinds, title, body, and
+why it matters. Raw typed payload, message ID, provenance, and trust remain in
+the detail overlay.
 
 ## Tool Inspection
 
-Tool records are recovered from durable transitions and displayed with
-transaction ID, tool name, state, agent, and bounded detail. Proposal,
-approval, preflight, verification, compensation, and failure states are
-inspection data only; no external effect is reachable from the TUI.
+Tool actions show the human action name, responsible agent, resource, result,
+permission, ownership, risk boundary, and undo availability. Transaction ID,
+tool ID, effect state, policy information, repair, and preview remain
+technical details. No tool effect is reachable from the TUI.
 
 ## Permission/Ownership Inspection
 
-The policy view reports recovered capability leases, agent/task scope,
-resource ownership, budgets, usage, health, and model assignment. It keeps
-logical `AgentId` distinct from the current effective model and does not
-grant or revoke authority.
+Permissions explains “Can access” and “Owns” per human-readable agent. Domain
+labels use file access, process execution, network access, and similar terms;
+capability leases, task scopes, canonical resources, and expiry remain in
+details. Network is described as blocked unless a recorded scoped lease says
+otherwise.
 
 ## Error Handling
 
-Source errors remain in the status line and do not fabricate replacement
-runtime data. Unknown runs, empty databases, missing projections, malformed
-selection, narrow terminals, UTF-8 boundaries, and unavailable older pages
-have bounded user-visible messages. Drawing and input failures return errors
-after terminal restoration.
+Source failures remain in the status line without fabricated data. Empty runs,
+unknown runs, missing projections, narrow terminals, unavailable older pages,
+UTF-8 truncation, and out-of-range selections produce bounded messages.
+Errors from input or drawing unwind through terminal cleanup.
 
 ## Terminal Cleanup
 
-`TerminalGuard` enters raw mode, alternate-screen mode, and hidden-cursor
-mode. It restores all three explicitly on normal exit and from `Drop`, so
-errors and panic unwinding do not leave the caller's terminal in raw mode.
+The terminal guard enters raw mode, alternate-screen mode, and hidden-cursor
+mode. It restores all three on normal exit and through `Drop`, including
+input/draw error paths and panic unwinding.
 
 ## Tests
 
-Focused `orynth-tui` tests cover bounded rendering, real run identity, empty
-collections, small terminals, UTF-8-safe truncation, projection rendering,
-and breakpoint scanning. `orynth` tests cover CLI parsing, deterministic
-demo recovery, persisted run listing/selection, SQLite inspection, replay,
-fork, diff, and read-only debug behavior. The workspace all-features suite
-passed in the Phase F validation run.
+Focused tests cover Ratatui rendering, small terminals, real run identity,
+empty navigation, agent/knowledge/permission selection, detail scrolling,
+human-detail targets for events/messages/knowledge/tools/conflicts/runs,
+help/Esc/Tab/q controls, projection rendering, and semantic breakpoint
+scanning. Operator tests cover demo recovery, persisted run selection and
+event paging, SQLite inspection, replay, fork, diff, and the read-only debug
+session. Full validation is recorded in the final handoff.
+
+## F.2 validation
+
+The following gates pass in the current worktree:
+
+- `cargo fmt --all -- --check`
+- `cargo check --workspace`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test -p orynth-tui`
+- `cargo test -p orynth`
+- `cargo build --release --workspace`
+- release smoke launch with `.\target\release\orynth.exe tui --demo`, including
+  first-run dismissal and clean `q` exit/terminal restoration.
+
+The exact `cargo test --workspace --all-features` command passes the application,
+agent, assumptions, cache, CLI, context, and event-store test groups observed
+before the host terminated the remaining test process with Windows status
+`0xC000013A`. It is therefore reported as environment-incomplete rather than
+as a full-suite pass; the focused TUI and operator suites pass independently.
 
 ## Memory Measurements
 
-Release binary `target/release/orynth.exe`, Windows working set sampled after
-the first stable frame with `Get-CimInstance Win32_Process`:
+Release Windows working-set samples after the UX overhaul. These are stable
+working-set readings taken about 1.2 seconds after launch on the current
+development host; they are not a cross-platform memory guarantee.
 
 | Scenario | Working set |
 |---|---:|
-| Empty SQLite database | 6,920 KiB |
-| Offline demo, 4 agents | 6,944 KiB |
-| Offline demo, 10 agents | 7,064 KiB |
+| Empty SQLite database | 7,676 KiB |
+| Offline demo, 4 agents | 7,624 KiB |
+| Offline demo, 10 agents | 7,812 KiB |
 
-The values are process working-set observations, not a cross-platform RSS
-claim. The ten-agent scenario is generated by the same real event-backed demo
-builder. The initial frame appeared in the first PTY capture; the current
-manual terminal harness has one-second polling resolution, so no sub-second
-startup number is claimed.
+The previous Phase F baseline was 6,920 KiB empty, 6,944 KiB for four demo
+agents, and 7,064 KiB for ten demo agents. The post-polish sample is within
+the same bounded range; the Ratatui presentation layer adds no unbounded
+growth in the ten-agent stress scenario.
 
 ## Known Limitations
 
-The SQLite source loads the selected stream for recovery before retaining the
-bounded display window; the older-page path is bounded but not a streaming
-database cursor. Live subscriptions/refresh are manual (`r`), and no remote
-provider or plugin process is launched by the demo. Terminal color and
-Unicode glyph width are conservative rather than locale-perfect.
+SQLite recovery still loads the selected stream before display paging; older
+pages are bounded but are not yet a streaming database cursor. Live refresh is
+manual, terminal glyph width is conservative, and persisted runs without a
+domain title are shown as numbered sessions until selected.
+The current run status is intentionally a compact state badge; elapsed time
+is not shown when the runtime does not provide a trustworthy duration.
 
 ## Deferred Features
 
 Safe live runtime controls, provider/plugin process inspection, artifact
-browser and retention controls, automatic subscriptions, semantic breakpoint
-actions, true cursor-based history streaming, replay/fork UI workflows, and
-cross-platform hosted memory measurements remain deferred. These are not
-represented as implemented capabilities.
+browser and retention controls, live subscriptions, semantic breakpoint
+actions, true cursor-based event streaming, replay/fork UI workflows, and
+hosted cross-platform memory measurements remain deferred.

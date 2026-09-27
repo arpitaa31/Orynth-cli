@@ -1,5 +1,19 @@
 # Current Plan
 
+## Phase F.3: chat-first Workspace redesign - in progress
+
+Implemented an initial Workspace shell as the default `orynth` interface,
+with a 75/25 Coordinator and AI Team layout, responsive narrow mode,
+worker Work/Conversation/Context/Tools/Access inspection, issue overlay,
+focus-aware input, local command palette and slash commands, and a transition
+to the preserved Advanced Debugger. Both modes use the same recovered run.
+
+Next: add an authoritative durable Coordinator conversation contract and
+runtime-backed input, improve demo conversation and worker activity, finish
+responsive/Unicode/scroll behavior, run two visual passes and full interaction
+walkthrough, measure Workspace RSS and first render, and complete required
+validation. Do not add a real provider or start Deep Audit #2.
+
 ## Phase 1: Foundation vertical slice - complete
 
 Implemented and tested provider-independent IDs and lifecycle values, an in-memory immutable execution trace, a streaming provider contract, usage and cancellation, a deterministic mock provider, a basic agent loop, and readable configuration parsing.
@@ -265,20 +279,21 @@ security, resource-boundary, and cross-platform evidence. Full cargo-fuzz is
 not installed on the current host, and Windows Application Control blocked
 some newly generated executables; these remain explicitly environment-blocked.
 
-## Phase F: full-screen TUI/runtime debugger - complete
+## Phase F.2: TUI information architecture and control-room redesign - complete
 
-Implemented the projection-backed full-screen runtime debugger in
-`orynth-tui` and the `orynth tui` command. The client provides dashboard,
-agent, event/detail, context, IPC, tools, policy, assumptions, runs, and help
-views; keyboard navigation/filtering/refresh; explicit empty/error/small
-terminal states; SQLite run selection; bounded older event pages; and RAII
-terminal restoration. The deterministic offline demo generates real runtime
-events for agents, models, context, IPC, conflicts, health, budgets,
-ownership, capability, cache, and tool transitions.
+The runtime debugger is now a coherent, human-oriented Ratatui control room.
+It provides Overview, Team, Activity, Knowledge, Messages, Tools, Access,
+Conflicts, Runs, a two-tier header, optional human run names, a reusable
+severity-aware event presentation model, contextual help, responsive layouts,
+reusable detail overlays, readable event/message/tool/access/conflict/
+knowledge presentations, and a compact first-run demo story. All advertised
+Enter actions and global controls are covered by focused tests, and the TUI
+remains read-only over authoritative projections.
 
 Focused TUI/runtime tests, workspace check, warnings-denied all-targets and
-all-features Clippy, workspace all-features tests, formatter check, and
-release build passed. Release working-set samples and known limits are in
-`docs/TUI_IMPLEMENTATION_REPORT.md` and `docs/BENCHMARK_RESULTS.md`.
+all-features Clippy, formatter check, and release build pass. The exact
+workspace all-features test command was environment-incomplete after Windows
+terminated the remaining test process with status `0xC000013A`. Evidence and
+known limits are in `docs/TUI_IMPLEMENTATION_REPORT.md`.
 
-Next phase: Deep Audit #2. It has not started.
+Deep Audit #2 has not started.

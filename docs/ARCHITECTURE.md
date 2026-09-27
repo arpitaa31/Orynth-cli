@@ -19,7 +19,7 @@ The dependency direction is: applications and UI -> runtime services -> domain c
 - `orynth-runtime`: runtime-service composition that hydrates ordinary, context, scheduler, failure-memory, and compact manager projections—including bounded context/cache/artifact/failure observability—from one authoritative event stream.
 - `orynth-terminal-tools`: bounded terminal planning plus controlled rooted filesystem effects and injected typed process fixtures built on the tool contracts.
 - `orynth-cli` and `orynth-shell`: explicit terminal request parsing, host-aware plan rendering, and confirmed rooted-filesystem execution through the tool runtime; they do not execute ambient shell commands.
-- `orynth-tui`: projection-backed, read-only full-screen runtime inspection over `RecoveredRun`; it owns only view state, selection, filtering, and bounded event paging, and does not invoke providers or mutate state.
+- `orynth-tui`: chat-first Workspace and Advanced Debugger over the same `RecoveredRun` source; both own presentation state only and do not invoke providers or mutate runtime state. Durable Coordinator conversation is not yet implemented.
 - `orynth`: operator command boundary for recovering selected SQLite runs or constructing the deterministic offline demo and passing snapshots to the TUI.
 - Later: policy-driven specialist selection, context-wide trust propagation, broader platform enforcement, interactive replay/fork/comparison controls, semantic breakpoints, and terminal services.
 - Apps compose contracts; adapters cannot replace kernel authority.

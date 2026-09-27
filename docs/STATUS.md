@@ -1,10 +1,22 @@
 # Status
 
 Project: Orynth
-Stage: Phase F - full-screen TUI/runtime debugger complete
+Stage: Phase F.3 - chat-first Workspace redesign in progress
 Blueprint: SUPPLIED IN CURRENT RESEARCH BRIEF
-Implementation: Phase 2 runtime core hardened; Phase 3 context slice complete; Phase 4A/4B plus budget/health projections complete; Phase 5 security/tools slice complete; Phase 6 plugin/protocol contracts active; Phase 7 terminal planning and rooted execution active; Phase 8 inspector slice complete; Phase D provider/persistence hardening complete; Phase E benchmark and hardening complete; Phase F full-screen TUI/runtime debugger complete
-Current Phase: Phase F - full-screen TUI/runtime debugger complete; next Deep Audit #2
+Implementation: Phase 2 runtime core hardened; Phase 3 context slice complete; Phase 4A/4B plus budget/health projections complete; Phase 5 security/tools slice complete; Phase 6 plugin/protocol contracts active; Phase 7 terminal planning and rooted execution active; Phase 8 inspector slice complete; Phase D provider/persistence hardening complete; Phase E benchmark and hardening complete; Phase F full-screen TUI/runtime debugger complete; Phase F.2 TUI information architecture and control-room redesign complete
+Current Phase: Phase F.3 - chat-first Workspace redesign in progress; Deep Audit #2 has not started
+
+## Phase F.3: chat-first Workspace redesign - in progress
+
+The normal CLI entry and offline demo now open a preliminary conversation-first
+Workspace. It shares the debugger's `TuiDataSource` and recovered runtime
+state. Coordinator activity, an AI Team sidebar, worker inspection tabs, issue
+overlay, local slash commands, command palette, and in-app debugger transition
+are implemented. Natural-language input is explicitly unsent in offline mode;
+durable conversation events, provider streaming integration points, further
+visual polish, manual walkthrough, tests, release binary validation, and
+Workspace RSS measurements remain open. No real provider or Deep Audit #2
+has been started.
 
 Phase A audit remediation: ORY-AUDIT-001 through ORY-AUDIT-005 have been
 addressed in the current worktree with focused regression coverage. The
@@ -332,23 +344,27 @@ cargo-fuzz, and hosted cross-platform execution remain unmeasured.
 The final adversarial pass found and fixed NEW-AUDIT-D-001, an opaque fork
 fallback that could have retained a legacy payload under a current tag.
 
-## Phase F: full-screen TUI/runtime debugger - complete
+## Phase F.2: TUI information architecture and control-room redesign - complete
 
-`orynth tui --demo` now launches the deterministic offline control-room demo;
-`orynth tui --db <path> [--run <id>]` inspects persisted SQLite runs. Views
-cover dashboard/agent tree, events and bounded older-page navigation, context,
-IPC, tools, permissions/ownership/budgets, assumptions/conflicts, persisted
-runs, and help. The client uses `RecoveredRun` and visibility-scoped context
-projection data, has explicit empty/error/small-terminal states, and restores
-terminal state through an RAII guard. It exposes no live mutation controls.
+The projection-backed debugger now reads as a human-oriented Ratatui control
+  room. `orynth tui --demo` launches a compact Authentication Migration story;
+`orynth tui --db <path> [--run <id>]` inspects persisted SQLite runs. Overview,
+  Team, Activity, Knowledge, Messages, Tools, Access, Conflicts, and Runs use
+  a two-tier header, connected responsive panels, contextual help, reusable
+  detail overlays, optional human run names, and a severity-aware plain-English
+  presentation layer. Technical IDs,
+payloads, provenance, and policy values remain available in inspectors. The
+client uses `RecoveredRun` and visibility-scoped context projection data,
+restores terminal state through an RAII guard, and exposes no live mutation
+controls.
 
-Focused and workspace all-features tests, formatting, workspace check,
-warnings-denied Clippy, and release build passed. Release working-set samples
-were 6,920 KiB empty, 6,944 KiB for the four-agent demo, and 7,064 KiB for
-the ten-agent demo. Details, commands, and limitations are in
+Focused TUI/operator tests, formatting, workspace check, warnings-denied
+Clippy, and release build pass. The exact workspace all-features test command
+was environment-incomplete after Windows terminated the remaining test
+process with status `0xC000013A`; details, commands, and limitations are in
 `docs/TUI_IMPLEMENTATION_REPORT.md`.
 
-The next planned activity is Deep Audit #2; it has not started in Phase F.
+Deep Audit #2 has not started.
 
 ## Phase E: benchmark and hardening - complete
 

@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 crossterm = "0.28"
+ratatui = "0.29"
 orynth-assumptions = { path = "../assumptions" }
 orynth-context = { path = "../context" }
 orynth-failure-memory = { path = "../failure-memory" }
 orynth-kernel = { path = "../kernel" }
+orynth-ipc = { path = "../ipc" }
 orynth-event-store = { path = "../event-store" }
 orynth-scheduler = { path = "../scheduler" }
 orynth-security = { path = "../security" }

@@ -26,12 +26,12 @@ use orynth_security::{CapabilityDomain, CapabilityLease};
 use orynth_specialist::SpecialistProfile;
 use orynth_tool_runtime::{ToolProvenance, ToolState, ToolTransition};
 use orynth_tui::{
-    InspectorAction, InspectorPane, InspectorState, RunSummary, TuiDataSource, TuiSnapshot,
-    inspector_pane_item_count, render_inspector_pane, render_runtime_inspector, run_fullscreen,
-    scan_semantic_breakpoints,
+    InspectorAction, InspectorPane, InspectorState, RunSummary, TuiDataSource, TuiPresentation,
+    TuiSnapshot, inspector_pane_item_count, render_inspector_pane, render_runtime_inspector,
+    run_fullscreen, run_workspace, scan_semantic_breakpoints,
 };
 
-const HELP: &str = "Usage:\n  orynth tui [--db <path>] [--run <run-id>]\n  orynth tui --demo\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth debug --db <path> --run <run-id>\n  orynth help";
+const HELP: &str = "Usage:\n  orynth [--db <path>] [--run <run-id>]\n  orynth --demo\n  orynth debug [--db <path>] [--run <run-id>] [--demo]\n  orynth debug-session --db <path> --run <run-id>\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth help";
 const MAX_TUI_EVENT_WINDOW: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +62,11 @@ pub enum Command {
         database: PathBuf,
         run: u64,
     },
+    AdvancedDebugger {
+        database: PathBuf,
+        run: Option<u64>,
+        demo: bool,
+    },
     Tui {
         database: PathBuf,
         run: Option<u64>,
@@ -74,18 +79,30 @@ where
     I: IntoIterator,
     I::Item: Into<String>,
 {
-    let mut args = args.into_iter().map(Into::into);
-    let Some(command) = args.next() else {
-        return Ok(Command::Help);
-    };
+    let mut args = args
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<String>>()
+        .into_iter();
+    let command = args.next().unwrap_or_else(|| "tui".to_owned());
     if command == "help" || command == "--help" || command == "-h" {
         return Ok(Command::Help);
     }
+    let command = if command.starts_with('-') {
+        args = std::iter::once(command)
+            .chain(args)
+            .collect::<Vec<_>>()
+            .into_iter();
+        "tui".to_owned()
+    } else {
+        command
+    };
     if command != "inspect"
         && command != "replay"
         && command != "fork"
         && command != "diff"
         && command != "debug"
+        && command != "debug-session"
         && command != "tui"
     {
         return Err(format!("unknown command {command:?}\n\n{HELP}"));
@@ -174,13 +191,20 @@ where
                         .map_err(|_| format!("invalid right run id {value:?}"))?,
                 );
             }
-            "--demo" if command == "tui" => demo = true,
+            "--demo" if command == "tui" || command == "debug" => demo = true,
             other => return Err(format!("unknown {command} argument {other:?}\n\n{HELP}")),
         }
     }
-    if command == "tui" {
+    if command == "tui" || command == "debug" {
         if demo && run.is_some() {
-            return Err("tui --demo cannot be combined with --run".to_owned());
+            return Err("--demo cannot be combined with --run".to_owned());
+        }
+        if command == "debug" {
+            return Ok(Command::AdvancedDebugger {
+                database: database.unwrap_or_else(|| PathBuf::from(".orynth/runtime.db")),
+                run,
+                demo,
+            });
         }
         return Ok(Command::Tui {
             database: database.unwrap_or_else(|| PathBuf::from(".orynth/runtime.db")),
@@ -196,7 +220,7 @@ where
             right: right.ok_or_else(|| format!("diff requires --right\n\n{HELP}"))?,
         });
     }
-    if command == "debug" {
+    if command == "debug-session" {
         return Ok(Command::Debug {
             database,
             run: run.ok_or_else(|| format!("debug requires --run\n\n{HELP}"))?,
@@ -257,12 +281,20 @@ where
             debug_terminal(database, run)?;
             Ok(None)
         }
+        Command::AdvancedDebugger {
+            database,
+            run,
+            demo,
+        } => {
+            run_tui(database, run, demo, true)?;
+            Ok(None)
+        }
         Command::Tui {
             database,
             run,
             demo,
         } => {
-            run_tui(database, run, demo)?;
+            run_tui(database, run, demo, false)?;
             Ok(None)
         }
     }
@@ -330,11 +362,21 @@ impl DbTuiSource {
 
 impl TuiDataSource for DbTuiSource {
     fn snapshot(&mut self) -> Result<TuiSnapshot, String> {
+        if !self.database.exists() && self.selected.is_none() {
+            return Ok(TuiSnapshot {
+                selected: None,
+                runs: Vec::new(),
+                presentation: None,
+            });
+        }
         let store = SqliteEventStore::open(&self.database)
             .map_err(|error| format!("could not open {}: {error}", self.database.display()))?;
         let run_ids = store
             .run_ids()
             .map_err(|error| format!("could not list persisted runs: {error}"))?;
+        if self.selected.is_none() {
+            self.selected = run_ids.last().copied();
+        }
         let mut runs = Vec::with_capacity(run_ids.len());
         for run_id in run_ids {
             let events = store
@@ -352,6 +394,7 @@ impl TuiDataSource for DbTuiSource {
                 .to_owned();
             runs.push(RunSummary {
                 run_id,
+                display_name: None,
                 status,
                 event_count: events.len(),
             });
@@ -379,7 +422,11 @@ impl TuiDataSource for DbTuiSource {
         } else {
             None
         };
-        Ok(TuiSnapshot { selected, runs })
+        Ok(TuiSnapshot {
+            selected,
+            runs,
+            presentation: None,
+        })
     }
 
     fn select_run(&mut self, run_id: RunId) -> Result<(), String> {
@@ -437,16 +484,24 @@ impl TuiDataSource for DemoTuiSource {
     }
 }
 
-fn run_tui(database: PathBuf, run: Option<u64>, demo: bool) -> Result<(), String> {
+fn run_tui(database: PathBuf, run: Option<u64>, demo: bool, advanced: bool) -> Result<(), String> {
     if demo {
         let agent_count = std::env::var("ORYNTH_TUI_DEMO_AGENTS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|count| (1..=64).contains(count))
             .unwrap_or(4);
-        run_fullscreen(DemoTuiSource::new(agent_count)?)
+        if advanced {
+            run_fullscreen(DemoTuiSource::new(agent_count)?)
+        } else {
+            run_workspace(DemoTuiSource::new(agent_count)?)
+        }
     } else {
-        run_fullscreen(DbTuiSource::new(database, run))
+        if advanced {
+            run_fullscreen(DbTuiSource::new(database, run))
+        } else {
+            run_workspace(DbTuiSource::new(database, run))
+        }
     }
 }
 
@@ -650,8 +705,8 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
         .publish(ContextDraft::new(
             "auth.schema",
             ContextKind::Contract,
-            ContextOwner::Agent(auth.id),
-            ContextScope::Private(auth.id),
+            ContextOwner::Runtime,
+            ContextScope::Global,
             "users.id must remain UUID during the migration.",
         ))
         .map_err(|error| format!("demo context failed: {error}"))?;
@@ -757,6 +812,7 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
         selected: Some(recovered),
         runs: vec![RunSummary {
             run_id,
+            display_name: Some("Authentication Migration Demo".to_owned()),
             status: "ACTIVE".to_owned(),
             event_count: service
                 .event_store()
@@ -764,6 +820,11 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
                 .map_err(|error| format!("demo event count failed: {error}"))?
                 .len(),
         }],
+        presentation: Some(TuiPresentation {
+            title: "Authentication Migration Demo".to_owned(),
+            description: "Several AI specialists are coordinating a database/authentication change. AUTH-01 and DB-02 disagree about the users.id type, demonstrating deterministic conflict detection and runtime supervision.".to_owned(),
+            demo: true,
+        }),
     })
 }
 
@@ -1128,6 +1189,30 @@ mod tests {
         );
         assert_eq!(
             parse_args(["debug", "--db", "run.db", "--run", "1"]),
+            Ok(Command::AdvancedDebugger {
+                database: PathBuf::from("run.db"),
+                run: Some(1),
+                demo: false,
+            })
+        );
+        assert_eq!(
+            parse_args(Vec::<String>::new()),
+            Ok(Command::Tui {
+                database: PathBuf::from(".orynth/runtime.db"),
+                run: None,
+                demo: false,
+            })
+        );
+        assert_eq!(
+            parse_args(["--demo"]),
+            Ok(Command::Tui {
+                database: PathBuf::from(".orynth/runtime.db"),
+                run: None,
+                demo: true,
+            })
+        );
+        assert_eq!(
+            parse_args(["debug-session", "--db", "run.db", "--run", "1"]),
             Ok(Command::Debug {
                 database: PathBuf::from("run.db"),
                 run: 1,
@@ -1153,6 +1238,19 @@ mod tests {
         assert_eq!(recovered.messages.len(), 3);
         assert_eq!(recovered.tools.records().len(), 1);
         assert!(recovered.context.block_count() > 0);
+    }
+
+    #[test]
+    fn demo_workspace_shows_coordinator_team_and_issue() {
+        let snapshot = demo_snapshot().expect("demo runtime should recover");
+        let wide = orynth_tui::render_workspace_for_terminal(&snapshot, 120, 34);
+        assert!(wide.contains("COORDINATOR"));
+        assert!(wide.contains("AI TEAM"));
+        assert!(wide.contains("AUTH-01"));
+        assert!(wide.contains("DB-02"));
+        assert!(wide.contains("ATTENTION"));
+        let narrow = orynth_tui::render_workspace_for_terminal(&snapshot, 60, 22);
+        assert!(narrow.contains("COORDINATOR"));
     }
 
     #[test]
