@@ -26,6 +26,7 @@ use ratatui::{
 
 use crate::{
     fullscreen::{TerminalGuard, TuiApp, TuiDataSource, TuiSnapshot},
+    markdown::{render_literal, render_markdown},
     presentation::{
         agent_label, agent_role, agent_status, context_lifecycle, human_event, knowledge_name,
         message_presentation, model_name, tool_name, tool_state_label,
@@ -1135,7 +1136,11 @@ impl Workspace {
                     ConversationSpeaker::Coordinator(_) => "Coordinator",
                 };
                 lines.push(heading(speaker));
-                lines.extend(conversation_content_lines(&turn.content));
+                let content_lines = match turn.speaker {
+                    ConversationSpeaker::User => render_literal(&turn.content),
+                    ConversationSpeaker::Coordinator(_) => render_markdown(&turn.content),
+                };
+                lines.extend(indent_content_lines(content_lines));
                 lines.push(Line::raw(""));
                 continue;
             }
@@ -1152,7 +1157,7 @@ impl Workspace {
         }
         if let Some(text) = &self.live_text {
             lines.push(heading("Coordinator · streaming"));
-            lines.extend(conversation_content_lines(text));
+            lines.extend(indent_content_lines(render_markdown(text)));
             lines.push(Line::raw(""));
         }
         if self.pinned_scroll {
@@ -1261,7 +1266,7 @@ impl Workspace {
                     let view = message_presentation(run, message);
                     lines.push(heading(&view.route));
                     lines.push(Line::raw(format!("{} · {}", view.kind, view.title)));
-                    lines.extend(conversation_content_lines(&view.body));
+                    lines.extend(indent_content_lines(render_markdown(&view.body)));
                     lines.push(Line::raw(""));
                 }
             }
@@ -1834,30 +1839,15 @@ fn heading(value: &str) -> Line<'static> {
     )
 }
 
-fn conversation_content_lines(content: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code = false;
-    for raw in content.lines() {
-        if let Some(language) = raw.trim_start().strip_prefix("```") {
-            let label = if in_code {
-                "  └─".to_owned()
-            } else if language.trim().is_empty() {
-                "  ┌─ code".to_owned()
-            } else {
-                format!("  ┌─ {}", language.trim())
-            };
-            lines.push(Line::styled(label, Style::default().fg(ACCENT).bg(SURFACE)));
-            in_code = !in_code;
-        } else if in_code {
-            lines.push(Line::styled(
-                format!("  │ {raw}"),
-                Style::default().fg(TEXT).bg(SURFACE),
-            ));
-        } else {
-            lines.push(Line::raw(format!("  {raw}")));
-        }
-    }
+fn indent_content_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn is_coordination_event(kind: &EventKind) -> bool {
@@ -2775,7 +2765,9 @@ mod tests {
 
     #[test]
     fn conversation_code_blocks_keep_structure_and_unicode() {
-        let lines = conversation_content_lines("Use this:\n```rust\nlet id = \"🧭\";\n```\nDone.");
+        let lines = indent_content_lines(render_markdown(
+            "Use this:\n```rust\nlet id = \"🧭\";\n```\nDone.",
+        ));
         let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert!(rendered.iter().any(|line| line.contains("┌─ rust")));
         assert!(

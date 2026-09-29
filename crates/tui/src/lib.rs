@@ -15,6 +15,7 @@ use orynth_security::CapabilityTransition;
 use orynth_tool_runtime::{ToolState, ToolTransition};
 
 mod fullscreen;
+mod markdown;
 mod presentation;
 mod theme;
 mod workspace;
