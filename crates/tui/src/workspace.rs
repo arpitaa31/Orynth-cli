@@ -1598,18 +1598,18 @@ impl Workspace {
             );
         frame.render_widget(
             Paragraph::new(content)
-            .wrap(Wrap { trim: false })
-            .scroll((input_scroll(&self.input, self.input_cursor, area.width), 0))
-            .block(
-                Block::default()
-                    .borders(Borders::TOP | Borders::BOTTOM)
-                    .title(title)
-                    .border_style(Style::default().fg(if self.focus == Focus::Input {
-                        BRAND
-                    } else {
-                        MUTED
-                    })),
-            ),
+                .wrap(Wrap { trim: false })
+                .scroll((input_scroll(&self.input, self.input_cursor, area.width), 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP | Borders::BOTTOM)
+                        .title(title)
+                        .border_style(Style::default().fg(if self.focus == Focus::Input {
+                            BRAND
+                        } else {
+                            MUTED
+                        })),
+                ),
             area,
         );
     }
@@ -1932,7 +1932,9 @@ fn input_scroll(value: &str, cursor: usize, width: u16) -> u16 {
         .sum::<usize>()
         .saturating_sub(1);
     let visible = usize::from(input_height(value, width).saturating_sub(2));
-    cursor_line.saturating_sub(visible.saturating_sub(1)).min(u16::MAX as usize) as u16
+    cursor_line
+        .saturating_sub(visible.saturating_sub(1))
+        .min(u16::MAX as usize) as u16
 }
 
 fn model_tier(class: &ModelClass) -> &'static str {
@@ -2616,10 +2618,11 @@ mod tests {
         let mut app = Workspace::new(empty());
         app.paste(&"x".repeat(MAX_INPUT_CHARS + 1));
         assert!(app.input.is_empty());
-        assert!(app
-            .notice
-            .as_deref()
-            .is_some_and(|notice| notice.contains("too large")));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("too large"))
+        );
     }
 
     #[test]
