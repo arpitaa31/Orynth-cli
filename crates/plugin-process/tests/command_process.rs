@@ -60,6 +60,17 @@ fn request(request_id: u64) -> PluginRequest {
     }
 }
 
+#[cfg(not(windows))]
+fn skip_if_process_containment_is_unavailable() -> bool {
+    eprintln!("skipping process launch test: no non-Windows containment adapter");
+    true
+}
+
+#[cfg(windows)]
+const fn skip_if_process_containment_is_unavailable() -> bool {
+    false
+}
+
 fn discovered_candidate(program: &Path) -> (PathBuf, DiscoveredPlugin) {
     let root = std::env::temp_dir().join(format!("orynth-process-activation-{}", PluginId::new()));
     fs::create_dir_all(&root).unwrap();
@@ -81,6 +92,9 @@ fn discovered_candidate(program: &Path) -> (PathBuf, DiscoveredPlugin) {
 
 #[test]
 fn command_invoker_launches_bounded_process_and_round_trips_payload() {
+    if skip_if_process_containment_is_unavailable() {
+        return;
+    }
     let program = fixture_path();
     let manifest = manifest(&program);
     let agent_id = AgentId::from_u64(72);
@@ -146,6 +160,9 @@ fn command_invoker_enforces_effect_capability_at_spawn_boundary() {
 
 #[test]
 fn supervisor_fails_closed_on_real_process_crash_and_timeout() {
+    if skip_if_process_containment_is_unavailable() {
+        return;
+    }
     let program = fixture_path();
     let agent_id = AgentId::from_u64(74);
     let policy = policy(agent_id, &program);
