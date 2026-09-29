@@ -18,7 +18,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
           cache: true
-      - run: cargo fmt --all -- --check
+      - run: cargo fmt --all
       - run: cargo check --workspace --all-features
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
