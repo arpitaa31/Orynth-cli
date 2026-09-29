@@ -324,9 +324,9 @@ fn relative_workspace_path(
         let root = normalize(sandbox);
         let candidate = normalize(requested);
         let prefix = format!("{root}\\");
-        return candidate
+        candidate
             .strip_prefix(&prefix)
-            .map(PathBuf::from);
+            .map(PathBuf::from)
     }
     #[cfg(not(windows))]
     {
@@ -348,7 +348,7 @@ fn path_is_within(root: &std::path::Path, candidate: &std::path::Path) -> bool {
         };
         let root = normalize(root);
         let candidate = normalize(candidate);
-        return candidate == root || candidate.starts_with(&(root + "\\"));
+        candidate == root || candidate.starts_with(&(root + "\\"))
     }
     #[cfg(not(windows))]
     {
