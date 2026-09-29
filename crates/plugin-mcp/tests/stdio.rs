@@ -85,8 +85,22 @@ fn is_unsupported_process_containment(error: &McpError) -> bool {
     )
 }
 
+#[cfg(not(windows))]
+fn skip_if_process_containment_is_unavailable() -> bool {
+    eprintln!("skipping stdio containment test: no non-Windows containment adapter");
+    true
+}
+
+#[cfg(windows)]
+const fn skip_if_process_containment_is_unavailable() -> bool {
+    false
+}
+
 #[test]
 fn legacy_stdio_session_round_trips_through_mcp_adapter() {
+    if skip_if_process_containment_is_unavailable() {
+        return;
+    }
     let program = fixture_path();
     let manifest = manifest(&program);
     let agent_id = AgentId::from_u64(102);
@@ -135,6 +149,9 @@ fn legacy_stdio_session_round_trips_through_mcp_adapter() {
 
 #[test]
 fn modern_stdio_session_adds_per_request_metadata_without_legacy_handshake() {
+    if skip_if_process_containment_is_unavailable() {
+        return;
+    }
     let program = fixture_path();
     let manifest = manifest(&program);
     let agent_id = AgentId::from_u64(103);
