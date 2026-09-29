@@ -1918,8 +1918,7 @@ fn wrapped_input_lines(value: &str, width: u16) -> usize {
 
 fn input_height(value: &str, width: u16) -> u16 {
     (wrapped_input_lines(value, width.saturating_sub(2)) + 2)
-        .min(MAX_INPUT_LINES)
-        .max(3) as u16
+        .clamp(3, MAX_INPUT_LINES) as u16
 }
 
 fn input_scroll(value: &str, cursor: usize, width: u16) -> u16 {
