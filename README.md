@@ -103,3 +103,5 @@ Most AI tools make the model feel like the whole system.
 Orynth experiments with the opposite idea:
 keep the model replaceable and let the runtime own the important state.
 That's what I'm trying to build.
+
+<img width="1288" height="527" alt="Screenshot 2026-09-29 192922" src="https://github.com/user-attachments/assets/b5b2816a-23cd-41db-b30d-36258fb353b3" />
