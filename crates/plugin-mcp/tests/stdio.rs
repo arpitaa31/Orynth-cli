@@ -5,11 +5,11 @@ use std::{
 
 use orynth_kernel::{AgentId, PluginId, TrustOrigin};
 use orynth_plugin_api::{
-    PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginKind, PluginManifest, PluginRequest,
-    PluginResourceLimits, PluginTransport,
+    PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginError, PluginKind, PluginManifest,
+    PluginRequest, PluginResourceLimits, PluginTransport,
 };
 use orynth_plugin_mcp::{
-    McpAdapter, McpClientInfo, McpConnectionContext, McpProtocolMode, McpServerInfo,
+    McpAdapter, McpClientInfo, McpConnectionContext, McpError, McpProtocolMode, McpServerInfo,
     SessionMcpInvoker, StdioMcpTransport,
 };
 use orynth_plugin_process::ProcessCommand;
@@ -76,6 +76,15 @@ fn request(id: u64) -> PluginRequest {
     }
 }
 
+fn is_unsupported_process_containment(error: &McpError) -> bool {
+    matches!(
+        error,
+        McpError::Plugin(PluginError::Invalid(
+            "OS process containment is unavailable on this platform"
+        ))
+    )
+}
+
 #[test]
 fn legacy_stdio_session_round_trips_through_mcp_adapter() {
     let program = fixture_path();
@@ -87,8 +96,7 @@ fn legacy_stdio_session_round_trips_through_mcp_adapter() {
         Duration::from_secs(2),
     )
     .unwrap();
-    let session = transport
-        .connect(
+    let session = match transport.connect(
             McpProtocolMode::Legacy2025,
             client(),
             server(),
@@ -99,8 +107,14 @@ fn legacy_stdio_session_round_trips_through_mcp_adapter() {
                 task_id: None,
                 now_ms: 1,
             },
-        )
-        .unwrap();
+        ) {
+        Ok(session) => session,
+        Err(error) if is_unsupported_process_containment(&error) => {
+            eprintln!("skipping stdio containment test: {error}");
+            return;
+        }
+        Err(error) => panic!("stdio session should connect: {error}"),
+    };
     let mut adapter =
         McpAdapter::new(manifest.clone(), server(), SessionMcpInvoker::new(session)).unwrap();
     let response = adapter
@@ -130,8 +144,7 @@ fn modern_stdio_session_adds_per_request_metadata_without_legacy_handshake() {
         Duration::from_secs(2),
     )
     .unwrap();
-    let session = transport
-        .connect(
+    let session = match transport.connect(
             McpProtocolMode::Modern2026,
             client(),
             server(),
@@ -142,8 +155,14 @@ fn modern_stdio_session_adds_per_request_metadata_without_legacy_handshake() {
                 task_id: None,
                 now_ms: 1,
             },
-        )
-        .unwrap();
+        ) {
+        Ok(session) => session,
+        Err(error) if is_unsupported_process_containment(&error) => {
+            eprintln!("skipping stdio containment test: {error}");
+            return;
+        }
+        Err(error) => panic!("stdio session should connect: {error}"),
+    };
     let mut adapter =
         McpAdapter::new(manifest.clone(), server(), SessionMcpInvoker::new(session)).unwrap();
     let response = adapter

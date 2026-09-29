@@ -1129,7 +1129,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("orynth-workspace-test-{suffix}"));
         let sandbox = root.join("sandbox");
         fs::create_dir_all(&sandbox).expect("sandbox should be created");
-        (root, sandbox)
+        (
+            root,
+            sandbox
+                .canonicalize()
+                .expect("sandbox root should resolve for validation"),
+        )
     }
 
     #[test]
