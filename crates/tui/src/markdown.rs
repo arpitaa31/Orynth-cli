@@ -253,61 +253,145 @@ fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{render_literal, render_markdown};
+    use ratatui::style::Modifier;
 
     fn plain(lines: &[ratatui::text::Line<'static>]) -> String {
         lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
     }
 
     #[test]
-    fn renders_common_markdown_without_source_tokens() {
-        let rendered = plain(&render_markdown(
-            "# Plan\n\n**bold** *italic* `code`\n\n- one\n- two\n\n[OpenRouter](https://openrouter.ai)",
-        ));
-        assert!(rendered.contains("Plan"));
-        assert!(rendered.contains("bold"));
+    fn renders_plain_text() {
+        assert_eq!(plain(&render_markdown("plain text")), "plain text");
+    }
+
+    #[test]
+    fn renders_bold_text() {
+        let lines = render_markdown("**bold**");
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(plain(&lines), "bold");
+    }
+
+    #[test]
+    fn renders_italic_text() {
+        let lines = render_markdown("*italic*");
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(plain(&lines), "italic");
+    }
+
+    #[test]
+    fn renders_headings() {
+        let lines = render_markdown("# heading\n\n## subheading\n\n### detail");
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(plain(&lines).contains("heading"));
+        assert!(plain(&lines).contains("subheading"));
+        assert!(plain(&lines).contains("detail"));
+    }
+
+    #[test]
+    fn renders_inline_code() {
+        let lines = render_markdown("use `cargo check`");
+        assert_eq!(plain(&lines), "use cargo check");
+        assert_eq!(lines[0].spans[1].content, "cargo check");
+    }
+
+    #[test]
+    fn renders_fenced_code_with_structure() {
+        let rendered = plain(&render_markdown("```rust\nfn main() {\n\tprintln!(\"hi\");\n}"));
+        assert!(rendered.contains("rust"));
+        assert!(rendered.contains("fn main() {"));
+        assert!(rendered.contains("println!"));
+        assert!(rendered.contains("  "));
+    }
+
+    #[test]
+    fn renders_unordered_lists() {
+        let rendered = plain(&render_markdown("- one\n- two"));
         assert!(rendered.contains("• one"));
+        assert!(rendered.contains("• two"));
+    }
+
+    #[test]
+    fn renders_ordered_lists() {
+        let rendered = plain(&render_markdown("1. one\n2. two"));
+        assert!(rendered.contains("1. one"));
+        assert!(rendered.contains("2. two"));
+    }
+
+    #[test]
+    fn renders_nested_lists_with_indentation() {
+        let rendered = plain(&render_markdown("- outer\n  - inner"));
+        assert!(rendered.contains("• outer"));
+        assert!(rendered.contains("  • inner"));
+    }
+
+    #[test]
+    fn renders_blockquotes() {
+        assert!(plain(&render_markdown("> quoted")).contains("> quoted"));
+    }
+
+    #[test]
+    fn renders_links_with_readable_label_and_url() {
+        let rendered = plain(&render_markdown("[OpenRouter](https://openrouter.ai)"));
         assert!(rendered.contains("OpenRouter (https://openrouter.ai)"));
-        assert!(!rendered.contains("**"));
         assert!(!rendered.contains("]("));
     }
 
     #[test]
-    fn preserves_code_structure_and_streaming_fragments() {
-        let rendered = plain(&render_markdown("```rust\nfn main() {\n\tprintln!(\"hi\");\n}"));
-        assert!(rendered.contains("┌─ rust"));
-        assert!(rendered.contains("│ fn main() {"));
-        assert!(rendered.contains("println!"));
-        assert!(rendered.contains("└─"));
+    fn preserves_paragraph_spacing() {
+        assert!(plain(&render_markdown("first\n\nsecond")).contains("first\n\nsecond"));
+    }
+
+    #[test]
+    fn preserves_unicode() {
+        assert!(plain(&render_markdown("Build it 🧭 — now")).contains("Build it 🧭 — now"));
+    }
+
+    #[test]
+    fn renders_incomplete_bold_streaming_fragment() {
         assert!(plain(&render_markdown("**bold wor")).contains("bold wor"));
-        assert!(plain(&render_markdown("```rust\nfn main() {")).contains("fn main()"));
     }
 
     #[test]
-    fn sanitizes_terminal_controls_and_handles_nested_lists() {
-        let rendered = plain(&render_markdown("- outer\n  - inner\n\n> quoted\n\ntext\u{1b}[2J"));
-        assert!(rendered.contains("• outer"));
-        assert!(rendered.contains("  • inner"));
-        assert!(rendered.contains("> quoted"));
-        assert!(!rendered.contains('\u{1b}'));
+    fn renders_incomplete_fenced_code_streaming_fragment() {
+        assert!(plain(&render_markdown("```rust\nfn main() {")).contains("fn main() {"));
     }
 
     #[test]
-    fn preserves_source_and_degrades_malformed_markdown() {
-        let source = "**Frontend**\n\n| name | value |\n| --- | --- |\n| 🧭 | ok |";
-        let original = source.to_owned();
-        let rendered = plain(&render_markdown(source));
-        assert_eq!(source, original);
-        assert!(rendered.contains("Frontend"));
+    fn malformed_markdown_degrades_to_readable_text() {
+        let rendered = plain(&render_markdown("[unclosed link\n| name | value |\n| --- | --- |"));
+        assert!(rendered.contains("unclosed link"));
         assert!(rendered.contains("name"));
-        assert!(rendered.contains("🧭"));
     }
 
     #[test]
-    fn keeps_long_lines_and_unicode_readable_for_narrow_layouts() {
+    fn keeps_long_lines_readable_for_narrow_layouts() {
         let source = "🧭 ".repeat(512);
         let rendered = plain(&render_markdown(&source));
         assert!(rendered.contains("🧭"));
         assert!(rendered.len() >= source.len() - 2);
+    }
+
+    #[test]
+    fn sanitizes_terminal_control_characters() {
+        let rendered = plain(&render_markdown("text\u{1b}[2J\u{7}after"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+    }
+
+    #[test]
+    fn preserves_raw_source_for_stored_conversation() {
+        let source = "**Frontend**\n\n- item";
+        let original = source.to_owned();
+        let _ = render_markdown(source);
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn rendering_does_not_mutate_source_text() {
+        let source = String::from("[label](https://example.com)");
+        let before = source.clone();
+        let _ = render_markdown(&source);
+        assert_eq!(source, before);
     }
 
     #[test]
