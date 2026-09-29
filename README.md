@@ -1,40 +1,105 @@
 # Orynth
 
-Orynth is an experimental Rust project exploring supervised agent-runtime architecture.
+Orynth is an experimental AI agent harness/runtime built in Rust.
 
-Status: Phase G OpenRouter integration in progress. Deep Audit #2 has not started. See [docs/STATUS.md](docs/STATUS.md) and
-[plans/CURRENT.md](plans/CURRENT.md).
+I started making it because I wanted to explore something beyond the usual:
 
-## OpenRouter live test
+`prompt → model → response`
 
-Copy `orynth.example.toml` to `orynth.toml`, set `OPENROUTER_API_KEY` in your
-PowerShell session, then run `orynth provider test openrouter` followed by
-`orynth provider tool-test openrouter` before the coding test. The example
-uses `openrouter/free` and `free_only = true`. Prompts and projected context
-sent to OpenRouter leave the local machine. See
-[docs/OPENROUTER_PROVIDER.md](docs/OPENROUTER_PROVIDER.md) and the
-[manual test procedure](docs/PHASE_G_REAL_MODEL_TEST.md).
+The main idea is:
 
-## Workspace
+> **Agent != Model**
 
-Run the deterministic offline team demo:
+Models can reason and propose actions, while Orynth manages the actual runtime around them — agents, context, tools, permissions, budgets, communication, persistence and replay.
 
-```text
-cargo run -p orynth -- --demo
+Basically: **models think, Orynth manages.**
+
+> **Status:** experimental. Most of the runtime works, but the multi-agent/subagent orchestration is still being improved.
+
+---
+
+## What it has
+
+- Chat-first terminal UI
+- Live AI Coordinator
+- OpenRouter integration
+- Streaming responses
+- Multi-turn agent execution
+- Persistent SQLite runs
+- Agent context + typed IPC
+- Permissions + resource ownership
+- Tool execution + history
+- Budgets + health state
+- Sandboxed coding workspaces
+- Replay / inspect / fork / diff
+- Advanced debugger
+- Offline demo mode
+- Early multi-agent support
+
+---
+
+## Build
+
+You'll need Rust installed.
+
+From the repo root:
+
+```powershell
+cargo build --release --workspace
 ```
 
-Inspect persisted SQLite runs:
+The Windows executable will be:
+ target\release\orynth.exe
 
-```text
-cargo run -p orynth --
-cargo run -p orynth -- --db .orynth/runtime.db --run <run-id>
-```
+Check available commands:
+ .\target\release\orynth.exe --help
 
-Open Advanced Debugger with `cargo run -p orynth -- debug --demo`. The TUI is
-read-only and projection-backed. Advanced Debugger shows the agent tree,
-logical/effective model identity, bounded event timeline and paging, context
-visibility, IPC, tool transactions, permissions/ownership, budgets,
-assumptions/conflicts, cache observations, persisted runs, and help. The
-existing `inspect`, `replay`, `fork`, `diff`, and line-oriented `debug-session` commands
-remain available for non-full-screen workflows. See [docs/TUI.md](docs/TUI.md)
-and [docs/TUI_IMPLEMENTATION_REPORT.md](docs/TUI_IMPLEMENTATION_REPORT.md).
+# Try it without AI
+ No API key needed:
+.\target\release\orynth.exe --demo
+
+This opens Orynth's offline demo so you can explore the TUI and runtime.
+
+# Run with OpenRouter
+Orynth does not include an API key.
+Reviewers/users should create their own OpenRouter key here:
+https://openrouter.ai/settings/keys
+
+1. Create your local config
+Copy-Item .\orynth.example.toml .\orynth.toml
+
+2. Add your OpenRouter key
+In the same PowerShell terminal:
+$env:OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
+
+Check that it is set:
+if ($env:OPENROUTER_API_KEY) { "KEY SET" } else { "KEY NOT SET" }
+
+Never put the API key inside the repo or orynth.toml.
+3. Test the connection
+.\target\release\orynth.exe provider test openrouter --config .\orynth.toml
+
+Optional tool-call test:
+.\target\release\orynth.exe provider tool-test openrouter --config .\orynth.toml
+
+4. Start a live workspace
+Orynth keeps coding work inside its sandbox directory.
+New-Item -ItemType Directory -Force .\sandbox\my-project
+
+Then:
+.\target\release\orynth.exe --workspace .\sandbox\my-project
+
+You can now talk to the live Coordinator from the TUI.
+
+# Current limitations
+Orynth is still in experimental condition.
+
+The main unfinished part rn is fully reliable multi-agent orchestration. The runtime already has agent, IPC, context, ownership and coordination foundations, but automatic Coordinator → multiple specialist agent delegation is still being improved.
+Also, openrouter/free can select different underlying models between requests, so live behavior can vary.
+I'd rather ship the actual current state than pretend those parts are finished.
+
+# Why Orynth?
+Most AI tools make the model feel like the whole system.
+Orynth experiments with the opposite idea:
+keep the model replaceable and let the runtime own the important state.
+That's what I'm trying to build.
