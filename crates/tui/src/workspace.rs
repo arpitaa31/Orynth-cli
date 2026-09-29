@@ -1886,8 +1886,23 @@ fn char_boundary(value: &str, char_index: usize) -> usize {
 
 fn sanitize_paste(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
+    let mut after_escape = false;
+    let mut in_csi = false;
     for character in value.chars() {
+        if after_escape {
+            after_escape = false;
+            in_csi = character == '[';
+            continue;
+        }
+        if in_csi {
+            if ('@'..='~').contains(&character) {
+                in_csi = false;
+            }
+            continue;
+        }
         match character {
+            '\u{1b}' => after_escape = true,
+            '\u{9b}' => in_csi = true,
             '\r' => {}
             '\n' | '\t' => sanitized.push(character),
             character if !character.is_control() => sanitized.push(character),
