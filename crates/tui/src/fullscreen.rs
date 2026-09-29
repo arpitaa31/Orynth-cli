@@ -6,11 +6,12 @@
 use std::{io, time::Duration};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_bracketed_paste, disable_raw_mode,
-        enable_bracketed_paste, enable_raw_mode,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
 use orynth_context::{ContextPrincipal, ContextTrustPolicy, ProjectionRequest};
@@ -2648,20 +2649,28 @@ pub(super) struct TerminalGuard;
 impl TerminalGuard {
     pub(super) fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = enable_bracketed_paste() {
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            EnterAlternateScreen,
+            crossterm::cursor::Hide
+        ) {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide)?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_bracketed_paste();
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            crossterm::cursor::Show,
+            LeaveAlternateScreen
+        );
     }
 }
 

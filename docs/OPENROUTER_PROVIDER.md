@@ -72,8 +72,9 @@ tool-call responses without executing a tool, before the website test.
 The key is loaded from the environment. It is not logged, persisted as an
 event, shown in the debugger, or included in HTTP error text. Coding writes
 use the existing rooted `FilesystemFixture` through `ToolRuntime` after schema,
-capability, ownership, and policy checks. The Phase G coding workspace is
-restricted to `sandbox/phase-g-personal-site` below the project root.
+capability, ownership, and policy checks. Live coding workspaces must be
+selected below the repository's approved `sandbox` root; the selected
+workspace becomes the filesystem tool root.
 For the user-requested tiny site only, Orynth's policy approves the existing
 confirm-risk write after preview, within a fixed allowlist of `index.html` and
 `styles.css`, a 4 KiB per-file limit, and a no-overwrite rule. The model cannot

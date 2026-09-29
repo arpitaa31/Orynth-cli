@@ -149,7 +149,10 @@ fn run_with_provider(
         let context_prompt = recovered.context.render_prompt(
             ContextPrincipal::Agent(child.id),
             &[PromptLayer::stable("worker context", references)],
-            "Runtime facts: selected coding workspace is sandbox/phase-g-personal-site; only index.html and styles.css may be written.",
+            &format!(
+                "Runtime facts: selected coding workspace is {}; only index.html and styles.css may be written.",
+                workspace.display()
+            ),
         ).map_err(|error| error.to_string())?;
         let mut next_parts = vec![
             RequestPart::System(system.into()),

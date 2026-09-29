@@ -119,6 +119,11 @@ improved the 80-column first frame and empty state. The release binary rendered
 the normal, demo, and 10-agent Workspaces. Workspace memory measurements are
 recorded in `docs/BENCHMARK_RESULTS.md`.
 
+Coordinator input now consumes Crossterm bracketed-paste events, preserves
+editable multiline prompts, bounds paste to 16,384 characters, sanitizes
+terminal control characters, and restores paste mode on exit. The bounded
+viewport keeps the rest of the Workspace stable while pasted content scrolls.
+
 Natural-language input is explicitly unsent in offline mode. Complete
 conversation turns now persist in the runtime event log; live submission and
 provider streaming remain open. Workspace unit tests were added. The focused

@@ -103,7 +103,7 @@ impl LiveTuiSource {
             .map_err(|error| error.to_string())?
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        let expected = repository.join("sandbox").join("phase-g-personal-site");
+        let sandbox = repository.join("sandbox");
         let workspace = workspace
             .map(|path| {
                 if path.is_absolute() {
@@ -112,22 +112,12 @@ impl LiveTuiSource {
                     repository.join(path)
                 }
             })
-            .unwrap_or_else(|| expected.clone());
-        if workspace != expected {
-            return Err("live coding workspace must be sandbox/phase-g-personal-site".into());
-        }
-        let sandbox = repository.join("sandbox");
+            .unwrap_or_else(|| sandbox.join("orynth-workspace"));
         ensure_workspace_dir(&sandbox)?;
-        if sandbox.canonicalize().map_err(|error| error.to_string())? != sandbox {
-            return Err("sandbox directory resolves outside the project".into());
-        }
-        ensure_workspace_dir(&workspace)?;
-        let workspace = workspace
+        let sandbox = sandbox
             .canonicalize()
-            .map_err(|error| error.to_string())?;
-        if workspace != expected {
-            return Err("live coding workspace resolves outside the sandbox".into());
-        }
+            .map_err(|error| format!("could not resolve approved sandbox root: {error}"))?;
+        let workspace = prepare_workspace(&sandbox, &workspace)?;
         let database = PathBuf::from(&config.runtime.event_store);
         let run = Run::new();
         let task = Task::new(run.id, "Live Coordinator session");
@@ -266,6 +256,104 @@ fn ensure_workspace_dir(path: &std::path::Path) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     }
     Ok(())
+}
+
+fn prepare_workspace(
+    sandbox: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<PathBuf, String> {
+    if requested
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "live coding workspace must not contain '..': {}",
+            requested.display()
+        ));
+    }
+    let relative = relative_workspace_path(sandbox, requested).ok_or_else(|| {
+        format!(
+            "live coding workspace must be contained by {}: {}",
+            sandbox.display(),
+            requested.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err("live coding workspace must be a directory below the approved sandbox root".into());
+    }
+
+    let mut current = sandbox.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!(
+                "invalid live coding workspace path: {}",
+                requested.display()
+            ));
+        };
+        current.push(name);
+        ensure_workspace_dir(&current)?;
+    }
+
+    let resolved = current
+        .canonicalize()
+        .map_err(|error| format!("could not resolve live coding workspace: {error}"))?;
+    if !path_is_within(sandbox, &resolved) || resolved == sandbox {
+        return Err(format!(
+            "live coding workspace resolves outside the approved sandbox: {}",
+            requested.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn relative_workspace_path(
+    sandbox: &std::path::Path,
+    requested: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Ok(relative) = requested.strip_prefix(sandbox) {
+        return Some(relative.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let normalize = |path: &std::path::Path| {
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+        };
+        let root = normalize(sandbox);
+        let candidate = normalize(requested);
+        let prefix = format!("{root}\\");
+        return candidate
+            .strip_prefix(&prefix)
+            .map(PathBuf::from);
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn path_is_within(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+    if candidate.strip_prefix(root).is_ok() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let normalize = |path: &std::path::Path| {
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+        };
+        let root = normalize(root);
+        let candidate = normalize(candidate);
+        return candidate == root || candidate.starts_with(&(root + "\\"));
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn model_ref(settings: &ModelSettings) -> Result<ModelRef, String> {
@@ -508,7 +596,10 @@ fn execute_turn(
         .collect();
     let prompt = recovered.context.render_prompt(ContextPrincipal::Agent(agent_id),
         &[PromptLayer::stable("projected context", references)],
-        &format!("Runtime facts: active agents: {roster}. Selected coding workspace: sandbox/phase-g-personal-site."))
+        &format!(
+            "Runtime facts: active agents: {roster}. Selected coding workspace: {}.",
+            workspace.display()
+        ))
         .map_err(|error| error.to_string())?;
     request.parts.push(RequestPart::System(prompt.text));
     let mut latest_user = String::new();
@@ -1022,10 +1113,59 @@ mod tests {
         MockProvider, ProviderCapabilities, ProviderError, ProviderUsage, ToolCall,
     };
     use std::{
+        fs,
         io::{Read, Write},
         net::TcpListener,
+        path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn workspace_test_root() -> (PathBuf, PathBuf) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("orynth-workspace-test-{suffix}"));
+        let sandbox = root.join("sandbox");
+        fs::create_dir_all(&sandbox).expect("sandbox should be created");
+        (root, sandbox)
+    }
+
+    #[test]
+    fn arbitrary_existing_and_nested_sandbox_workspaces_are_allowed() {
+        let (root, sandbox) = workspace_test_root();
+        for relative in ["phase-g-personal-site", "multi-agent-test", "foo/bar"] {
+            let requested = sandbox.join(relative);
+            let resolved = prepare_workspace(&sandbox, &requested).expect("workspace is valid");
+            assert!(path_is_within(&sandbox, &resolved));
+        }
+        let absolute = prepare_workspace(&sandbox, &sandbox.join("absolute-test"))
+            .expect("workspace is valid")
+            .canonicalize()
+            .expect("workspace should resolve");
+        let resolved = prepare_workspace(&sandbox, &absolute).expect("absolute path is valid");
+        assert!(path_is_within(&sandbox, &resolved));
+        let dot_relative = sandbox
+            .parent()
+            .expect("sandbox has a parent")
+            .join(".")
+            .join("sandbox")
+            .join("dot-relative");
+        assert!(prepare_workspace(&sandbox, &dot_relative).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_escape_and_parent_paths_are_rejected() {
+        let (root, sandbox) = workspace_test_root();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).expect("outside fixture should be created");
+        assert!(prepare_workspace(&sandbox, &outside).is_err());
+        assert!(prepare_workspace(&sandbox, &sandbox.join("..").join("outside")).is_err());
+        assert!(prepare_workspace(&sandbox, &sandbox).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 
     struct RetryProvider {
         model: ModelRef,
