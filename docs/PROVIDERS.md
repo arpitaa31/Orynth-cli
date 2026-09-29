@@ -12,4 +12,4 @@ report this value leave it absent. The runtime records observations only when
 the field is explicit and rejects values greater than reported input tokens.
 The deterministic mock provider intentionally reports no cache metadata.
 
-Phase 1 implements the provider contract, streaming, usage, cancellation, errors, and a deterministic mock. It adds no network adapter or credential requirement.
+Phase 1 implements the provider contract, streaming, usage, cancellation, errors, and a deterministic mock. Phase G adds the first network adapter, OpenRouter Chat Completions. The adapter translates SSE text, indexed function calls, usage, finish reasons, and resolved-model metadata into provider-neutral observations. A provider response never grants access to tools. See [OPENROUTER_PROVIDER.md](OPENROUTER_PROVIDER.md).

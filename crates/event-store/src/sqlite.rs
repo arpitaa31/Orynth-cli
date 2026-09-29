@@ -104,6 +104,33 @@ impl SqliteEventStore {
         u64::try_from(count).map_err(|_| StoreError::Corrupt("negative event count".to_string()))
     }
 
+    /// Read one bounded page before a global event sequence without loading the run.
+    /// Results are returned in chronological order.
+    pub fn events_before(
+        &self,
+        run_id: RunId,
+        before_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let before = before_sequence
+            .and_then(|sequence| i64::try_from(sequence).ok())
+            .unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit.min(512))
+            .map_err(|_| StoreError::Corrupt("event page limit overflow".to_string()))?;
+        let mut events = read_events(
+            &self.connection,
+            "SELECT sequence, event_id, run_id, payload, checksum
+             FROM events WHERE run_id = ?1 AND sequence < ?2
+             ORDER BY sequence DESC LIMIT ?3",
+            params![run_id.to_string(), before, limit],
+        )?;
+        events.reverse();
+        Ok(events)
+    }
+
     /// Return persisted run identities for operator-facing run selection.
     pub fn run_ids(&self) -> Result<Vec<RunId>, StoreError> {
         let mut statement = self
@@ -1276,8 +1303,14 @@ fn event_kind_tag(kind: &EventKind) -> i64 {
         EventKind::TaskCreated { .. } => 1,
         EventKind::AgentCreated { .. } => 2,
         EventKind::ModelRequested { .. } => 3,
+        EventKind::ModelResponseMetadata { .. } => 24,
         EventKind::ModelChunkReceived { .. } => 4,
         EventKind::ModelCompleted { .. } => 5,
+        EventKind::ModelFinishedWithoutUsage { .. } => 25,
+        EventKind::ModelTurnCompleted { .. } => 26,
+        EventKind::ModelTurnOutcome { .. } => 29,
+        EventKind::ModelTurnCancelled { .. } => 27,
+        EventKind::ModelTurnFailed { .. } => 28,
         EventKind::ModelCancelled { .. } => 6,
         EventKind::ModelFailed { .. } => 7,
         EventKind::RunCompleted { .. } => 8,
@@ -1295,6 +1328,7 @@ fn event_kind_tag(kind: &EventKind) -> i64 {
         EventKind::ToolTransition { .. } => 20,
         EventKind::FailureMemoryTransition { .. } => 21,
         EventKind::SpecialistTransition { .. } => 22,
+        EventKind::ConversationTurn { .. } => 23,
     }
 }
 
@@ -1369,6 +1403,38 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_event_pages_are_bounded_ordered_and_run_scoped() {
+        let mut store = SqliteEventStore::open_in_memory().expect("SQLite store should open");
+        let run = RunId::from_u64(1);
+        let other = RunId::from_u64(2);
+        for index in 0..5 {
+            store
+                .append(Event::new(run, EventKind::RunCreated { run_id: run }))
+                .expect("run event should append");
+            if index == 2 {
+                store
+                    .append(Event::new(other, EventKind::RunCreated { run_id: other }))
+                    .expect("other run event should append");
+            }
+        }
+        let newest = store.events_before(run, None, 2).expect("newest page");
+        assert_eq!(newest.len(), 2);
+        assert!(newest[0].sequence < newest[1].sequence);
+        let older = store
+            .events_before(run, Some(newest[0].sequence), 2)
+            .expect("older page");
+        assert_eq!(older.len(), 2);
+        assert!(older[1].sequence < newest[0].sequence);
+        assert!(older.iter().all(|event| event.event.run_id == run));
+        assert!(
+            store
+                .events_before(run, None, 0)
+                .expect("empty page")
+                .is_empty()
+        );
     }
 
     #[test]

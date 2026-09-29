@@ -1,27 +1,48 @@
 # Orynth TUI
 
-Status: chat-first Workspace redesign in progress. Phase F.2 Advanced
-Debugger remains available. Deep Audit #2 has not started.
+Status: chat-first Workspace available in offline demo and preliminary
+OpenRouter live mode. Phase F.2 Advanced Debugger remains available. Complete
+Coordinator turns are durable; Phase G live acceptance is pending. Deep Audit
+#2 has not started.
 
 ## Primary Workspace
 
 `orynth` opens the normal Workspace. `orynth --demo` opens a deterministic
 offline team scenario. `orynth debug --demo` opens Advanced Debugger directly.
+An explicit `orynth --db <path> [--run <id>]` opens persisted runs for
+inspection; it does not start a new live provider session.
 The previous line-oriented debug session is `orynth debug-session --db <path>
 --run <id>`.
 
 The Workspace shows Coordinator activity, an AI Team sidebar on wide
 terminals, worker Work/Conversation/Context/Tools/Access tabs, and a contextual
-issue overlay. Use Tab to focus the team, Up/Down to select, Enter to open a
-worker, Left/Right to change tabs, and Esc to return to Coordinator. Ctrl+K
-opens the command palette. `/help`, `/agents`, `/agent NAME`, `/status`,
+issue overlay. The footer teaches Tab to focus AI Team; its bright border,
+title, and highlighted row show focus and selection. Up/Down selects, Enter
+opens a worker or issue, and Esc returns to Coordinator. Ctrl+P opens a compact
+switcher with Coordinator and the recovered workers. Left/Right changes worker
+sections. Ctrl+B hides or shows the team. Ctrl+K opens the command palette.
+`/help`, `/agents`, `/agent NAME`, `/status`,
 `/conflicts`, `/tools`, `/context`, `/runs`, `/coordinator`, and `/debug` are
-implemented. Ctrl+W returns from the in-app debugger.
+implemented. `/runs` opens the debugger's run history. Ctrl+W returns from
+the in-app debugger. Worker input names the viewed agent and says that messages
+still go to Coordinator. Press `/` from a worker view to start a slash command.
+Worker exchanges themselves are read-only.
 
-This is an offline inspection surface. No provider is connected, and natural
-language entered in the input is explicitly reported as unsent and unrecorded.
-Durable conversation, streaming, runtime-backed input, and visual/manual
-acceptance remain open work.
+The demo is an offline inspection surface. Its header says **OFFLINE DEMO /
+MOCK MODE**. No provider is connected in demo mode; free-form tasks receive a deterministic
+warning that mock agents cannot execute new AI tasks, a provider is needed to
+run real work, and the message was not sent or recorded.
+The Coordinator pane derives its goal, team, issue, recorded turns, and recent
+activity from the recovered run. The offline demo's Coordinator summary is
+deterministic and comes from its recorded conflict. Worker conversation shows
+actual typed IPC. The source
+refreshes every two seconds, and new activity does not pull the scroll away
+from older content. PageUp can request older coordination activity from a
+bounded SQLite event page. At the top of a full window, PageUp moves to older
+activity while keeping the cache bounded; End returns to current activity.
+Unchanged selected runs reuse recovery on refresh, while changed runs are fully
+recovered. Input history lasts for the current
+session only.
 
 ## Advanced Debugger
 
@@ -33,9 +54,9 @@ resources appear in inspection overlays rather than every primary list.
 ## Launch
 
 ```text
-cargo run -p orynth -- tui --demo
-.\target\release\orynth.exe tui --demo
-cargo run -p orynth -- tui --db .orynth/runtime.db [--run <run-id>]
+.\target\release\orynth.exe
+.\target\release\orynth.exe --demo
+.\target\release\orynth.exe debug --demo
 ```
 
 The deterministic offline demo is titled **Authentication Migration Demo**.
@@ -95,11 +116,11 @@ status text and symbols accompany color.
 
 ## Read-only boundary
 
-The TUI never invokes providers, appends events, executes tools, grants or
-revokes permissions, changes models, pauses agents, or performs replay/fork
-mutations. Existing CLI replay, fork, diff, and terminal debug commands remain
-explicit workflows. Live subscriptions, live breakpoint actions, and safe
-runtime mutation controls are deferred.
+The TUI widget layer never invokes providers, appends events, executes tools,
+or grants permissions. In live mode, the app-supplied data source accepts
+Coordinator input and calls the runtime/provider boundary asynchronously. The
+Advanced Debugger remains read-only. Existing CLI replay, fork, diff, and
+terminal debug commands remain explicit workflows.
 
 ## Phase F.2 control-room design
 
@@ -122,3 +143,6 @@ inspectors rather than being required to read a screen.
 `RunSummary.display_name` is optional presentation metadata. It improves run
 recognition in the UI but is never used for runtime authority or selection;
 the raw `RunId` remains available under Technical Details.
+
+The live Workspace refreshes on the terminal's 250 ms input poll so provider
+text deltas can appear while a response is still arriving.

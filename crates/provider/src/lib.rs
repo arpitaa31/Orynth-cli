@@ -2,6 +2,8 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use orynth_kernel::{AgentId, CancellationToken, ModelRef, RunId, TaskId, Usage};
 
+pub mod openrouter;
+
 pub const MAX_REQUEST_PARTS: usize = 128;
 pub const MAX_PROVIDER_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOOL_DEFINITIONS: usize = 64;
@@ -29,6 +31,7 @@ pub enum RequestPart {
     System(String),
     User(String),
     Model(String),
+    ModelToolCalls(Vec<ToolCall>),
     ToolResult {
         call_id: String,
         content: String,
@@ -47,6 +50,15 @@ impl RequestPart {
             Self::ToolResult {
                 call_id, content, ..
             } => call_id.len().saturating_add(content.len()),
+            Self::ModelToolCalls(calls) => calls
+                .iter()
+                .map(|call| {
+                    call.call_id
+                        .len()
+                        .saturating_add(call.name.len())
+                        .saturating_add(call.arguments.len())
+                })
+                .sum(),
             Self::Image { media_type, data } => media_type.len().saturating_add(data.len()),
         }
     }
@@ -62,6 +74,12 @@ pub struct ToolDefinition {
     pub description: String,
     /// Provider-neutral structured schema, normally JSON Schema.
     pub input_schema: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolChoice {
+    Auto,
+    Required,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +102,7 @@ pub struct ModelRequest {
     pub model: ModelRef,
     pub parts: Vec<RequestPart>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
     pub structured_output: Option<StructuredOutputRequest>,
     pub reasoning: Option<ReasoningOptions>,
     pub parallel_tool_calls: bool,
@@ -106,6 +125,7 @@ impl ModelRequest {
             model,
             parts: vec![RequestPart::User(prompt.into())],
             tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
             structured_output: None,
             reasoning: None,
             parallel_tool_calls: false,
@@ -168,6 +188,11 @@ impl ModelRequest {
         if self.parallel_tool_calls && self.tools.is_empty() {
             return Err(ProviderError::InvalidRequest(
                 "parallel tool calls require at least one tool".to_owned(),
+            ));
+        }
+        if self.tool_choice == ToolChoice::Required && self.tools.is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "required tool choice needs a tool definition".into(),
             ));
         }
         let part_bytes = self
@@ -256,11 +281,28 @@ pub struct ProviderUsage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderEvent {
-    TextDelta { text: String },
-    ReasoningDelta { text: String },
-    ToolCallStarted { call_id: String, name: String },
-    ToolCallArgumentsDelta { call_id: String, delta: String },
-    ToolCallCompleted { call: ToolCall },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ResponseMetadata {
+        resolved_model: Option<String>,
+        request_id: Option<String>,
+        provider_name: Option<String>,
+    },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        call_id: String,
+        delta: String,
+    },
+    ToolCallCompleted {
+        call: ToolCall,
+    },
     Usage(ProviderUsage),
     Finish(FinishReason),
 }
@@ -269,6 +311,15 @@ impl ProviderEvent {
     pub fn validate(&self) -> Result<(), ProviderError> {
         let size = match self {
             Self::TextDelta { text } | Self::ReasoningDelta { text } => text.len(),
+            Self::ResponseMetadata {
+                resolved_model,
+                request_id,
+                provider_name,
+            } => resolved_model
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(request_id.as_ref().map_or(0, String::len))
+                .saturating_add(provider_name.as_ref().map_or(0, String::len)),
             Self::ToolCallStarted { call_id, name } => call_id.len().saturating_add(name.len()),
             Self::ToolCallArgumentsDelta { call_id, delta } => {
                 call_id.len().saturating_add(delta.len())

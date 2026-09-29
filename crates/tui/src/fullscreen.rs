@@ -8,7 +8,10 @@ use std::{io, time::Duration};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_bracketed_paste, disable_raw_mode,
+        enable_bracketed_paste, enable_raw_mode,
+    },
 };
 use orynth_context::{ContextPrincipal, ContextTrustPolicy, ProjectionRequest};
 use orynth_event_store::{RunStatus, StoredEvent};
@@ -32,6 +35,7 @@ use crate::presentation::{
     health_marker, human_event, knowledge_name, message_presentation, model_class, model_name,
     tool_name, tool_state_label,
 };
+use crate::theme::THEME;
 
 const MAX_EVENT_ROWS: usize = 64;
 const MAX_DETAIL_CHARS: usize = 720;
@@ -42,35 +46,6 @@ const MAX_POLICY_ROWS: usize = 64;
 const MAX_ASSUMPTION_ROWS: usize = 48;
 const MAX_AGENT_INDEXES: usize = 4096;
 const MAX_EVENT_INDEXES: usize = 4096;
-
-/// One restrained palette keeps the control room calm and makes focus and
-/// severity predictable across every screen.
-#[derive(Clone, Copy)]
-struct UiTheme {
-    brand: Color,
-    accent: Color,
-    surface: Color,
-    surface_selected: Color,
-    text: Color,
-    muted: Color,
-    success: Color,
-    warning: Color,
-    danger: Color,
-    info: Color,
-}
-
-const THEME: UiTheme = UiTheme {
-    brand: Color::Rgb(69, 190, 210),
-    accent: Color::Rgb(102, 170, 224),
-    surface: Color::Rgb(24, 34, 44),
-    surface_selected: Color::Rgb(35, 55, 68),
-    text: Color::Rgb(232, 238, 242),
-    muted: Color::Rgb(132, 148, 160),
-    success: Color::Rgb(88, 190, 126),
-    warning: Color::Rgb(224, 177, 80),
-    danger: Color::Rgb(224, 105, 105),
-    info: Color::Rgb(115, 166, 224),
-};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunSummary {
@@ -98,6 +73,18 @@ pub struct TuiSnapshot {
 pub trait TuiDataSource {
     fn snapshot(&mut self) -> Result<TuiSnapshot, String>;
     fn select_run(&mut self, run_id: RunId) -> Result<(), String>;
+
+    fn submit_text(&mut self, _text: String) -> Result<(), String> {
+        Err("No live Coordinator is connected".into())
+    }
+
+    fn live_text(&self) -> Option<String> {
+        None
+    }
+
+    fn is_live(&self) -> bool {
+        false
+    }
 
     /// Load one bounded page of older events before `before_sequence`.
     fn event_page(
@@ -256,6 +243,11 @@ impl TuiApp {
         let mut app = Self::new(snapshot);
         app.overlay = None;
         app
+    }
+
+    pub(super) fn open_runs(&mut self) {
+        self.screen = Screen::Runs;
+        self.overlay = None;
     }
 
     fn recovered(&self) -> Option<&RecoveredRun> {
@@ -2184,7 +2176,7 @@ impl TuiApp {
                 Style::default().fg(Color::Gray),
             ),
             Line::raw(""),
-            Line::raw("MANAGER coordinates the work"),
+            Line::raw("Coordinator manages the work"),
             Line::raw("AUTH-01 handles authentication"),
             Line::raw("DB-02 checks the database"),
             Line::raw("SEC-03 reviews security"),
@@ -2656,6 +2648,10 @@ pub(super) struct TerminalGuard;
 impl TerminalGuard {
     pub(super) fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
+        if let Err(error) = enable_bracketed_paste() {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide)?;
         Ok(Self)
     }
@@ -2663,6 +2659,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = disable_bracketed_paste();
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
     }

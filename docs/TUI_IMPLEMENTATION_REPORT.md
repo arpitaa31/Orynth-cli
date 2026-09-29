@@ -1,6 +1,16 @@
 # Orynth TUI Implementation Report
 
-## Phase F.3 chat-first Workspace: in progress
+## Phase F.3 chat-first Workspace: offline retest build
+
+The navigation retest found that seeing AI Team did not teach users how to
+open a worker. The focused follow-up makes Tab focus explicit in the footer,
+highlights the team border, title, instruction row, and selected agent, and
+adds Ctrl+P switcher navigation over the recovered team. Worker input names
+the viewed agent and says the input still goes to Coordinator. The demo header
+and free-form task warning identify OFFLINE DEMO / MOCK MODE. The requested
+release walkthrough passed through DB-02, Coordinator, SEC-03, AUTH-01, and
+Coordinator without documentation. The focused TUI and app suites pass 26/26
+and 9/9; formatting and changed-crate Clippy pass.
 
 The primary CLI entry now opens a Workspace shell over the same authoritative
 `TuiDataSource` used by the Phase F.2 debugger. A 75/25 wide layout gives the
@@ -10,11 +20,82 @@ Conversation, agent-visible Context, Tools, and Access. Runtime conflicts open
 a human-readable overlay. Ctrl+K shows implemented navigation commands, and
 `/debug` switches to the preserved Advanced Debugger.
 
-The Workspace currently narrates selected structured runtime events. It does
-not yet persist user/Coordinator turns or stream a provider response.
-Natural-language input is rejected transparently offline. This phase is not
-complete; manual visual passes, full interaction coverage, and fresh
-Workspace-specific memory measurements remain.
+The Workspace narrates selected structured runtime events. The demo now
+records a user goal and a conflict-derived Coordinator summary as versioned
+conversation turns. It also records an AUTH-01 question to DB-02 and DB-02's
+answer through runtime IPC, alongside the persisted conflict. The main pane
+keeps the recorded goal, team, and conflict visible at 80 columns. A second
+visual pass shortened the 80-column team rows and made the 10-agent sidebar
+page around the selection. The empty run uses the whole main pane.
+
+Input has Unicode-safe insertion, deletion, cursor movement, and bounded
+history. It remains a Coordinator control surface while inspecting a worker.
+Ctrl+B collapses the team. The issue is an Enter-selectable sidebar item.
+`/runs` and its palette action open the debugger run list. Both modes use a
+shared semantic theme and one `TuiDataSource`.
+
+Natural-language input is rejected transparently offline. Live submission,
+real stream projection, and model-backed orchestration remain future runtime
+work. Idle refreshes reuse a selected SQLite run's recovered projection when
+its event count is unchanged. A changed run still reconstructs its complete
+history before bounding the UI event window; incremental recovery remains a
+performance follow-up before large live runs.
+
+The latest follow-up allows the bounded Coordinator activity window to expand
+from two to 128 events on scroll and makes an active failure inspectable in the
+attention panel when no conflict exists. The empty-state test now checks the
+intentional full-width layout. A further follow-up anchors scrolled-up
+conversation content when new events arrive. The focused TUI suite now passes
+26/26, including navigation, issue selection, scrolling, code blocks, and older-page
+regressions. The full
+all-features workspace test remains incomplete because Windows Application
+Control intermittently blocks generated test executables (OS error 4551).
+Changed-crate Clippy with warnings denied passes; workspace-wide Clippy is
+blocked while loading a dependency in the unchanged plugin-MCP crate. A later `cargo fmt --all`
+attempt succeeded after earlier Application Control blocks. The rebuilt release
+demo rendered the compact
+first frame at 80 columns with the Coordinator goal, team, conflict, and input
+visible. Opening AUTH-01 and switching through its recorded Conversation and
+Tools tabs worked in the PTY; Ctrl+C restored the terminal.
+
+The next history pass adds a source-backed older-activity request to Coordinator
+scrolling. SQLite serves it with an indexed `ORDER BY sequence DESC LIMIT`
+query and checksum-verified decoding. Run-list status and counts also avoid
+loading every run's full event vector. The Workspace retains at most 512 older
+raw events and renders at most 128 coordination items. At the top of that
+window, PageUp advances a sequence cursor and replaces newer cache pages with
+older ones; End returns to current activity. The SQLite selected-run snapshot
+still fully reconstructs changed runs. Focused SQLite paging, TUI, and CLI tests pass;
+the current workspace-wide gate is still subject to Windows Application
+Control.
+
+ADR-0069 defines the durable complete-turn payload. Runtime validation rejects
+empty or oversized turns, unknown Coordinator agents, and child-agent
+impersonation; recovery rejects malformed payloads. SQLite reopen reconstructs
+recorded turns. The demo's final summary is assembled from the recovered
+conflict and recorded by the same runtime API. Provider streaming still needs
+a chunk and completion contract tied to a turn event ID.
+
+The current release PTY walkthrough completed Coordinator → AUTH-01 Work →
+Conversation → Context → Tools → Coordinator → issue overlay → command palette
+→ Advanced Debugger → Workspace → quit. The debugger retained its technical
+Overview, and `Ctrl+W` returned to the Workspace; terminal state was restored
+on quit. Fenced code in recorded conversation and worker exchanges now receives
+a compact code rail and background, with a Unicode regression test.
+The worker Access tab now lists recorded capability leases, their task scope,
+network lease presence, owned resources, and descriptive specialist scope.
+It avoids implying that a declared scope alone grants permission.
+The attention sidebar now selects each active conflict or failure separately;
+the overlay follows the selected runtime record. A two-failure regression
+checks that selecting the second item opens its own reason.
+The Work tab shows the latest recorded exchange and an active failure reason.
+
+Validation: release build, format check, and changed-crate Clippy pass. The
+release demo, empty Workspace, and 10-agent demo rendered in a PTY; Ctrl+C
+restored the terminal. The latest app, event-store, runtime, and TUI suites
+passed 9/9, 61/61, 37/37, and 26/26 after intermittent Windows Application
+Control blocks. The full workspace test and Clippy commands remain blocked
+while loading the `url` dependency's `zerofrom_derive` DLL (OS error 4551).
 
 ## Phase F.2 redesign
 

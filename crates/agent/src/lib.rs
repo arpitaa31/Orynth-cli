@@ -194,6 +194,7 @@ where
                     }
                 }
                 ProviderEvent::ReasoningDelta { .. } => record_model_chunk = true,
+                ProviderEvent::ResponseMetadata { .. } => {}
                 ProviderEvent::ToolCallStarted { call_id, .. } => {
                     if active_tool_calls.len() >= MAX_TOOL_CALLS {
                         return Err(self.failed(

@@ -16,13 +16,14 @@ use orynth_tool_runtime::{ToolState, ToolTransition};
 
 mod fullscreen;
 mod presentation;
+mod theme;
 mod workspace;
 
 pub use fullscreen::{
     RunSummary, TuiDataSource, TuiPresentation, TuiSnapshot, render_snapshot_for_terminal,
     run_fullscreen,
 };
-pub use workspace::{render_workspace_for_terminal, run_workspace};
+pub use workspace::{render_workspace_for_terminal, run_workspace, run_workspace_started_at};
 
 const MAX_RECENT_EVENTS: usize = 8;
 const MAX_EVENT_DETAIL_CHARS: usize = 512;

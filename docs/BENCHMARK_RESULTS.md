@@ -51,6 +51,59 @@ The first frame appeared in the first PTY capture. The manual process harness
 has one-second polling resolution, so no more precise first-render timing is
 claimed.
 
+## Phase F.3 Workspace samples (2026-09-27)
+
+These are single Windows working-set observations from the release Workspace
+after the first frame, read with `Get-Process orynth`. They include the process
+and its recovered demo state. The F.2 figures above used the older debugger
+layout and a different build; the comparison is directional only.
+
+| Workspace scenario | Working set | Compared with F.2 debugger sample |
+|---|---:|---:|
+| Empty normal Workspace | 6,640 KiB | −280 KiB |
+| Offline demo, 4 agents | 7,596 KiB | +652 KiB |
+| Offline demo, 10 agents | 7,824 KiB | +760 KiB |
+
+The first frame appeared in the initial PTY capture for each launch. The
+capture tool waits up to ten seconds before returning, so it does not supply
+a useful millisecond first-render measurement. No precise first-render time
+is claimed.
+
+## Phase F.3 current Workspace samples (2026-09-28)
+
+Single Windows working-set observations of the rebuilt release binary after
+the first PTY frame, using `Get-Process orynth`. The current build includes
+durable complete conversation turns and bounded older-activity paging. The
+process was closed after each observation.
+
+| Workspace scenario | Working set | Compared with 2026-09-27 Workspace sample |
+|---|---:|---:|
+| Empty normal Workspace | 6,568 KiB | -72 KiB |
+| Offline demo, 4 agents | 7,896 KiB | +300 KiB |
+| Offline demo, 10 agents | 7,904 KiB | +80 KiB |
+
+These are one-sample Windows process working sets, not an average or
+cross-platform RSS guarantee. The first frame appeared in the initial PTY
+capture; the capture's ten-second yield does not establish a precise
+time-to-first-render measurement.
+
+The subsequent release build includes a first-frame timing hook. It starts at
+the `run_tui` entry, before demo construction or SQLite source setup, and
+records elapsed microseconds after the first successful terminal draw. It
+does not include process launch and argument parsing. One PTY sample per
+scenario was captured in `benchmarks/results/phase-f3-workspace-*-us.txt`:
+
+| Workspace scenario | Entry to first draw |
+|---|---:|
+| Empty normal Workspace | 6,457 us |
+| Offline demo, 4 agents | 3,101 us |
+| Offline demo, 10 agents | 4,126 us |
+
+The samples are individual observations, not a warmup-controlled latency
+distribution. The earlier working-set table was measured on the release build
+immediately before this timing hook; the hook does not retain additional run
+state after its first write.
+
 ## Release workload measurements
 
 | Area / scenario | Size | Median | p95 | Notes |

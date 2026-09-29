@@ -773,17 +773,21 @@ name = "orynth"
 version = "0.1.0"
 dependencies = [
  "orynth-assumptions",
+ "orynth-cli",
  "orynth-context",
  "orynth-event-store",
  "orynth-failure-memory",
  "orynth-ipc",
  "orynth-kernel",
+ "orynth-provider",
  "orynth-runtime",
  "orynth-scheduler",
  "orynth-security",
  "orynth-specialist",
+ "orynth-terminal-tools",
  "orynth-tool-runtime",
  "orynth-tui",
+ "serde_json",
 ]
 
 [[package]]
@@ -954,6 +958,9 @@ name = "orynth-provider"
 version = "0.1.0"
 dependencies = [
  "orynth-kernel",
+ "reqwest",
+ "rustls",
+ "serde_json",
 ]
 
 [[package]]

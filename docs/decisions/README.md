@@ -48,3 +48,10 @@ Significant decisions record context, decision, alternatives, consequences, and 
 - ADR-0063 records Phase C boundary hardening for bounded process I/O,
   suspended-before-attach Windows containment, bounded discovery/WASM reads,
   cumulative plugin admission, MCP wire negotiation, and enforced ownership.
+- ADR-0068 separates the chat-first Workspace from the Advanced Debugger.
+- ADR-0069 records durable, validated complete user/Coordinator turns in the
+  existing run event log.
+- ADR-0070 records the first OpenRouter Chat Completions adapter within the
+  existing provider trait and its secret, streaming, and tool boundaries.
+- ADR-0071 separates reusable Coordinator provider turns from terminal logical
+  agent lifecycle transitions.

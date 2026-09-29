@@ -2,8 +2,18 @@
 
 Orynth is an experimental Rust project exploring supervised agent-runtime architecture.
 
-Status: chat-first Workspace redesign in progress. Deep Audit #2 has not started. See [docs/STATUS.md](docs/STATUS.md) and
+Status: Phase G OpenRouter integration in progress. Deep Audit #2 has not started. See [docs/STATUS.md](docs/STATUS.md) and
 [plans/CURRENT.md](plans/CURRENT.md).
+
+## OpenRouter live test
+
+Copy `orynth.example.toml` to `orynth.toml`, set `OPENROUTER_API_KEY` in your
+PowerShell session, then run `orynth provider test openrouter` followed by
+`orynth provider tool-test openrouter` before the coding test. The example
+uses `openrouter/free` and `free_only = true`. Prompts and projected context
+sent to OpenRouter leave the local machine. See
+[docs/OPENROUTER_PROVIDER.md](docs/OPENROUTER_PROVIDER.md) and the
+[manual test procedure](docs/PHASE_G_REAL_MODEL_TEST.md).
 
 ## Workspace
 

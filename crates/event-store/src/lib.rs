@@ -525,6 +525,17 @@ fn remap_event_for_run(event: &Event, child_run_id: RunId) -> Event {
             agent_id: *agent_id,
             model: model.clone(),
         },
+        EventKind::ModelResponseMetadata {
+            agent_id,
+            resolved_model,
+            provider_request_id,
+            provider_name,
+        } => EventKind::ModelResponseMetadata {
+            agent_id: *agent_id,
+            resolved_model: resolved_model.clone(),
+            provider_request_id: provider_request_id.clone(),
+            provider_name: provider_name.clone(),
+        },
         EventKind::ModelChunkReceived {
             agent_id,
             chunk_index,
@@ -535,6 +546,31 @@ fn remap_event_for_run(event: &Event, child_run_id: RunId) -> Event {
         EventKind::ModelCompleted { agent_id, usage } => EventKind::ModelCompleted {
             agent_id: *agent_id,
             usage: *usage,
+        },
+        EventKind::ModelFinishedWithoutUsage { agent_id } => EventKind::ModelFinishedWithoutUsage {
+            agent_id: *agent_id,
+        },
+        EventKind::ModelTurnCompleted { agent_id, usage } => EventKind::ModelTurnCompleted {
+            agent_id: *agent_id,
+            usage: *usage,
+        },
+        EventKind::ModelTurnOutcome {
+            agent_id,
+            finish,
+            continued,
+            unproductive,
+        } => EventKind::ModelTurnOutcome {
+            agent_id: *agent_id,
+            finish: finish.clone(),
+            continued: *continued,
+            unproductive: *unproductive,
+        },
+        EventKind::ModelTurnCancelled { agent_id } => EventKind::ModelTurnCancelled {
+            agent_id: *agent_id,
+        },
+        EventKind::ModelTurnFailed { agent_id, message } => EventKind::ModelTurnFailed {
+            agent_id: *agent_id,
+            message: message.clone(),
         },
         EventKind::ModelCancelled { agent_id } => EventKind::ModelCancelled {
             agent_id: *agent_id,
@@ -591,6 +627,10 @@ fn remap_event_for_run(event: &Event, child_run_id: RunId) -> Event {
                 .unwrap_or((*version, payload.clone()));
             EventKind::AgentMessage { version, payload }
         }
+        EventKind::ConversationTurn { version, payload } => EventKind::ConversationTurn {
+            version: *version,
+            payload: payload.clone(),
+        },
         EventKind::AssumptionTransition { version, payload } => {
             let remapped = orynth_assumptions::decode_transition(*version, payload)
                 .map(|transition| {
@@ -1089,6 +1129,11 @@ impl RuntimeState {
                 agent.model = model.clone();
                 agent.status = AgentStatus::Running;
             }
+            EventKind::ModelResponseMetadata { agent_id, .. } => {
+                if !self.agents.contains_key(agent_id) {
+                    return Err(StoreError::UnknownAgent(*agent_id));
+                }
+            }
             EventKind::ModelChunkReceived { agent_id, .. } => {
                 let agent = self
                     .agents
@@ -1103,6 +1148,44 @@ impl RuntimeState {
                     .ok_or(StoreError::UnknownAgent(*agent_id))?;
                 agent.status = AgentStatus::Completed;
                 agent.usage = *usage;
+            }
+            EventKind::ModelFinishedWithoutUsage { agent_id } => {
+                let agent = self
+                    .agents
+                    .get_mut(agent_id)
+                    .ok_or(StoreError::UnknownAgent(*agent_id))?;
+                agent.status = AgentStatus::Completed;
+            }
+            EventKind::ModelTurnCompleted { agent_id, usage } => {
+                let agent = self
+                    .agents
+                    .get_mut(agent_id)
+                    .ok_or(StoreError::UnknownAgent(*agent_id))?;
+                if agent.status != AgentStatus::Running {
+                    return Err(StoreError::InvalidTransition(
+                        "model turn completed outside a running agent".into(),
+                    ));
+                }
+                if let Some(usage) = usage {
+                    agent.usage = agent.usage.saturating_add(*usage);
+                }
+            }
+            EventKind::ModelTurnOutcome { agent_id, .. } => {
+                if !self.agents.contains_key(agent_id) {
+                    return Err(StoreError::UnknownAgent(*agent_id));
+                }
+            }
+            EventKind::ModelTurnCancelled { agent_id }
+            | EventKind::ModelTurnFailed { agent_id, .. } => {
+                let agent = self
+                    .agents
+                    .get(agent_id)
+                    .ok_or(StoreError::UnknownAgent(*agent_id))?;
+                if agent.status != AgentStatus::Running {
+                    return Err(StoreError::InvalidTransition(
+                        "model turn ended outside a running agent".into(),
+                    ));
+                }
             }
             EventKind::ModelCancelled { agent_id } => {
                 let agent = self
@@ -1165,6 +1248,9 @@ impl RuntimeState {
             EventKind::AgentMessage { .. } => {
                 // IPC owns the typed payload and replays it separately.
             }
+            EventKind::ConversationTurn { .. } => {
+                // Runtime conversation owns the typed payload and replays it separately.
+            }
             EventKind::AssumptionTransition { .. } => {
                 // Assumptions own the typed payload and replay it separately.
             }
@@ -1201,12 +1287,36 @@ impl RuntimeState {
             }
             EventKind::RunCompleted { run_id } if *run_id == self.run_id => {
                 self.status = RunStatus::Completed;
+                for agent in self.agents.values_mut() {
+                    if matches!(
+                        agent.status,
+                        AgentStatus::Created | AgentStatus::Running | AgentStatus::Paused
+                    ) {
+                        agent.status = AgentStatus::Completed;
+                    }
+                }
             }
             EventKind::RunCancelled { run_id } if *run_id == self.run_id => {
                 self.status = RunStatus::Cancelled;
+                for agent in self.agents.values_mut() {
+                    if matches!(
+                        agent.status,
+                        AgentStatus::Created | AgentStatus::Running | AgentStatus::Paused
+                    ) {
+                        agent.status = AgentStatus::Cancelled;
+                    }
+                }
             }
             EventKind::RunFailed { run_id, .. } if *run_id == self.run_id => {
                 self.status = RunStatus::Failed;
+                for agent in self.agents.values_mut() {
+                    if matches!(
+                        agent.status,
+                        AgentStatus::Created | AgentStatus::Running | AgentStatus::Paused
+                    ) {
+                        agent.status = AgentStatus::Failed;
+                    }
+                }
             }
             EventKind::RunCompleted { .. }
             | EventKind::RunCancelled { .. }

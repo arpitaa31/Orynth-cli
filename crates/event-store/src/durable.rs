@@ -1222,6 +1222,23 @@ pub(crate) fn encode_event(event: &Event) -> Result<Vec<u8>, String> {
             writer.u64(agent_id.value());
             encode_model(&mut writer, model)?;
         }
+        EventKind::ModelResponseMetadata {
+            agent_id,
+            resolved_model,
+            provider_request_id,
+            provider_name,
+        } => {
+            writer.u8(24);
+            writer.u64(agent_id.value());
+            for value in [resolved_model, provider_request_id, provider_name] {
+                if let Some(value) = value {
+                    writer.u8(1);
+                    writer.string(value)?;
+                } else {
+                    writer.u8(0);
+                }
+            }
+        }
         EventKind::ModelChunkReceived {
             agent_id,
             chunk_index,
@@ -1242,6 +1259,48 @@ pub(crate) fn encode_event(event: &Event) -> Result<Vec<u8>, String> {
                 }
                 None => writer.u8(0),
             }
+        }
+        EventKind::ModelFinishedWithoutUsage { agent_id } => {
+            writer.u8(25);
+            writer.u64(agent_id.value());
+        }
+        EventKind::ModelTurnCompleted { agent_id, usage } => {
+            writer.u8(26);
+            writer.u64(agent_id.value());
+            if let Some(usage) = usage {
+                writer.u8(1);
+                writer.u64(usage.input_tokens);
+                writer.u64(usage.output_tokens);
+                if let Some(cached) = usage.cached_input_tokens {
+                    writer.u8(1);
+                    writer.u64(cached);
+                } else {
+                    writer.u8(0);
+                }
+            } else {
+                writer.u8(0);
+            }
+        }
+        EventKind::ModelTurnOutcome {
+            agent_id,
+            finish,
+            continued,
+            unproductive,
+        } => {
+            writer.u8(29);
+            writer.u64(agent_id.value());
+            writer.string(finish)?;
+            writer.u8(u8::from(*continued));
+            writer.u8(u8::from(*unproductive));
+        }
+        EventKind::ModelTurnCancelled { agent_id } => {
+            writer.u8(27);
+            writer.u64(agent_id.value());
+        }
+        EventKind::ModelTurnFailed { agent_id, message } => {
+            writer.u8(28);
+            writer.u64(agent_id.value());
+            writer.string(message)?;
         }
         EventKind::ModelCancelled { agent_id } => {
             writer.u8(6);
@@ -1339,6 +1398,11 @@ pub(crate) fn encode_event(event: &Event) -> Result<Vec<u8>, String> {
             writer.u16(*version);
             writer.bytes(payload)?;
         }
+        EventKind::ConversationTurn { version, payload } => {
+            writer.u8(23);
+            writer.u16(*version);
+            writer.bytes(payload)?;
+        }
     }
 
     Ok(writer.finish())
@@ -1387,6 +1451,32 @@ pub(crate) fn decode_event(bytes: &[u8]) -> Result<Event, String> {
             agent_id: AgentId::from_u64(cursor.u64()?),
             model: decode_model(&mut cursor)?,
         },
+        24 => {
+            let agent_id = AgentId::from_u64(cursor.u64()?);
+            let mut values = Vec::with_capacity(2);
+            for _ in 0..2 {
+                values.push(match cursor.u8()? {
+                    0 => None,
+                    1 => Some(cursor.string()?),
+                    tag => return Err(format!("unknown model metadata tag {tag}")),
+                });
+            }
+            let provider_name = if cursor.remaining() == 0 {
+                None
+            } else {
+                match cursor.u8()? {
+                    0 => None,
+                    1 => Some(cursor.string()?),
+                    tag => return Err(format!("unknown provider name tag {tag}")),
+                }
+            };
+            EventKind::ModelResponseMetadata {
+                agent_id,
+                resolved_model: values.remove(0),
+                provider_request_id: values.remove(0),
+                provider_name,
+            }
+        }
         4 => EventKind::ModelChunkReceived {
             agent_id: AgentId::from_u64(cursor.u64()?),
             chunk_index: cursor.u32()?,
@@ -1414,6 +1504,51 @@ pub(crate) fn decode_event(bytes: &[u8]) -> Result<Event, String> {
                 ),
             }
         }
+        25 => EventKind::ModelFinishedWithoutUsage {
+            agent_id: AgentId::from_u64(cursor.u64()?),
+        },
+        26 => {
+            let agent_id = AgentId::from_u64(cursor.u64()?);
+            let usage = match cursor.u8()? {
+                0 => None,
+                1 => {
+                    let input = cursor.u64()?;
+                    let output = cursor.u64()?;
+                    let cached = match cursor.u8()? {
+                        0 => None,
+                        1 => Some(cursor.u64()?),
+                        tag => return Err(format!("unknown cached turn usage tag {tag}")),
+                    };
+                    Some(cached.map_or_else(
+                        || Usage::new(input, output),
+                        |value| Usage::new(input, output).with_cached_input_tokens(value),
+                    ))
+                }
+                tag => return Err(format!("unknown model turn usage tag {tag}")),
+            };
+            EventKind::ModelTurnCompleted { agent_id, usage }
+        }
+        27 => EventKind::ModelTurnCancelled {
+            agent_id: AgentId::from_u64(cursor.u64()?),
+        },
+        29 => EventKind::ModelTurnOutcome {
+            agent_id: AgentId::from_u64(cursor.u64()?),
+            finish: cursor.string()?,
+            continued: match cursor.u8()? {
+                0 => false,
+                1 => true,
+                tag => return Err(format!("unknown model turn continuation tag {tag}")),
+            },
+            unproductive: match cursor.u8()? {
+                0 => false,
+                1 => true,
+                tag => return Err(format!("unknown model turn productivity tag {tag}")),
+            },
+        },
+        28 => EventKind::ModelTurnFailed {
+            agent_id: AgentId::from_u64(cursor.u64()?),
+            message: cursor.string()?,
+        },
         6 => EventKind::ModelCancelled {
             agent_id: AgentId::from_u64(cursor.u64()?),
         },
@@ -1489,6 +1624,10 @@ pub(crate) fn decode_event(bytes: &[u8]) -> Result<Event, String> {
             payload: cursor.bytes()?,
         },
         22 => EventKind::SpecialistTransition {
+            version: cursor.u16()?,
+            payload: cursor.bytes()?,
+        },
+        23 => EventKind::ConversationTurn {
             version: cursor.u16()?,
             payload: cursor.bytes()?,
         },
@@ -1656,6 +1795,44 @@ mod tests {
         match &trace.events()[0].kind {
             EventKind::RunCreated { run_id } => *run_id,
             _ => panic!("trace must begin with run.created"),
+        }
+    }
+
+    #[test]
+    fn provider_response_metadata_round_trips_without_a_secret() {
+        let run_id = RunId::from_u64(1);
+        let agent_id = orynth_kernel::AgentId::from_u64(2);
+        for kind in [
+            EventKind::ModelResponseMetadata {
+                agent_id,
+                resolved_model: Some("vendor/model:free".into()),
+                provider_request_id: Some("gen-1".into()),
+                provider_name: Some("Example Provider".into()),
+            },
+            EventKind::ModelFinishedWithoutUsage { agent_id },
+            EventKind::ModelTurnCompleted {
+                agent_id,
+                usage: Some(Usage::new(3, 4).with_cached_input_tokens(1)),
+            },
+            EventKind::ModelTurnCompleted {
+                agent_id,
+                usage: None,
+            },
+            EventKind::ModelTurnOutcome {
+                agent_id,
+                finish: "length".into(),
+                continued: true,
+                unproductive: true,
+            },
+            EventKind::ModelTurnCancelled { agent_id },
+            EventKind::ModelTurnFailed {
+                agent_id,
+                message: "provider unavailable".into(),
+            },
+        ] {
+            let event = Event::new(run_id, kind);
+            let decoded = decode_event(&encode_event(&event).unwrap()).unwrap();
+            assert_eq!(decoded, event);
         }
     }
 

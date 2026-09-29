@@ -7,16 +7,20 @@ license.workspace = true
 [dependencies]
 orynth-assumptions = { path = "../../crates/assumptions" }
 orynth-context = { path = "../../crates/context" }
+orynth-cli = { path = "../../crates/cli" }
 orynth-event-store = { path = "../../crates/event-store" }
 orynth-failure-memory = { path = "../../crates/failure-memory" }
 orynth-ipc = { path = "../../crates/ipc" }
 orynth-kernel = { path = "../../crates/kernel" }
+orynth-provider = { path = "../../crates/provider" }
 orynth-runtime = { path = "../../crates/runtime" }
 orynth-scheduler = { path = "../../crates/scheduler" }
 orynth-security = { path = "../../crates/security" }
 orynth-specialist = { path = "../../crates/specialist" }
 orynth-tool-runtime = { path = "../../crates/tool-runtime" }
+orynth-terminal-tools = { path = "../../crates/terminal-tools" }
 orynth-tui = { path = "../../crates/tui" }
+serde_json = "1"
 
 [[bin]]
 name = "orynth"

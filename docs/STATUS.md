@@ -1,22 +1,147 @@
 # Status
 
+## Phase G.5: in progress
+
+The live Coordinator now owns a bounded multi-turn execution loop. A model
+turn ending with `length` preserves visible output, executes any complete tool
+actions, and continues from the same logical agent/task context. Empty length
+turns use a bounded recovery policy; repeated unproductive turns stop with a
+sanitized diagnostic while preserving the Coordinator identity. The rooted
+website worker also accepts usable actions on length and continues bounded
+turns. Coordinator and worker requests share run-level request and scheduler
+budgets. Full multi-agent orchestration remains Phase H and is intentionally
+not started.
+
+Coordinator and worker timeout/rate-limit setup failures receive bounded
+turn-level retries; cancellation and non-retryable provider failures remain
+terminal for the current turn.
+
+The OpenRouter Chat Completions adapter implements the existing provider trait.
+It streams text, assembles tool calls, records response model/request metadata
+when reported, accepts reported usage, and classifies HTTP errors without
+exposing the bearer token. Manual text and function-call diagnostics are
+available through `provider test openrouter` and `provider tool-test openrouter`.
+Free-only model configuration exists. The live Workspace streams Coordinator
+turns, persists response and usage events, and delegates the tiny website task
+to one rooted worker through Orynth's IPC, capability, ownership, and typed
+tool runtime. A persisted twelve-request cap covers both Coordinator and worker
+calls in each live run. Reusable Coordinator turns record provider completion
+without terminating the logical agent; TUI shutdown persists a completed, failed, or
+cancelled run outcome. Replay now projects that terminal outcome onto agents
+still active at shutdown, so a closed Coordinator does not display as running.
+Worker provider turns persist reported usage before later continuation or tool
+failures can end the logical worker. Live shutdown and worker file effects
+share a gate, closing the gap between the last cancellation check and the
+verified write transaction. ADR-0071 records the lifecycle boundary.
+The worker handoff reports verified filenames without repeating unverified
+model claims about other actions.
+An explicit `--db` now selects persisted inspection even when the live
+configuration file is present.
+Offline provider, Coordinator, and worker tests cover the transport and
+verified write path. The release app library suite passes (20/20), including
+worker-usage preservation, shutdown cancellation, verified handoff, offline
+HTTP/SSE text, fragmented function-call, and redirect probes. The OpenRouter
+adapter now applies the shared 4 MiB provider payload limit to the entire SSE
+response. The blocking network transport now feeds a bounded channel so the
+provider iterator can enforce a 90-second total deadline and return promptly
+on cancellation. The SSE parser merges repeated identical finish metadata
+idempotently, rejects contradictory finish metadata, and treats `[DONE]` as a
+single transport terminator. It accepts usage-only chunks before or after
+semantic finish and explicitly rejects multi-choice responses while supporting the
+single-choice request contract. Offline parser fixtures cover the reported
+duplicate-finish shape; the live response body was not available to this
+development session. The focused debug provider suite passes (23/23); release
+test execution is blocked by Windows Application Control (OS error 4551). The
+release event-store suite passes (62/62). The focused context, TUI, and runtime suites pass (19/19, 26/26, and
+38/38). Full release workspace
+attempts passed several suites before Windows Application Control blocked
+different generated executables (`orynth-event-store` and `orynth-bench`, OS
+error 4551), so the full workspace gate remains
+ENVIRONMENT-BLOCKED. Live
+end-to-end acceptance remains pending. No live request was made by this
+development session; `OPENROUTER_API_KEY` is absent here.
+The process containment wrapper now stores a platform handle only under
+`cfg(windows)`; the non-Windows adapter returns unit directly and is called
+without binding that result. Windows Job Object ownership is unchanged, and
+the Ubuntu/Windows/macOS CI matrix is intact. Windows fmt, workspace check,
+warnings-denied Clippy, and release workspace build pass. The focused
+process-plugin library tests pass (7/7); full workspace tests remain blocked
+by host Application Control (OS error 4551). Only the Windows Rust target is
+installed locally, so Linux/macOS cfg validation is left to the preserved CI
+matrix.
+An earlier focused all-features runtime test executable was blocked by the
+same host policy (OS error 4551); the standard focused runtime suite later
+passed.
+
+On this host, workspace check, all-targets/all-features warnings-denied
+Clippy, formatting, and `cargo build --release --workspace` pass. The release
+binary runs `help`; the offline demo displayed `OFFLINE DEMO / MOCK MODE` and
+exited cleanly with Ctrl+C. The latest all-features workspace test command
+passed the app, agent, assumptions, and cache suites before Windows Application
+Control blocked the CLI test executable (OS error 4551). An earlier run was
+blocked at the benchmark executable by the same policy.
+An earlier explicit-`--db` retest was blocked by Windows Application Control
+(OS error 4551). Exact workspace check and warnings-denied Clippy commands
+pass on the latest retry. Earlier debug and full workspace test
+attempts were blocked by Windows Application Control (OS error 4551). Earlier
+debug test attempts hit
+Application Control loading `zerofrom_derive`; earlier release provider and
+event-store attempts could not load `zerovec_derive` (E0463). Both focused
+release suites have since passed on retry.
+Unreached suites are not counted as passes.
+
 Project: Orynth
-Stage: Phase F.3 - chat-first Workspace redesign in progress
+Stage: Phase G - OpenRouter real provider integration
 Blueprint: SUPPLIED IN CURRENT RESEARCH BRIEF
 Implementation: Phase 2 runtime core hardened; Phase 3 context slice complete; Phase 4A/4B plus budget/health projections complete; Phase 5 security/tools slice complete; Phase 6 plugin/protocol contracts active; Phase 7 terminal planning and rooted execution active; Phase 8 inspector slice complete; Phase D provider/persistence hardening complete; Phase E benchmark and hardening complete; Phase F full-screen TUI/runtime debugger complete; Phase F.2 TUI information architecture and control-room redesign complete
-Current Phase: Phase F.3 - chat-first Workspace redesign in progress; Deep Audit #2 has not started
+Current Phase: Phase G - OpenRouter real provider integration; Deep Audit #2 has not started
 
-## Phase F.3: chat-first Workspace redesign - in progress
+## Phase F.3: chat-first Workspace redesign - offline retest build
+
+The focused navigation follow-up makes Tab-to-team discoverable in the footer,
+gives team focus a bright border and selected row, and adds Ctrl+P for a
+runtime-derived Coordinator/worker switcher. `/agent NAME` and `/coordinator`
+support direct navigation; invalid names produce an error. Worker input now
+states that it still addresses Coordinator. The demo header and free-form task
+warning explicitly identify **OFFLINE DEMO / MOCK MODE**. The release
+walkthrough opened DB-02, returned to Coordinator, switched to SEC-03, and used
+both slash navigation commands successfully. The current focused TUI and app
+suites pass 26/26 and 9/9; formatting and changed-crate Clippy pass.
 
 The normal CLI entry and offline demo now open a preliminary conversation-first
 Workspace. It shares the debugger's `TuiDataSource` and recovered runtime
 state. Coordinator activity, an AI Team sidebar, worker inspection tabs, issue
 overlay, local slash commands, command palette, and in-app debugger transition
-are implemented. Natural-language input is explicitly unsent in offline mode;
-durable conversation events, provider streaming integration points, further
-visual polish, manual walkthrough, tests, release binary validation, and
-Workspace RSS measurements remain open. No real provider or Deep Audit #2
-has been started.
+are implemented. The issue is selectable with Enter, the sidebar scrolls for
+larger teams, Ctrl+B toggles it, `/runs` enters debugger run history, and the
+Coordinator input remains usable from a worker view. Two PTY visual passes
+improved the 80-column first frame and empty state. The release binary rendered
+the normal, demo, and 10-agent Workspaces. Workspace memory measurements are
+recorded in `docs/BENCHMARK_RESULTS.md`.
+
+Natural-language input is explicitly unsent in offline mode. Complete
+conversation turns now persist in the runtime event log; live submission and
+provider streaming remain open. Workspace unit tests were added. The focused
+TUI suite passes 26/26, including failure-only issue
+inspection and conversation scroll anchoring. The app, event-store, and runtime
+suites pass 9/9, 61/61, and 37/37. Windows Application Control blocks the
+`zerofrom_derive` DLL while compiling `url` during the full workspace test
+and Clippy runs (OS error 4551). Clippy passes for the changed crates, and
+`cargo fmt --all` passes. No real
+provider or Deep Audit #2 has been started.
+
+The current history follow-up adds indexed bounded SQLite older-event pages,
+uses those pages for Coordinator scrollback, and reads run-list counts/status
+without materializing every run's event vector. Idle refreshes reuse the
+selected run's recovered projection when its event count has not changed;
+changed runs still require full recovery. PageUp can move the sequence cursor
+through older pages beyond the finite 512-event cache; End returns to live
+activity.
+The worker Work tab now shows the latest recorded exchange and an active
+failure reason when present.
+ADR-0069 records the durable conversation event contract. The offline demo
+uses that contract for a user goal and a conflict-derived Coordinator summary;
+no provider or automatic orchestration is connected.
 
 Phase A audit remediation: ORY-AUDIT-001 through ORY-AUDIT-005 have been
 addressed in the current worktree with focused regression coverage. The

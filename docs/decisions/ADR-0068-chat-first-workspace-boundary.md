@@ -17,6 +17,16 @@ derives its team, agent views, issues, and coordination activity from
 `RecoveredRun`. It owns focus, selection, input editing, scroll position, and
 overlays only. No UI state is treated as runtime authority.
 
+The Workspace polls this source every two seconds for offline/live observation.
+Its conversation window and team rows are bounded; a selected issue is a
+sidebar entry, not an independent runtime record. The two interfaces share
+semantic colors through the TUI theme module. The current SQLite source
+still reconstructs the selected run before bounding the displayed event
+window, so incremental recovery remains a separate runtime/performance task.
+Older Workspace activity pages now use a bounded indexed SQLite query and a
+bounded UI cache; the selected run's initial projection still uses full
+recovery, and the older-history cache is finite.
+
 ## Rationale
 
 The previous nine-screen inspector makes users navigate runtime concepts
@@ -26,11 +36,12 @@ inspection.
 
 ## Current boundary
 
-There is no durable Coordinator conversation event or provider in the runtime
-yet. Offline natural-language input therefore reports that it was not sent or
-recorded. Slash commands are local inspection and navigation controls.
-Conversation submission, persistence, replay, and streaming require an
-explicit runtime contract before they can be claimed complete.
+ADR-0069 adds durable, validated complete conversation turns to the run event
+log. The offline demo records real user/Coordinator turns, but there is no
+provider. Offline natural-language input therefore reports that it was not
+sent or recorded. Slash commands are local inspection and navigation
+controls. Live submission and streaming still require additional runtime
+contracts before they can be claimed complete.
 
 ## Consequences
 

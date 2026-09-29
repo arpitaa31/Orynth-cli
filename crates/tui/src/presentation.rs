@@ -9,6 +9,7 @@ use orynth_context::{ContextTransition, decode_transition as decode_context};
 use orynth_event_store::{AgentStatus, StoredEvent};
 use orynth_ipc::{IpcEnvelope, IpcMessage};
 use orynth_kernel::{AgentId, EventKind, ModelClass, ModelRef};
+use orynth_runtime::conversation::{ConversationSpeaker, ConversationTurn};
 use orynth_runtime::{ManagerAgentProjection, RecoveredRun};
 use orynth_scheduler::{HealthSignal, HealthStatus, decode_transition as decode_scheduler};
 use orynth_security::decode_transition as decode_capability;
@@ -146,6 +147,27 @@ pub fn human_event(recovered: &RecoveredRun, stored: &StoredEvent) -> EventPrese
                 "Model selection changes the effective model without changing the logical agent identity.".to_owned(),
             )
         }
+        EventKind::ModelResponseMetadata {
+            agent_id,
+            resolved_model,
+            provider_request_id,
+            provider_name,
+        } => {
+            let name = agent_label(recovered, *agent_id);
+            involved.push(name.clone());
+            (
+                format!("{name} received provider metadata"),
+                format!(
+                    "Resolved model: {}.",
+                    resolved_model.as_deref().unwrap_or("not reported")
+                ),
+                format!(
+                    "Provider: {}; request ID: {}.",
+                    provider_name.as_deref().unwrap_or("not reported"),
+                    provider_request_id.as_deref().unwrap_or("not reported")
+                ),
+            )
+        }
         EventKind::ModelChunkReceived { agent_id, .. } => {
             let name = agent_label(recovered, *agent_id);
             involved.push(name.clone());
@@ -162,6 +184,67 @@ pub fn human_event(recovered: &RecoveredRun, stored: &StoredEvent) -> EventPrese
                 format!("{name} finished a model response"),
                 format!("{name} completed its latest model step."),
                 "The response and usage are now part of the recovered projection.".to_owned(),
+            )
+        }
+        EventKind::ModelFinishedWithoutUsage { agent_id } => {
+            let name = agent_label(recovered, *agent_id);
+            involved.push(name.clone());
+            (
+                format!("{name} finished a model response"),
+                format!("{name} completed its latest model step."),
+                "The provider did not report token usage.".to_owned(),
+            )
+        }
+        EventKind::ModelTurnCompleted { agent_id, usage } => {
+            let name = agent_label(recovered, *agent_id);
+            involved.push(name.clone());
+            (
+                format!("{name} finished a response"),
+                format!("{name} is ready for another turn."),
+                if usage.is_some() {
+                    "Provider token usage was recorded.".to_owned()
+                } else {
+                    "The provider did not report token usage.".to_owned()
+                },
+            )
+        }
+        EventKind::ModelTurnOutcome {
+            agent_id,
+            finish,
+            continued,
+            unproductive,
+        } => {
+            let name = agent_label(recovered, *agent_id);
+            involved.push(name.clone());
+            (
+                format!("{name} completed a {finish} turn"),
+                if *unproductive {
+                    format!("{name} produced no visible output; bounded recovery is continuing.")
+                } else if *continued {
+                    format!("{name} is continuing from the durable runtime state.")
+                } else {
+                    format!("{name} produced a final response for this turn.")
+                },
+                "The provider finish state is recorded separately from logical agent completion."
+                    .to_owned(),
+            )
+        }
+        EventKind::ModelTurnCancelled { agent_id } => {
+            let name = agent_label(recovered, *agent_id);
+            involved.push(name.clone());
+            (
+                format!("{name}'s response was cancelled"),
+                "The current response stopped before completion.".to_owned(),
+                "The logical agent remains available for another turn.".to_owned(),
+            )
+        }
+        EventKind::ModelTurnFailed { agent_id, message } => {
+            let name = agent_label(recovered, *agent_id);
+            involved.push(name.clone());
+            (
+                format!("{name}'s response failed"),
+                message.clone(),
+                "The logical agent remains available for another turn.".to_owned(),
             )
         }
         EventKind::ModelCancelled { agent_id } => {
@@ -224,6 +307,29 @@ pub fn human_event(recovered: &RecoveredRun, stored: &StoredEvent) -> EventPrese
         EventKind::AgentMessage { version, payload } => {
             message_event_presentation(recovered, *version, payload, &mut involved)
         }
+        EventKind::ConversationTurn { version, payload } => {
+            match ConversationTurn::decode(*version, payload) {
+                Ok(turn) => {
+                    let speaker = match turn.speaker {
+                        ConversationSpeaker::User => "You".to_owned(),
+                        ConversationSpeaker::Coordinator(agent_id) => {
+                            agent_label(recovered, agent_id)
+                        }
+                    };
+                    involved.push(speaker.clone());
+                    (
+                        format!("{speaker} said"),
+                        turn.content,
+                        "This turn is recorded in the authoritative run history.".to_owned(),
+                    )
+                }
+                Err(_) => (
+                    "Unreadable conversation turn".to_owned(),
+                    "The stored conversation payload could not be decoded.".to_owned(),
+                    "Inspect the raw event in Advanced Debugger.".to_owned(),
+                ),
+            }
+        }
         EventKind::AssumptionTransition { version, payload } => {
             assumption_event_presentation(recovered, *version, payload, &mut involved)
         }
@@ -268,9 +374,12 @@ pub fn human_event(recovered: &RecoveredRun, stored: &StoredEvent) -> EventPrese
     let severity = match &stored.event.kind {
         EventKind::RunCompleted { .. }
         | EventKind::ModelCompleted { .. }
+        | EventKind::ModelTurnCompleted { .. }
+        | EventKind::ModelTurnOutcome { .. }
         | EventKind::AgentResumed { .. } => EventSeverity::Success,
         EventKind::RunFailed { .. }
         | EventKind::ModelFailed { .. }
+        | EventKind::ModelTurnFailed { .. }
         | EventKind::RunCancelled { .. } => EventSeverity::Danger,
         EventKind::AssumptionTransition { .. } | EventKind::AgentMessage { .. } => {
             if title.to_ascii_lowercase().contains("conflict") {
@@ -489,8 +598,14 @@ pub fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::TaskCreated { .. } => "task.created",
         EventKind::AgentCreated { .. } => "agent.created",
         EventKind::ModelRequested { .. } => "model.selected",
+        EventKind::ModelResponseMetadata { .. } => "model.response_metadata",
         EventKind::ModelChunkReceived { .. } => "model.output",
         EventKind::ModelCompleted { .. } => "model.completed",
+        EventKind::ModelFinishedWithoutUsage { .. } => "model.finished_without_usage",
+        EventKind::ModelTurnCompleted { .. } => "model.turn_completed",
+        EventKind::ModelTurnOutcome { .. } => "model.turn_outcome",
+        EventKind::ModelTurnCancelled { .. } => "model.turn_cancelled",
+        EventKind::ModelTurnFailed { .. } => "model.turn_failed",
         EventKind::ModelCancelled { .. } => "model.cancelled",
         EventKind::ModelFailed { .. } => "model.failed",
         EventKind::RunCompleted { .. } => "run.completed",
@@ -508,6 +623,7 @@ pub fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::ToolTransition { .. } => "tool.changed",
         EventKind::FailureMemoryTransition { .. } => "failure.memory.changed",
         EventKind::SpecialistTransition { .. } => "specialist.profile.changed",
+        EventKind::ConversationTurn { .. } => "conversation.turn",
     }
 }
 

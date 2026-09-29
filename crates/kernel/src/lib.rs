@@ -298,6 +298,12 @@ pub enum EventKind {
         agent_id: AgentId,
         model: ModelRef,
     },
+    ModelResponseMetadata {
+        agent_id: AgentId,
+        resolved_model: Option<String>,
+        provider_request_id: Option<String>,
+        provider_name: Option<String>,
+    },
     ModelChunkReceived {
         agent_id: AgentId,
         chunk_index: u32,
@@ -305,6 +311,30 @@ pub enum EventKind {
     ModelCompleted {
         agent_id: AgentId,
         usage: Usage,
+    },
+    ModelFinishedWithoutUsage {
+        agent_id: AgentId,
+    },
+    /// One provider request completed while the logical agent remains available.
+    ModelTurnCompleted {
+        agent_id: AgentId,
+        usage: Option<Usage>,
+    },
+    /// The provider finish state for one bounded model turn. `continued`
+    /// records that the logical agent remained active and another turn was
+    /// scheduled from the durable runtime context.
+    ModelTurnOutcome {
+        agent_id: AgentId,
+        finish: String,
+        continued: bool,
+        unproductive: bool,
+    },
+    ModelTurnCancelled {
+        agent_id: AgentId,
+    },
+    ModelTurnFailed {
+        agent_id: AgentId,
+        message: String,
     },
     ModelCancelled {
         agent_id: AgentId,
@@ -383,6 +413,11 @@ pub enum EventKind {
     },
     /// Versioned dynamic-specialist profile owned by `orynth-specialist`.
     SpecialistTransition {
+        version: u16,
+        payload: Vec<u8>,
+    },
+    /// Versioned user/Coordinator conversation turn owned by the runtime.
+    ConversationTurn {
         version: u16,
         payload: Vec<u8>,
     },

@@ -1013,6 +1013,7 @@ fn describe_operation(operation: &TerminalOperation) -> String {
 pub struct RuntimeConfig {
     pub runtime: RuntimeSettings,
     pub models: ModelsSettings,
+    pub openrouter: OpenRouterSettings,
     pub scheduler: SchedulerSettings,
     pub context: ContextSettings,
     pub security: SecuritySettings,
@@ -1077,9 +1078,35 @@ impl RuntimeConfig {
                         "provider" => model.provider = parse_string(raw_value, key, line_number)?,
                         "model" => model.model = parse_string(raw_value, key, line_number)?,
                         "class" => model.model_class = parse_string(raw_value, key, line_number)?,
+                        "reasoning_effort" => {
+                            model.reasoning_effort =
+                                Some(parse_string(raw_value, key, line_number)?)
+                        }
                         _ => return Err(unknown_key(key, line_number)),
                     }
                 }
+                Section::OpenRouter => match key {
+                    "enabled" => {
+                        config.openrouter.enabled = parse_bool(raw_value, key, line_number)?
+                    }
+                    "api_key_env" => {
+                        if parse_string(raw_value, key, line_number)? != "OPENROUTER_API_KEY" {
+                            return Err(ConfigError::Invalid(
+                                "OpenRouter key must come from OPENROUTER_API_KEY".into(),
+                            ));
+                        }
+                    }
+                    "base_url" => {
+                        config.openrouter.base_url = parse_string(raw_value, key, line_number)?
+                    }
+                    "free_only" => {
+                        config.openrouter.free_only = parse_bool(raw_value, key, line_number)?
+                    }
+                    "title" => {
+                        config.openrouter.title = Some(parse_string(raw_value, key, line_number)?)
+                    }
+                    _ => return Err(unknown_key(key, line_number)),
+                },
                 Section::Scheduler => match key {
                     "mode" => {
                         config.scheduler.mode = parse_string(raw_value, key, line_number)?;
@@ -1132,9 +1159,47 @@ impl RuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, model) in [
+            ("coordinator", &self.models.manager),
+            ("worker", &self.models.worker),
+        ] {
+            if let Some(model) = model {
+                if model.provider.trim().is_empty() || model.model.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "models.{name} needs provider and model"
+                    )));
+                }
+                if model.provider == "openrouter" && !self.openrouter.enabled {
+                    return Err(ConfigError::Invalid(
+                        "[providers.openrouter] enabled = true is required".into(),
+                    ));
+                }
+                if self.openrouter.free_only
+                    && model.provider == "openrouter"
+                    && model.model != "openrouter/free"
+                    && !model.model.ends_with(":free")
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "models.{name} must use openrouter/free or a :free model when free_only = true"
+                    )));
+                }
+                if model.reasoning_effort.as_deref().is_some_and(|effort| {
+                    !matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max")
+                }) {
+                    return Err(ConfigError::Invalid(format!(
+                        "models.{name} has invalid reasoning_effort"
+                    )));
+                }
+            }
+        }
         if self.runtime.max_concurrent_agents == 0 {
             return Err(ConfigError::Invalid(
                 "runtime.max_concurrent_agents must be greater than zero".to_string(),
+            ));
+        }
+        if !self.openrouter.base_url.starts_with("https://") {
+            return Err(ConfigError::Invalid(
+                "providers.openrouter.base_url must use HTTPS".into(),
             ));
         }
         if self.runtime.event_store.trim().is_empty() {
@@ -1167,6 +1232,24 @@ impl RuntimeConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenRouterSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub free_only: bool,
+    pub title: Option<String>,
+}
+impl Default for OpenRouterSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            free_only: true,
+            title: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeSettings {
     pub max_concurrent_agents: u16,
     pub event_store: String,
@@ -1195,6 +1278,7 @@ pub struct ModelSettings {
     pub provider: String,
     pub model: String,
     pub model_class: String,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1283,6 +1367,7 @@ enum Section {
     Root,
     Runtime,
     Models(ModelRole),
+    OpenRouter,
     Scheduler,
     Context,
     Security,
@@ -1301,7 +1386,9 @@ impl Section {
         match value {
             "runtime" => Ok(Self::Runtime),
             "models.manager" => Ok(Self::Models(ModelRole::Manager)),
+            "models.coordinator" => Ok(Self::Models(ModelRole::Manager)),
             "models.worker" => Ok(Self::Models(ModelRole::Worker)),
+            "providers.openrouter" => Ok(Self::OpenRouter),
             "models.local" => Ok(Self::Models(ModelRole::Local)),
             "scheduler" => Ok(Self::Scheduler),
             "context" => Ok(Self::Context),
@@ -1386,6 +1473,25 @@ mod tests {
             Some("cheap")
         );
         assert_eq!(config.security.default_network, "deny");
+    }
+
+    #[test]
+    fn openrouter_free_policy_rejects_billable_model_assignments() {
+        let source = r#"
+            [providers.openrouter]
+            enabled = true
+            free_only = true
+            [models.coordinator]
+            provider = "openrouter"
+            model = "vendor/paid-model"
+            class = "strong"
+        "#;
+        assert!(matches!(
+            RuntimeConfig::parse(source),
+            Err(ConfigError::Invalid(_))
+        ));
+        let free = source.replace("vendor/paid-model", "vendor/model:free");
+        assert!(RuntimeConfig::parse(&free).is_ok());
     }
 
     #[test]

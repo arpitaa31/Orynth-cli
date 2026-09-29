@@ -4,6 +4,10 @@
 //! domains. The event store preserves events; the runtime service decides how
 //! to hydrate the materialized projections used by callers.
 
+pub mod conversation;
+
+use conversation::{CONVERSATION_SCHEMA_VERSION, ConversationSpeaker, ConversationTurn};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -540,6 +544,84 @@ impl<S> RuntimeService<S> {
         ))?;
         self.tools = candidate;
         Ok(())
+    }
+
+    /// Persist one validated user or root-Coordinator turn in the run event log.
+    pub fn record_conversation_turn(
+        &mut self,
+        run_id: RunId,
+        turn: ConversationTurn,
+    ) -> Result<(), RuntimeError>
+    where
+        S: EventStore,
+    {
+        let payload = turn.encode().map_err(StoreError::InvalidTransition)?;
+        let state = self.event_store.reconstruct(run_id)?;
+        if let ConversationSpeaker::Coordinator(agent_id) = turn.speaker {
+            let agent = state
+                .agents
+                .get(&agent_id)
+                .ok_or(StoreError::UnknownAgent(agent_id))?;
+            if matches!(
+                agent.status,
+                AgentStatus::Completed | AgentStatus::Cancelled | AgentStatus::Failed
+            ) {
+                return Err(StoreError::InvalidTransition(
+                    "a terminal agent cannot speak as the Coordinator".to_owned(),
+                )
+                .into());
+            }
+            let events = self.event_store.events(run_id)?;
+            let scheduler = SchedulerState::from_events(
+                &events
+                    .iter()
+                    .map(|stored| stored.event.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            if scheduler.parent_of(agent_id).is_some() {
+                return Err(StoreError::InvalidTransition(
+                    "a specialist cannot speak as the Coordinator".to_owned(),
+                )
+                .into());
+            }
+        }
+        self.append_validated_event(Event::new(
+            run_id,
+            EventKind::ConversationTurn {
+                version: CONVERSATION_SCHEMA_VERSION,
+                payload,
+            },
+        ))
+    }
+
+    /// Persist a provider lifecycle transition after normal run/agent validation.
+    pub fn record_model_transition(
+        &mut self,
+        run_id: RunId,
+        kind: EventKind,
+    ) -> Result<(), RuntimeError>
+    where
+        S: EventStore,
+    {
+        if !matches!(
+            kind,
+            EventKind::ModelRequested { .. }
+                | EventKind::ModelResponseMetadata { .. }
+                | EventKind::ModelChunkReceived { .. }
+                | EventKind::ModelCompleted { .. }
+                | EventKind::ModelFinishedWithoutUsage { .. }
+                | EventKind::ModelTurnCompleted { .. }
+                | EventKind::ModelTurnOutcome { .. }
+                | EventKind::ModelTurnCancelled { .. }
+                | EventKind::ModelTurnFailed { .. }
+                | EventKind::ModelFailed { .. }
+                | EventKind::ModelCancelled { .. }
+        ) {
+            return Err(
+                StoreError::InvalidTransition("expected a model lifecycle event".into()).into(),
+            );
+        }
+        self.append_validated_event(Event::new(run_id, kind))
     }
 
     /// Persist a compact failed-approach fact without copying a transcript.
@@ -1770,6 +1852,9 @@ impl<S: EventStore> RuntimeService<S> {
             if let EventKind::AgentMessage { version, payload } = &stored.event.kind {
                 messages.push(IpcEnvelope::decode(*version, payload)?);
             }
+            if let EventKind::ConversationTurn { version, payload } = &stored.event.kind {
+                ConversationTurn::decode(*version, payload).map_err(StoreError::Corrupt)?;
+            }
         }
         let manager = ManagerProjection::from_state(
             run_id,
@@ -1848,8 +1933,8 @@ mod tests {
         ContextSearchRequest, TrustLevel,
     };
     use orynth_event_store::{
-        FileEventStore, InMemoryArtifactStore, InMemoryEventStore, SqliteArtifactStore,
-        SqliteEventStore,
+        BranchStore, FileEventStore, ForkStore, InMemoryArtifactStore, InMemoryEventStore,
+        ReplayMode, SqliteArtifactStore, SqliteEventStore,
     };
     use orynth_failure_memory::{FailureRecord, FailureState};
     use orynth_ipc::{IpcEnvelope, IpcMessage, IpcProvenance};
@@ -1908,6 +1993,34 @@ mod tests {
         (run_id, trace)
     }
 
+    #[test]
+    fn openrouter_assignment_switch_preserves_logical_agent_id() {
+        let run_id = RunId::new();
+        let first = ModelRef::new("openrouter", "openrouter/free", ModelClass::Cheap);
+        let second = ModelRef::new("openrouter", "vendor/other:free", ModelClass::Cheap);
+        let agent = AgentIdentity::new("SITE-01", "tiny website", first);
+        let mut service = RuntimeService::new(InMemoryEventStore::new());
+        service
+            .event_store_mut()
+            .append_batch(&[
+                Event::new(run_id, EventKind::RunCreated { run_id }),
+                Event::new(
+                    run_id,
+                    EventKind::AgentCreated {
+                        agent: agent.clone(),
+                    },
+                ),
+            ])
+            .unwrap();
+        service
+            .select_model(run_id, agent.id, second.clone())
+            .unwrap();
+        let recovered = service.recover(run_id).unwrap();
+        assert_eq!(recovered.manager.agents.len(), 1);
+        assert_eq!(recovered.manager.agents[&agent.id].model, second);
+        assert_eq!(recovered.manager.agents[&agent.id].agent_id, agent.id);
+    }
+
     fn assert_recovered(service: &RuntimeService<InMemoryEventStore>, run_id: RunId) {
         let recovered = service.recover(run_id).expect("run should recover");
         assert_eq!(recovered.run_id, run_id);
@@ -1929,6 +2042,154 @@ mod tests {
             ),
             Ok(b"typed runtime state".as_slice())
         );
+    }
+
+    #[test]
+    fn conversation_turns_survive_sqlite_reopen_and_reject_invalid_speakers() {
+        let path = temp_path("conversation");
+        let run_id = RunId::new();
+        let manager = AgentIdentity::new(
+            "COORDINATOR",
+            "Coordinate the run",
+            ModelRef::new("mock", "strong", ModelClass::Strong),
+        );
+        {
+            let mut service = RuntimeService::new(
+                SqliteEventStore::open(&path).expect("SQLite store should open"),
+            );
+            service
+                .event_store_mut()
+                .append_batch(&[
+                    Event::new(run_id, EventKind::RunCreated { run_id }),
+                    Event::new(
+                        run_id,
+                        EventKind::AgentCreated {
+                            agent: manager.clone(),
+                        },
+                    ),
+                ])
+                .expect("run and coordinator should persist");
+            service
+                .record_conversation_turn(run_id, ConversationTurn::user("Review users.id"))
+                .expect("user turn should persist");
+            service
+                .record_conversation_turn(
+                    run_id,
+                    ConversationTurn::coordinator(manager.id, "The agents disagree about users.id"),
+                )
+                .expect("coordinator turn should persist");
+            service
+                .configure_budget(
+                    run_id,
+                    manager.id,
+                    BudgetLimits {
+                        max_child_agents: Some(1),
+                        ..BudgetLimits::default()
+                    },
+                )
+                .expect("coordinator budget should be configured");
+            let child = AgentIdentity::new(
+                "WORK-01",
+                "Inspect a task",
+                ModelRef::new("mock", "cheap", ModelClass::Cheap),
+            );
+            service
+                .spawn_specialist(
+                    run_id,
+                    manager.id,
+                    child.clone(),
+                    SpecialistProfile::new(child.id, "Worker"),
+                )
+                .expect("worker should spawn");
+            assert!(
+                service
+                    .record_conversation_turn(
+                        run_id,
+                        ConversationTurn::coordinator(child.id, "I am not the Coordinator"),
+                    )
+                    .is_err()
+            );
+            assert!(
+                service
+                    .record_conversation_turn(
+                        run_id,
+                        ConversationTurn::coordinator(AgentId::from_u64(999), "Not a member"),
+                    )
+                    .is_err()
+            );
+            assert!(
+                service
+                    .record_conversation_turn(run_id, ConversationTurn::user(" "))
+                    .is_err()
+            );
+        }
+        let service =
+            RuntimeService::new(SqliteEventStore::open(&path).expect("SQLite store should reopen"));
+        let recovered = service
+            .recover(run_id)
+            .expect("conversation should recover");
+        let turns = recovered
+            .events
+            .iter()
+            .filter_map(|stored| match &stored.event.kind {
+                EventKind::ConversationTurn { version, payload } => {
+                    Some(ConversationTurn::decode(*version, payload).expect("valid turn"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0], ConversationTurn::user("Review users.id"));
+        assert_eq!(
+            turns[1],
+            ConversationTurn::coordinator(manager.id, "The agents disagree about users.id")
+        );
+        let child_run = RunId::new();
+        let mut store = SqliteEventStore::open(&path).expect("SQLite store should reopen");
+        let last_sequence = store
+            .events(run_id)
+            .expect("parent events")
+            .last()
+            .expect("parent has events")
+            .sequence;
+        let branch = store
+            .create_branch(run_id, last_sequence, ReplayMode::Recorded, 1)
+            .expect("branch should be created");
+        store
+            .materialize_fork(branch.branch_id, child_run)
+            .expect("child should materialize");
+        let child = RuntimeService::new(store)
+            .recover(child_run)
+            .expect("child conversation should recover");
+        assert_eq!(
+            child
+                .events
+                .iter()
+                .filter(|stored| matches!(stored.event.kind, EventKind::ConversationTurn { .. }))
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_conversation_event_fails_recovery() {
+        let run_id = RunId::new();
+        let mut service = RuntimeService::new(InMemoryEventStore::new());
+        service
+            .event_store_mut()
+            .append_batch(&[
+                Event::new(run_id, EventKind::RunCreated { run_id }),
+                Event::new(
+                    run_id,
+                    EventKind::ConversationTurn {
+                        version: CONVERSATION_SCHEMA_VERSION,
+                        payload: vec![1, 2, 3],
+                    },
+                ),
+            ])
+            .expect("opaque payload should persist");
+        assert!(service.recover(run_id).is_err());
     }
 
     #[test]

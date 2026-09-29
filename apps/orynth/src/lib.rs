@@ -1,13 +1,16 @@
 //! Small command boundary for the Orynth operator app.
 
+mod live;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, Write},
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use orynth_assumptions::Assumption;
+use orynth_cli::RuntimeConfig;
 use orynth_context::{
     ContextDraft, ContextEventLog, ContextGraph, ContextKind, ContextOwner, ContextScope,
 };
@@ -17,10 +20,15 @@ use orynth_event_store::{
 };
 use orynth_ipc::{IpcEnvelope, IpcMessage, IpcProvenance};
 use orynth_kernel::{
-    AgentId, AgentIdentity, Event, EventKind, ModelClass, ModelRef, RunId, Task, TaskId,
-    ToolTransactionId, TrustOrigin,
+    AgentId, AgentIdentity, CancellationToken, Event, EventKind, ModelClass, ModelRef, RunId, Task,
+    TaskId, ToolTransactionId, TrustOrigin,
+};
+use orynth_provider::{
+    FinishReason, ModelProvider, ModelRequest, ProviderEvent, ToolChoice,
+    ToolDefinition as ProviderToolDefinition, openrouter::OpenRouterProvider,
 };
 use orynth_runtime::RuntimeService;
+use orynth_runtime::conversation::ConversationTurn;
 use orynth_scheduler::{BudgetLimits, HealthSignal};
 use orynth_security::{CapabilityDomain, CapabilityLease};
 use orynth_specialist::SpecialistProfile;
@@ -28,15 +36,24 @@ use orynth_tool_runtime::{ToolProvenance, ToolState, ToolTransition};
 use orynth_tui::{
     InspectorAction, InspectorPane, InspectorState, RunSummary, TuiDataSource, TuiPresentation,
     TuiSnapshot, inspector_pane_item_count, render_inspector_pane, render_runtime_inspector,
-    run_fullscreen, run_workspace, scan_semantic_breakpoints,
+    run_fullscreen, run_workspace_started_at, scan_semantic_breakpoints,
 };
 
-const HELP: &str = "Usage:\n  orynth [--db <path>] [--run <run-id>]\n  orynth --demo\n  orynth debug [--db <path>] [--run <run-id>] [--demo]\n  orynth debug-session --db <path> --run <run-id>\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth help";
+const HELP: &str = "Usage:\n  orynth [--db <path>] [--run <run-id>] [--workspace <path>]\n  orynth --demo\n  orynth provider test openrouter [--config <path>]\n  orynth provider tool-test openrouter [--config <path>]\n  orynth provider site-test openrouter [--config <path>]\n  orynth debug [--db <path>] [--run <run-id>] [--demo]\n  orynth debug-session --db <path> --run <run-id>\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth help";
 const MAX_TUI_EVENT_WINDOW: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Help,
+    ProviderTestOpenRouter {
+        config: PathBuf,
+    },
+    ProviderToolTestOpenRouter {
+        config: PathBuf,
+    },
+    ProviderSiteTestOpenRouter {
+        config: PathBuf,
+    },
     Inspect {
         database: PathBuf,
         run: u64,
@@ -69,8 +86,10 @@ pub enum Command {
     },
     Tui {
         database: PathBuf,
+        explicit_database: bool,
         run: Option<u64>,
         demo: bool,
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -87,6 +106,35 @@ where
     let command = args.next().unwrap_or_else(|| "tui".to_owned());
     if command == "help" || command == "--help" || command == "-h" {
         return Ok(Command::Help);
+    }
+    if command == "provider" {
+        let subcommand = args
+            .next()
+            .ok_or("expected provider test, tool-test, or site-test")?;
+        if !matches!(subcommand.as_str(), "test" | "tool-test" | "site-test")
+            || args.next().as_deref() != Some("openrouter")
+        {
+            return Err(
+                "expected: orynth provider <test|tool-test|site-test> openrouter [--config path]"
+                    .into(),
+            );
+        }
+        let config = match args.next() {
+            None => PathBuf::from("orynth.toml"),
+            Some(flag) if flag == "--config" => args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--config requires a path".to_owned())?,
+            Some(_) => return Err("unknown provider test argument".into()),
+        };
+        if args.next().is_some() {
+            return Err("unexpected provider test argument".into());
+        }
+        return Ok(match subcommand.as_str() {
+            "test" => Command::ProviderTestOpenRouter { config },
+            "tool-test" => Command::ProviderToolTestOpenRouter { config },
+            _ => Command::ProviderSiteTestOpenRouter { config },
+        });
     }
     let command = if command.starts_with('-') {
         args = std::iter::once(command)
@@ -116,6 +164,7 @@ where
     let mut left = None;
     let mut right = None;
     let mut demo = false;
+    let mut workspace = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--db" => {
@@ -192,6 +241,13 @@ where
                 );
             }
             "--demo" if command == "tui" || command == "debug" => demo = true,
+            "--workspace" if command == "tui" => {
+                workspace = Some(
+                    args.next()
+                        .ok_or_else(|| "--workspace requires a path".to_owned())?
+                        .into(),
+                );
+            }
             other => return Err(format!("unknown {command} argument {other:?}\n\n{HELP}")),
         }
     }
@@ -206,10 +262,13 @@ where
                 demo,
             });
         }
+        let explicit_database = database.is_some();
         return Ok(Command::Tui {
             database: database.unwrap_or_else(|| PathBuf::from(".orynth/runtime.db")),
+            explicit_database,
             run,
             demo,
+            workspace,
         });
     }
     let database = database.ok_or_else(|| format!("{command} requires --db\n\n{HELP}"))?;
@@ -263,6 +322,14 @@ where
 {
     match parse_args(args)? {
         Command::Help => Ok(Some(HELP.to_string())),
+        Command::ProviderTestOpenRouter { config } => provider_test_openrouter(config).map(Some),
+        Command::ProviderToolTestOpenRouter { config } => {
+            provider_tool_test_openrouter(config).map(Some)
+        }
+        Command::ProviderSiteTestOpenRouter { config } => {
+            let config = RuntimeConfig::from_path(config).map_err(|error| error.to_string())?;
+            live::run_site_test(config).map(Some)
+        }
         Command::Inspect { database, run } => inspect(database, run).map(Some),
         Command::Replay { database, run, at } => replay(database, run, at).map(Some),
         Command::Fork {
@@ -286,18 +353,303 @@ where
             run,
             demo,
         } => {
-            run_tui(database, run, demo, true)?;
+            run_tui(database, true, run, demo, true, None)?;
             Ok(None)
         }
         Command::Tui {
             database,
+            explicit_database,
             run,
             demo,
+            workspace,
         } => {
-            run_tui(database, run, demo, false)?;
+            run_tui(database, explicit_database, run, demo, false, workspace)?;
             Ok(None)
         }
     }
+}
+
+const OPENROUTER_DIAGNOSTIC_MARKER: &str = "ORYNTH_CONNECTED";
+const OPENROUTER_DIAGNOSTIC_OUTPUT_TOKENS: u32 = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DiagnosticAssessment {
+    response_received: bool,
+    marker_matches: bool,
+}
+
+fn assess_diagnostic_response(response: &str) -> DiagnosticAssessment {
+    let response = response.trim();
+    DiagnosticAssessment {
+        response_received: !response.is_empty(),
+        marker_matches: response == OPENROUTER_DIAGNOSTIC_MARKER,
+    }
+}
+
+struct DiagnosticOutput {
+    response: String,
+    usage: Option<orynth_kernel::Usage>,
+    resolved_model: Option<String>,
+    provider_name: Option<String>,
+    finish: FinishReason,
+}
+
+fn collect_diagnostic_output(
+    stream: impl Iterator<Item = Result<ProviderEvent, orynth_provider::ProviderError>>,
+) -> Result<DiagnosticOutput, String> {
+    let mut response = String::new();
+    let mut usage = None;
+    let mut resolved_model = None;
+    let mut provider_name = None;
+    let mut finish = None;
+    for item in stream {
+        match item.map_err(provider_diagnostic_error)? {
+            ProviderEvent::TextDelta { text } => {
+                if response.len().saturating_add(text.len()) > 1024 {
+                    return Err("diagnostic response exceeded 1 KiB".into());
+                }
+                response.push_str(&text);
+            }
+            ProviderEvent::Usage(observed) => usage = Some(observed.usage),
+            ProviderEvent::ResponseMetadata {
+                resolved_model: observed_model,
+                provider_name: observed_provider,
+                ..
+            } => {
+                if observed_model.is_some() {
+                    resolved_model = observed_model;
+                }
+                if observed_provider.is_some() {
+                    provider_name = observed_provider;
+                }
+            }
+            ProviderEvent::Finish(reason) => finish = Some(reason),
+            // Provider reasoning is not user-visible assistant response text.
+            _ => {}
+        }
+    }
+    let finish = finish.ok_or_else(|| {
+        "OpenRouter connection/stream failure: completion event was not received".to_owned()
+    })?;
+    Ok(DiagnosticOutput {
+        response,
+        usage,
+        resolved_model,
+        provider_name,
+        finish,
+    })
+}
+
+fn format_provider_diagnostic(
+    configured_route: &str,
+    resolved_model: Option<&str>,
+    provider_name: Option<&str>,
+    usage: Option<orynth_kernel::Usage>,
+    finish: &FinishReason,
+    response: &str,
+    duration_ms: u128,
+) -> String {
+    let assessment = assess_diagnostic_response(response);
+    format!(
+        "OpenRouter connection: PASS\nConfigured route: {configured_route}\nResolved model: {}\nProvider: {}\nResponse transport: PASS\nVisible assistant text: {}\nExpected marker: {OPENROUTER_DIAGNOSTIC_MARKER}\nMarker match: {}\nReceived: {}\nFinish reason: {}\nToken usage: {}\nDuration ms: {duration_ms}",
+        resolved_model.unwrap_or("not reported"),
+        provider_name.unwrap_or("not reported"),
+        if assessment.response_received {
+            "PASS"
+        } else {
+            "NONE"
+        },
+        if assessment.marker_matches {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        if response.is_empty() {
+            "<empty>".to_owned()
+        } else {
+            format!("{response:?}")
+        },
+        finish_reason_label(finish),
+        usage
+            .map(|usage| format!(
+                "{} input / {} output tokens",
+                usage.input_tokens, usage.output_tokens
+            ))
+            .unwrap_or_else(|| "not reported".into())
+    )
+}
+
+fn finish_reason_label(finish: &FinishReason) -> &'static str {
+    match finish {
+        FinishReason::Length => "length (output limit reached)",
+        FinishReason::Stop => "stop",
+        FinishReason::ToolCall => "tool_calls",
+        FinishReason::ContentFilter => "content_filter",
+        FinishReason::Cancelled => "cancelled",
+        FinishReason::Other(_) => "other",
+    }
+}
+
+fn provider_diagnostic_error(error: impl std::fmt::Display) -> String {
+    format!("OpenRouter connection/provider failure: {error}")
+}
+
+fn provider_test_openrouter(path: PathBuf) -> Result<String, String> {
+    let config = RuntimeConfig::from_path(&path).map_err(|error| error.to_string())?;
+    if !config.openrouter.enabled {
+        return Err("[providers.openrouter] enabled = true is required".into());
+    }
+    let configured = config
+        .models
+        .manager
+        .as_ref()
+        .or(config.models.worker.as_ref())
+        .ok_or_else(|| "configure [models.coordinator] or [models.worker]".to_owned())?;
+    if configured.provider != "openrouter" {
+        return Err("diagnostic model provider must be openrouter".into());
+    }
+    let class = match configured.model_class.as_str() {
+        "strong" => ModelClass::Strong,
+        "economy" | "cheap" => ModelClass::Cheap,
+        other => return Err(format!("unsupported model class {other}")),
+    };
+    let model = ModelRef::new("openrouter", &configured.model, class);
+    let provider = OpenRouterProvider::from_env(
+        model.clone(),
+        &config.openrouter.base_url,
+        config.openrouter.title.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut request = ModelRequest::new(
+        RunId::new(),
+        TaskId::new(),
+        AgentId::new(),
+        model,
+        "Return exactly:\nORYNTH_CONNECTED\nNo explanation or markdown.",
+    );
+    request.max_output_tokens = Some(OPENROUTER_DIAGNOSTIC_OUTPUT_TOKENS);
+    let started = Instant::now();
+    let stream = provider
+        .stream(request, CancellationToken::new())
+        .map_err(provider_diagnostic_error)?;
+    let output = collect_diagnostic_output(stream)?;
+    let report = format_provider_diagnostic(
+        &configured.model,
+        output.resolved_model.as_deref(),
+        output.provider_name.as_deref(),
+        output.usage,
+        &output.finish,
+        &output.response,
+        started.elapsed().as_millis(),
+    );
+    Ok(report)
+}
+
+fn provider_tool_test_openrouter(path: PathBuf) -> Result<String, String> {
+    let config = RuntimeConfig::from_path(&path).map_err(|error| error.to_string())?;
+    if !config.openrouter.enabled {
+        return Err("[providers.openrouter] enabled = true is required".into());
+    }
+    let worker = config
+        .models
+        .worker
+        .as_ref()
+        .or(config.models.manager.as_ref())
+        .ok_or_else(|| "configure [models.worker] or [models.coordinator]".to_owned())?;
+    let coordinator = config.models.manager.as_ref().unwrap_or(worker);
+    let mut seen: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    let mut lines = vec!["ORYNTH_TOOLS_OK".to_owned()];
+    for (role, configured) in [("worker", worker), ("coordinator", coordinator)] {
+        if configured.provider != "openrouter" {
+            return Err(format!(
+                "{role} tool diagnostic model provider must be openrouter"
+            ));
+        }
+        let class = match configured.model_class.as_str() {
+            "strong" => ModelClass::Strong,
+            "economy" | "cheap" => ModelClass::Cheap,
+            other => return Err(format!("unsupported model class {other}")),
+        };
+        let observed = if let Some(observed) = seen.get(&configured.model) {
+            observed.clone()
+        } else {
+            let model = ModelRef::new("openrouter", &configured.model, class);
+            let provider = OpenRouterProvider::from_env(
+                model.clone(),
+                &config.openrouter.base_url,
+                config.openrouter.title.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let observed = run_tool_probe(&provider, model)?;
+            seen.insert(configured.model.clone(), observed.clone());
+            observed
+        };
+        lines.push(format!(
+            "{role} route: {}\nresolved model: {}\nprovider: {}",
+            configured.model,
+            observed.0.as_deref().unwrap_or("not reported"),
+            observed.1.as_deref().unwrap_or("not reported")
+        ));
+    }
+    lines.push(format!("probe requests: {}", seen.len()));
+    lines.push("No tool was executed.".into());
+    Ok(lines.join("\n"))
+}
+
+fn run_tool_probe(
+    provider: &dyn ModelProvider,
+    model: ModelRef,
+) -> Result<(Option<String>, Option<String>), String> {
+    const PROBE_NAME: &str = "orynth_tool_probe";
+    let mut request = ModelRequest::new(
+        RunId::new(),
+        TaskId::new(),
+        AgentId::new(),
+        model,
+        "Call orynth_tool_probe once with value ORYNTH_TOOLS_OK.",
+    );
+    request.max_output_tokens = Some(96);
+    request.tool_choice = ToolChoice::Required;
+    request.tools.push(ProviderToolDefinition {
+        name: PROBE_NAME.into(),
+        description: "Check function-call support without executing any action".into(),
+        input_schema: r#"{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}"#.into(),
+    });
+    let mut calls = Vec::new();
+    let mut finish = None;
+    let mut resolved = None;
+    let mut provider_name = None;
+    for item in provider
+        .stream(request, CancellationToken::new())
+        .map_err(|error| format!("tool-capability request failed: {error}"))?
+    {
+        match item.map_err(|error| format!("tool-capability stream failed: {error}"))? {
+            ProviderEvent::ToolCallCompleted { call } => calls.push(call),
+            ProviderEvent::ResponseMetadata {
+                resolved_model,
+                provider_name: observed,
+                ..
+            } => {
+                if resolved_model.is_some() {
+                    resolved = resolved_model;
+                }
+                if observed.is_some() {
+                    provider_name = observed;
+                }
+            }
+            ProviderEvent::Finish(reason) => finish = Some(reason),
+            _ => {}
+        }
+    }
+    if finish != Some(FinishReason::ToolCall)
+        || calls.len() != 1
+        || calls[0].name != PROBE_NAME
+        || !serde_json::from_str::<serde_json::Value>(&calls[0].arguments)
+            .is_ok_and(|value| value["value"] == "ORYNTH_TOOLS_OK")
+    {
+        return Err("configured route did not produce the required function call; choose a tool-capable model or route".into());
+    }
+    Ok((resolved, provider_name))
 }
 
 fn recover_recorded_prefix(
@@ -349,6 +701,7 @@ fn recover_recorded_prefix(
 struct DbTuiSource {
     database: PathBuf,
     selected: Option<RunId>,
+    cached_selected: Option<(RunId, u64, orynth_runtime::RecoveredRun)>,
 }
 
 impl DbTuiSource {
@@ -356,6 +709,7 @@ impl DbTuiSource {
         Self {
             database,
             selected: selected.map(RunId::from_u64),
+            cached_selected: None,
         }
     }
 }
@@ -378,11 +732,17 @@ impl TuiDataSource for DbTuiSource {
             self.selected = run_ids.last().copied();
         }
         let mut runs = Vec::with_capacity(run_ids.len());
+        let mut selected_count = None;
         for run_id in run_ids {
-            let events = store
-                .events(run_id)
-                .map_err(|error| format!("could not read run {run_id}: {error}"))?;
-            let status = events
+            let event_count = store
+                .event_count(run_id)
+                .map_err(|error| format!("could not count run {run_id}: {error}"))?;
+            if self.selected == Some(run_id) {
+                selected_count = Some(event_count);
+            }
+            let status = store
+                .events_before(run_id, None, 1)
+                .map_err(|error| format!("could not read run status {run_id}: {error}"))?
                 .last()
                 .map(|event| match event.event.kind {
                     EventKind::RunCompleted { .. } => "COMPLETED",
@@ -396,10 +756,21 @@ impl TuiDataSource for DbTuiSource {
                 run_id,
                 display_name: None,
                 status,
-                event_count: events.len(),
+                event_count: usize::try_from(event_count).unwrap_or(usize::MAX),
             });
         }
         let selected = if let Some(run_id) = self.selected {
+            let event_count = selected_count.unwrap_or(0);
+            if let Some((cached_run, cached_count, recovered)) = &self.cached_selected
+                && *cached_run == run_id
+                && *cached_count == event_count
+            {
+                return Ok(TuiSnapshot {
+                    selected: Some(recovered.clone()),
+                    runs,
+                    presentation: None,
+                });
+            }
             let events = store
                 .events(run_id)
                 .map_err(|error| format!("could not read selected run {run_id}: {error}"))?;
@@ -414,12 +785,14 @@ impl TuiDataSource for DbTuiSource {
             prefix
                 .append_batch(&values)
                 .map_err(|error| format!("could not stage selected run {run_id}: {error}"))?;
-            Some(bound_tui_history(
-                RuntimeService::new(prefix)
-                    .recover(run_id)
-                    .map_err(|error| format!("could not recover selected run {run_id}: {error}"))?,
-            ))
+            let recovered =
+                bound_tui_history(RuntimeService::new(prefix).recover(run_id).map_err(
+                    |error| format!("could not recover selected run {run_id}: {error}"),
+                )?);
+            self.cached_selected = Some((run_id, event_count, recovered.clone()));
+            Some(recovered)
         } else {
+            self.cached_selected = None;
             None
         };
         Ok(TuiSnapshot {
@@ -431,6 +804,7 @@ impl TuiDataSource for DbTuiSource {
 
     fn select_run(&mut self, run_id: RunId) -> Result<(), String> {
         self.selected = Some(run_id);
+        self.cached_selected = None;
         Ok(())
     }
 
@@ -444,17 +818,9 @@ impl TuiDataSource for DbTuiSource {
             .ok_or_else(|| "no run selected for event paging".to_owned())?;
         let store = SqliteEventStore::open(&self.database)
             .map_err(|error| format!("could not open {}: {error}", self.database.display()))?;
-        let before = before_sequence.unwrap_or(u64::MAX);
-        let mut page = store
-            .events(run_id)
-            .map_err(|error| format!("could not read event page for {run_id}: {error}"))?
-            .into_iter()
-            .filter(|event| event.sequence < before)
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>();
-        page.reverse();
-        Ok(page)
+        store
+            .events_before(run_id, before_sequence, limit)
+            .map_err(|error| format!("could not read event page for {run_id}: {error}"))
     }
 }
 
@@ -484,7 +850,15 @@ impl TuiDataSource for DemoTuiSource {
     }
 }
 
-fn run_tui(database: PathBuf, run: Option<u64>, demo: bool, advanced: bool) -> Result<(), String> {
+fn run_tui(
+    database: PathBuf,
+    explicit_database: bool,
+    run: Option<u64>,
+    demo: bool,
+    advanced: bool,
+    workspace: Option<PathBuf>,
+) -> Result<(), String> {
+    let started_at = Instant::now();
     if demo {
         let agent_count = std::env::var("ORYNTH_TUI_DEMO_AGENTS")
             .ok()
@@ -494,13 +868,32 @@ fn run_tui(database: PathBuf, run: Option<u64>, demo: bool, advanced: bool) -> R
         if advanced {
             run_fullscreen(DemoTuiSource::new(agent_count)?)
         } else {
-            run_workspace(DemoTuiSource::new(agent_count)?)
+            run_workspace_started_at(DemoTuiSource::new(agent_count)?, started_at)
         }
     } else {
         if advanced {
             run_fullscreen(DbTuiSource::new(database, run))
         } else {
-            run_workspace(DbTuiSource::new(database, run))
+            if run.is_none() && !explicit_database && std::path::Path::new("orynth.toml").exists() {
+                let config =
+                    RuntimeConfig::from_path("orynth.toml").map_err(|error| error.to_string())?;
+                if config.openrouter.enabled
+                    && config
+                        .models
+                        .manager
+                        .as_ref()
+                        .is_some_and(|model| model.provider == "openrouter")
+                {
+                    return run_workspace_started_at(
+                        live::LiveTuiSource::new(config, workspace)?,
+                        started_at,
+                    );
+                }
+            }
+            if workspace.is_some() {
+                return Err("--workspace requires a live OpenRouter Workspace".into());
+            }
+            run_workspace_started_at(DbTuiSource::new(database, run), started_at)
         }
     }
 }
@@ -526,7 +919,7 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
     };
     let manager = demo_agent(
         0xD3E0_0100,
-        "MANAGER",
+        "COORDINATOR",
         "Coordinate the migration and review specialist evidence",
         "strong-reasoner-v1",
         ModelClass::Strong,
@@ -559,6 +952,9 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
             ),
         ])
         .map_err(|error| format!("demo core events failed: {error}"))?;
+    service
+        .record_conversation_turn(run_id, ConversationTurn::user(task.title.clone()))
+        .map_err(|error| format!("demo request recording failed: {error}"))?;
 
     service
         .configure_budget(
@@ -747,14 +1143,42 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
                 Some(task.id),
                 manager.id,
                 auth.id,
-                IpcMessage::Question {
-                    subject: "identifier migration".to_owned(),
-                    why: "confirm the conflict resolution evidence".to_owned(),
+                IpcMessage::ReviewRequest {
+                    subject: "authentication migration".to_owned(),
+                    instructions:
+                        "Validate token compatibility and confirm the users.id contract with DB-02."
+                            .to_owned(),
                 },
             )
             .with_provenance(IpcProvenance::Runtime),
         )
         .map_err(|error| format!("demo IPC failed: {error}"))?;
+    service
+        .send_message(IpcEnvelope::new(
+            run_id,
+            Some(task.id),
+            auth.id,
+            db.id,
+            IpcMessage::Question {
+                subject: "users.id type".to_owned(),
+                why: "Authentication currently encodes the user ID as UUID. What does the database schema require?".to_owned(),
+            },
+        ))
+        .map_err(|error| format!("demo auth question failed: {error}"))?;
+    service
+        .send_message(IpcEnvelope::new(
+            run_id,
+            Some(task.id),
+            db.id,
+            auth.id,
+            IpcMessage::Answer {
+                subject: "users.id type".to_owned(),
+                value: "BIGINT in the legacy schema".to_owned(),
+                revision: None,
+                evidence: vec!["Recorded database migration constraint".to_owned()],
+            },
+        ))
+        .map_err(|error| format!("demo database answer failed: {error}"))?;
 
     let mut input = BTreeMap::new();
     input.insert("path".to_owned(), "src/auth/schema.rs".to_owned());
@@ -804,6 +1228,35 @@ fn demo_snapshot_with_agent_count(agent_count: usize) -> Result<TuiSnapshot, Str
     service
         .pause_agent(run_id, sec.id)
         .map_err(|error| format!("demo pause failed: {error}"))?;
+
+    let current = service
+        .recover(run_id)
+        .map_err(|error| format!("demo summary recovery failed: {error}"))?;
+    if let Some(conflict) = current.assumptions.conflicts().values().next() {
+        let left = current.assumptions.assumptions().get(&conflict.left);
+        let right = current.assumptions.assumptions().get(&conflict.right);
+        if let (Some(left), Some(right)) = (left, right) {
+            let name = |id| {
+                current
+                    .manager
+                    .agents
+                    .get(&id)
+                    .map_or_else(|| "A worker".to_owned(), |agent| agent.name.clone())
+            };
+            let summary = format!(
+                "{} and {} disagree about {}. The recorded contract needs review.",
+                name(left.owner),
+                name(right.owner),
+                conflict.subject
+            );
+            service
+                .record_conversation_turn(
+                    run_id,
+                    ConversationTurn::coordinator(manager.id, summary),
+                )
+                .map_err(|error| format!("demo summary recording failed: {error}"))?;
+        }
+    }
 
     let recovered = service
         .recover(run_id)
@@ -1151,10 +1604,206 @@ mod tests {
     use super::*;
     use orynth_event_store::EventStore;
     use orynth_kernel::{Event, EventKind};
+    use orynth_provider::MockProvider;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn openrouter_diagnostic_accepts_exact_marker() {
+        let report = format_provider_diagnostic(
+            "openrouter/free",
+            Some("cohere/north-mini-code:free"),
+            Some("Cohere"),
+            None,
+            &FinishReason::Stop,
+            "ORYNTH_CONNECTED",
+            10,
+        );
+        assert!(report.contains("OpenRouter connection: PASS"));
+        assert!(report.contains("Response transport: PASS"));
+        assert!(report.contains("Visible assistant text: PASS"));
+        assert!(report.contains("Marker match: PASS"));
+        assert!(report.contains("Finish reason: stop"));
+    }
+
+    #[test]
+    fn openrouter_diagnostic_trims_marker_whitespace() {
+        assert_eq!(
+            assess_diagnostic_response("  ORYNTH_CONNECTED\n"),
+            DiagnosticAssessment {
+                response_received: true,
+                marker_matches: true,
+            }
+        );
+    }
+
+    #[test]
+    fn openrouter_diagnostic_reports_punctuation_as_marker_mismatch() {
+        let report = format_provider_diagnostic(
+            "openrouter/free",
+            Some("vendor/model:free"),
+            Some("Example Provider"),
+            None,
+            &FinishReason::Stop,
+            "ORYNTH_CONNECTED.",
+            12,
+        );
+        assert!(report.contains("OpenRouter connection: PASS"));
+        assert!(report.contains("Configured route: openrouter/free"));
+        assert!(report.contains("Resolved model: vendor/model:free"));
+        assert!(report.contains("Visible assistant text: PASS"));
+        assert!(report.contains("Marker match: FAIL"));
+        assert!(report.contains("Received: \"ORYNTH_CONNECTED.\""));
+    }
+
+    #[test]
+    fn openrouter_diagnostic_reports_explanatory_text_as_marker_mismatch() {
+        let report = format_provider_diagnostic(
+            "openrouter/free",
+            None,
+            None,
+            None,
+            &FinishReason::Stop,
+            "Sure, ORYNTH_CONNECTED",
+            0,
+        );
+        assert!(report.contains("OpenRouter connection: PASS"));
+        assert!(report.contains("Marker match: FAIL"));
+        assert!(report.contains("Received: \"Sure, ORYNTH_CONNECTED\""));
+    }
+
+    #[test]
+    fn openrouter_diagnostic_marks_empty_text_as_response_failure() {
+        let events = vec![
+            Ok(ProviderEvent::Usage(orynth_provider::ProviderUsage {
+                usage: orynth_kernel::Usage::new(34, 32),
+                cost: None,
+                prompt_cache_hit: None,
+            })),
+            Ok(ProviderEvent::Finish(FinishReason::Length)),
+        ];
+        let output = collect_diagnostic_output(events.into_iter()).unwrap();
+        let report = format_provider_diagnostic(
+            "openrouter/free",
+            Some("cohere/north-mini-code:free"),
+            Some("Cohere"),
+            output.usage,
+            &output.finish,
+            &output.response,
+            0,
+        );
+        assert!(report.contains("OpenRouter connection: PASS"));
+        assert!(report.contains("Response transport: PASS"));
+        assert!(report.contains("Visible assistant text: NONE"));
+        assert!(report.contains("Marker match: FAIL"));
+        assert!(report.contains("Received: <empty>"));
+        assert!(report.contains("length (output limit reached)"));
+        assert!(report.contains("34 input / 32 output tokens"));
+    }
+
+    #[test]
+    fn openrouter_diagnostic_accepts_marker_when_output_limit_is_reached() {
+        let report = format_provider_diagnostic(
+            "openrouter/free",
+            None,
+            None,
+            None,
+            &FinishReason::Length,
+            "ORYNTH_CONNECTED",
+            0,
+        );
+        assert!(report.contains("OpenRouter connection: PASS"));
+        assert!(report.contains("Visible assistant text: PASS"));
+        assert!(report.contains("Marker match: PASS"));
+        assert!(report.contains("length (output limit reached)"));
+    }
+
+    #[test]
+    fn diagnostic_reassembles_many_visible_text_deltas() {
+        let events = "ORYNTH_CONNECTED"
+            .chars()
+            .map(|character| {
+                Ok(ProviderEvent::TextDelta {
+                    text: character.to_string(),
+                })
+            })
+            .chain(std::iter::once(Ok(ProviderEvent::Finish(
+                FinishReason::Stop,
+            ))));
+        let output = collect_diagnostic_output(events).unwrap();
+        assert_eq!(output.response, "ORYNTH_CONNECTED");
+    }
+
+    #[test]
+    fn diagnostic_keeps_visible_text_while_ignoring_reasoning_and_metadata() {
+        let events = vec![
+            Ok(ProviderEvent::ReasoningDelta {
+                text: "private reasoning is not visible text".into(),
+            }),
+            Ok(ProviderEvent::ResponseMetadata {
+                resolved_model: Some("cohere/north-mini-code:free".into()),
+                request_id: Some("sanitized-request-id".into()),
+                provider_name: Some("Cohere".into()),
+            }),
+            Ok(ProviderEvent::TextDelta {
+                text: "ORYNTH_CONNECTED".into(),
+            }),
+            Ok(ProviderEvent::Finish(FinishReason::Stop)),
+        ];
+        let output = collect_diagnostic_output(events.into_iter()).unwrap();
+        assert_eq!(output.response, "ORYNTH_CONNECTED");
+        assert_eq!(
+            output.resolved_model.as_deref(),
+            Some("cohere/north-mini-code:free")
+        );
+        assert_eq!(output.provider_name.as_deref(), Some("Cohere"));
+    }
+
+    #[test]
+    fn usage_only_final_chunk_preserves_visible_text() {
+        let events = vec![
+            Ok(ProviderEvent::TextDelta {
+                text: "ORYNTH_CONNECTED".into(),
+            }),
+            Ok(ProviderEvent::Usage(orynth_provider::ProviderUsage {
+                usage: orynth_kernel::Usage::new(34, 32),
+                cost: None,
+                prompt_cache_hit: None,
+            })),
+            Ok(ProviderEvent::Finish(FinishReason::Stop)),
+        ];
+        let output = collect_diagnostic_output(events.into_iter()).unwrap();
+        assert_eq!(output.response, "ORYNTH_CONNECTED");
+        assert_eq!(output.usage.unwrap(), orynth_kernel::Usage::new(34, 32));
+    }
+
+    #[test]
+    fn openrouter_diagnostic_labels_provider_errors_at_connection_stage() {
+        assert_eq!(
+            provider_diagnostic_error("network unavailable"),
+            "OpenRouter connection/provider failure: network unavailable"
+        );
+    }
+
+    #[test]
     fn parser_requires_explicit_inspect_inputs() {
+        assert_eq!(
+            parse_args(["provider", "tool-test", "openrouter"]),
+            Ok(Command::ProviderToolTestOpenRouter {
+                config: PathBuf::from("orynth.toml")
+            })
+        );
+        assert_eq!(
+            parse_args([
+                "provider",
+                "site-test",
+                "openrouter",
+                "--config",
+                "example.toml"
+            ]),
+            Ok(Command::ProviderSiteTestOpenRouter {
+                config: PathBuf::from("example.toml")
+            })
+        );
         assert!(parse_args(["inspect", "--db", "run.db"]).is_err());
         assert!(parse_args(["inspect", "--run", "1"]).is_err());
         assert_eq!(parse_args(["help"]), Ok(Command::Help));
@@ -1199,16 +1848,20 @@ mod tests {
             parse_args(Vec::<String>::new()),
             Ok(Command::Tui {
                 database: PathBuf::from(".orynth/runtime.db"),
+                explicit_database: false,
                 run: None,
                 demo: false,
+                workspace: None,
             })
         );
         assert_eq!(
             parse_args(["--demo"]),
             Ok(Command::Tui {
                 database: PathBuf::from(".orynth/runtime.db"),
+                explicit_database: false,
                 run: None,
                 demo: true,
+                workspace: None,
             })
         );
         assert_eq!(
@@ -1222,10 +1875,35 @@ mod tests {
             parse_args(["tui", "--demo"]),
             Ok(Command::Tui {
                 database: PathBuf::from(".orynth/runtime.db"),
+                explicit_database: false,
                 run: None,
                 demo: true,
+                workspace: None,
             })
         );
+        assert_eq!(
+            parse_args(["--db", "recorded.db"]),
+            Ok(Command::Tui {
+                database: PathBuf::from("recorded.db"),
+                explicit_database: true,
+                run: None,
+                demo: false,
+                workspace: None,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_probe_requires_an_actual_function_call_without_executing_it() {
+        let model = ModelRef::new("mock", "probe", ModelClass::Cheap);
+        let passing = MockProvider::new(model.clone(), "").with_tool_call(
+            "call-1",
+            "orynth_tool_probe",
+            r#"{"value":"ORYNTH_TOOLS_OK"}"#,
+        );
+        assert!(run_tool_probe(&passing, model.clone()).is_ok());
+        let text_only = MockProvider::new(model.clone(), "ORYNTH_TOOLS_OK");
+        assert!(run_tool_probe(&text_only, model).is_err());
     }
 
     #[test]
@@ -1235,7 +1913,7 @@ mod tests {
         assert!(recovered.events.len() > 10);
         assert_eq!(recovered.manager.agents.len(), 4);
         assert_eq!(recovered.assumptions.conflicts().len(), 1);
-        assert_eq!(recovered.messages.len(), 3);
+        assert_eq!(recovered.messages.len(), 5);
         assert_eq!(recovered.tools.records().len(), 1);
         assert!(recovered.context.block_count() > 0);
     }
@@ -1268,11 +1946,36 @@ mod tests {
         drop(store);
         let mut source = DbTuiSource::new(path.clone(), None);
         let catalog = source.snapshot().expect("catalog should recover");
-        assert!(catalog.selected.is_none());
+        assert_eq!(
+            catalog.selected.as_ref().map(|run| run.run_id),
+            Some(run_id)
+        );
         assert_eq!(catalog.runs[0].run_id, run_id);
         source.select_run(run_id).expect("run should select");
         let selected = source.snapshot().expect("selected run should recover");
         assert_eq!(selected.selected.expect("selected run").run_id, run_id);
+        assert_eq!(
+            source.cached_selected.as_ref().map(|cache| cache.1),
+            Some(1)
+        );
+        source
+            .snapshot()
+            .expect("unchanged run should reuse recovery");
+        assert_eq!(
+            source.cached_selected.as_ref().map(|cache| cache.1),
+            Some(1)
+        );
+        let mut store = SqliteEventStore::open(&path).expect("SQLite store should reopen");
+        store
+            .append(Event::new(run_id, EventKind::RunCompleted { run_id }))
+            .expect("completion should append");
+        drop(store);
+        let refreshed = source.snapshot().expect("changed run should recover");
+        assert_eq!(
+            source.cached_selected.as_ref().map(|cache| cache.1),
+            Some(2)
+        );
+        assert_eq!(refreshed.runs[0].status, "COMPLETED");
         let older = source
             .event_page(Some(2), 16)
             .expect("older event page should load");

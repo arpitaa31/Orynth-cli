@@ -876,6 +876,7 @@ fn validate_program_path(path: &Path) -> Result<(), PluginError> {
 }
 
 struct ProcessIsolation {
+    #[cfg(windows)]
     platform: platform_isolation::Handle,
 }
 
@@ -885,22 +886,40 @@ impl ProcessIsolation {
         policy: ProcessIsolationPolicy,
         memory_limit_bytes: u64,
     ) -> Result<Self, PluginError> {
-        let platform = platform_isolation::attach(child, policy, memory_limit_bytes)?;
-        Ok(Self { platform })
+        #[cfg(windows)]
+        {
+            let platform = platform_isolation::attach(child, policy, memory_limit_bytes)?;
+            Ok(Self { platform })
+        }
+        #[cfg(not(windows))]
+        {
+            platform_isolation::attach(child, policy, memory_limit_bytes)?;
+            Ok(Self {})
+        }
     }
 
     fn resume(&self, child: &Child) -> Result<(), PluginError> {
-        platform_isolation::resume(&self.platform, child)
+        #[cfg(windows)]
+        {
+            platform_isolation::resume(&self.platform, child)
+        }
+        #[cfg(not(windows))]
+        {
+            platform_isolation::resume(child)
+        }
     }
 
     fn close(&mut self) {
+        #[cfg(windows)]
         platform_isolation::close(&mut self.platform);
+        #[cfg(not(windows))]
+        platform_isolation::close();
     }
 }
 
 impl Drop for ProcessIsolation {
     fn drop(&mut self) {
-        platform_isolation::close(&mut self.platform);
+        self.close();
     }
 }
 
@@ -1117,13 +1136,11 @@ mod platform_isolation {
 mod platform_isolation {
     use super::*;
 
-    pub type Handle = ();
-
     pub fn attach(
         _child: &Child,
         policy: ProcessIsolationPolicy,
         _memory_limit_bytes: u64,
-    ) -> Result<Handle, PluginError> {
+    ) -> Result<(), PluginError> {
         if policy.require_containment {
             Err(PluginError::Invalid(
                 "OS process containment is unavailable on this platform",
@@ -1133,9 +1150,9 @@ mod platform_isolation {
         }
     }
 
-    pub fn close(_handle: &mut Handle) {}
+    pub fn close() {}
 
-    pub fn resume(_handle: &Handle, _child: &Child) -> Result<(), PluginError> {
+    pub fn resume(_child: &Child) -> Result<(), PluginError> {
         Ok(())
     }
 

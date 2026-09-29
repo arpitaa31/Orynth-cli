@@ -1,34 +1,85 @@
 # Orynth TUI design
 
 Phase F.3 introduces a chat-first Workspace as the primary interface. The
-Phase F.2 control room remains available as Advanced Debugger. Both are
-read-only presentations of authoritative runtime projections while durable
-Coordinator conversation support is being designed.
+Phase F.2 control room remains available as Advanced Debugger. Both render
+authoritative runtime projections. The runtime persists complete
+user/Coordinator turns in the run event log. Phase G adds preliminary live
+submission and streaming through an app-supplied data source; the widgets
+remain presentation-only.
 
-## Normal Workspace (in progress)
+## Normal Workspace
 
 The shell presents a Coordinator pane, AI Team sidebar, input area, header,
-and compact footer. On terminals at least 82 columns wide, the main pane gets
-75% of the width and the team gets 25%. On narrower terminals, team focus
-temporarily shows the team in the main area. Tiny terminals show a resize
-message.
+and compact footer. On wide terminals, the main pane gets about 75% of the
+width; at 72–103 columns the team gets a fixed 28 columns. On narrower
+terminals, team focus temporarily shows the team in the main area. Tiny
+terminals show a resize message. With no active run, the empty state uses
+the full width and points to `orynth --demo`.
 
 The main pane translates selected runtime events into deterministic
 coordination activity. Worker views provide Work, Conversation, Context,
 Tools, and Access tabs. The sidebar shows logical worker identity, role,
 lifecycle, health, and effective model. Conflicts open a plain-language
 overlay. Technical identifiers stay in Advanced Debugger.
+Access reads the actual capability leases and ownership projection. Lease
+resources and task scope are shown separately from the specialist's declared
+work scope; a missing network lease is stated plainly.
+Each recorded conflict or active failure is an individually selectable
+attention item. The compact sidebar shows the selected issue and its position
+among the current issues; Enter opens details from that exact runtime record.
 
-Focus rotates between input, team, and conversation with Tab/Shift-Tab.
-Up/Down select agents when the team has focus and scroll when conversation has
-focus. Enter opens a selected worker. Left/Right changes worker tabs. Esc
-returns to Coordinator. Ctrl+K opens implemented commands. `/debug` enters
-Advanced Debugger; Ctrl+W returns to Workspace.
+Focus rotates between input, team, and conversation with Tab/Shift-Tab. Team
+focus has a bright full border, a focused title, an instruction row, and a
+high-contrast selected row. Up/Down select agents or the issue when the team
+has focus and scroll when conversation has focus. Enter opens the selection.
+Ctrl+P opens a compact switcher derived from the recovered team; it includes
+Coordinator once and accepts arrows, Enter, and Esc. `/agent NAME` accepts a
+worker name and reports missing or invalid names without changing the view.
+`/coordinator` returns to the primary conversation. Left/Right changes worker
+tabs. Esc returns to Coordinator. Ctrl+B collapses the team. Ctrl+K opens
+implemented commands. `/debug` enters Advanced Debugger; `/runs` opens its run
+history. Ctrl+W returns to Workspace. The input remains usable while inspecting
+a worker; its title and placeholder say that messages still address the
+Coordinator. The demo is labeled **OFFLINE DEMO / MOCK MODE** in the header;
+free-form requests receive a deterministic warning that mock agents cannot
+execute new AI tasks. Input editing is Unicode-safe, with cursor movement,
+deletion, bounded local history, and terminal bracketed-paste support. Paste
+is inserted into the focused editor as one bounded, sanitized edit: embedded
+newlines remain editable input and never submit automatically. The Coordinator
+input grows to a bounded six-line viewport and keeps Enter as the explicit
+submit action. Bracketed-paste mode is restored on exit, and Orynth does not
+capture mouse selection.
 
-Natural-language submission remains unavailable offline because no durable
-Coordinator turn contract or provider is present. The UI explicitly reports
+The shell refreshes its source every two seconds. New runtime events show a
+notice when the conversation is scrolled up and keep its absolute wrapped-line
+offset until the user follows the bottom again. The Coordinator activity window
+grows with new events while pinned, up to its 128-event limit. PageUp requests
+older raw events through a bounded source page when the current window has too
+few coordination events. At the top of a full 128-item window, PageUp advances
+a sequence cursor into older activity; End returns to current activity. SQLite
+answers page requests with an indexed bounded query; the UI retains at most
+512 older raw events while moving the window backward. The rendered conversation
+starts with two recent activity items to keep the first screen legible and
+expands to at most 128 items when the user scrolls upward. The rendered window
+and team rows are bounded; the 10-agent sidebar scrolls around the
+selected agent. Runtime entities are formatted in the TUI presentation layer,
+using a shared semantic theme. No model, tool, or permission mutation happens
+in the UI.
+
+Natural-language submission remains unavailable offline because no provider
+is present. The UI explicitly reports
 that such text was not sent or recorded. Input history is local to the current
-session. This is an implementation gap, not a complete chat experience.
+session. This is an implementation gap, not a complete chat experience. The
+Coordinator pane combines durable user/Coordinator turns with a deterministic
+summary of recovered task, team, issue, and event state. Recorded worker IPC
+appears as read-only conversation.
+Fenced code in recorded turns or worker exchanges receives a restrained code
+rail and background; content remains plain text and wraps at the pane edge.
+The retained older-history window is finite, but the sequence cursor can move
+beyond it by replacing newer cached pages. Returning to live activity uses End;
+incremental recovery of a changed selected run remains open. Later
+provider streaming can update the same snapshot/projection boundary with a
+chunk contract referring to the starting turn event ID.
 
 ## Advanced Debugger (Phase F.2)
 

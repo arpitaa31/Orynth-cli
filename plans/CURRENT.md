@@ -1,6 +1,76 @@
 # Current Plan
 
-## Phase F.3: chat-first Workspace redesign - in progress
+## Phase G.5: durable multi-turn agent execution - in progress
+
+The live Coordinator and rooted worker now treat provider completions as model
+turn boundaries inside one durable agent task and run. Coordinator turns keep
+the same AgentId, preserve request context and tool results, execute usable
+actions on length, and perform bounded recovery for empty length turns.
+Worker turns apply the same length/action rule. Run request, scheduler token,
+tool, wall-clock, and consecutive-unproductive safeguards remain active.
+Full Phase H orchestration and live acceptance still require a later step.
+
+G1: OpenRouter Chat Completions SSE adapter, key handling, optional usage,
+resolved-model metadata, free-only model policy, and manual text/tool-call
+diagnostics are implemented. The release app suite runs offline HTTP/SSE text
+and fragmented function-call tests. The focused debug provider suite passes
+(23/23); release test execution is blocked by Windows Application Control
+(OS error 4551). Tests cover
+duplicate identical finish metadata, conflicting finish rejection, usage-only
+chunks before and after finish, repeated `[DONE]`, explicit multi-choice
+rejection, cumulative SSE payload limiting,
+prompt cancellation on a stalled body, and a total response deadline. The
+reported duplicate-finish shape has an offline sanitized fixture; its original
+live response body was not available in this environment. No live call was
+made because `OPENROUTER_API_KEY` is absent here.
+
+The process-isolation wrapper now stores its platform handle only on Windows;
+non-Windows attachment is checked without binding the unit result. Windows
+Job Object behavior is unchanged. The CI matrix still covers Ubuntu, Windows,
+and macOS. Windows fmt, workspace check, strict Clippy, and release build pass;
+the process-plugin library suite passes 7/7. Full workspace test executables
+are blocked by Application Control (OS error 4551), and only the Windows Rust
+target is installed locally.
+
+G2/G3/G4: The live Workspace streams Coordinator text, requires a typed
+`delegate_personal_site` proposal for the tiny website task, invokes one
+rooted worker through Orynth's capability, ownership, and typed-tool pipeline,
+records IPC assignment/handoff, and returns the verified worker result to
+Coordinator. Provider-turn completion leaves the logical Coordinator active
+for multi-turn chat and tool-result continuation (ADR-0071). A persisted
+twelve-request cap covers both agents in one live run. Offline Coordinator
+and worker integration tests cover consecutive turns, committed tool writes,
+and out-of-workspace rejection. Terminal run replay now closes any still-active
+Coordinator or worker while preserving each previously finished agent's result.
+The worker now records usage for each provider turn, shutdown is serialized
+with its verified file transaction, and the Coordinator handoff contains only
+verified file results. The release app library suite passes (20/20).
+Exact workspace check, warnings-denied Clippy, formatting, and the full release
+workspace build pass; its binary ran `help`, opened the offline demo, and exited
+cleanly via Ctrl+C. The latest all-features workspace test passed the app,
+agent, assumptions, and cache suites before Application Control blocked the
+CLI test executable (OS error 4551). Earlier release workspace test attempts also
+passed several suites before Application Control blocked generated test
+executables. The focused context, TUI, and runtime suites pass (19/19, 26/26,
+and 38/38).
+The exact debug all-features
+test command compiled but Application Control blocked its first test executable;
+the focused event-store release suite
+passes (62/62). The exact release build to the default output path passes on
+the current host.
+Next: run the manual connectivity, single-worker, Coordinator, restart, and
+replay acceptance sequence on a host with an API key and executable permission.
+
+## Phase F.3: chat-first Workspace redesign - offline retest build
+
+The user retest found that agent navigation was not discoverable. The focused
+follow-up adds an explicit team-focus footer, a bright focused team panel and
+selected row, Ctrl+P runtime-derived switcher, stricter `/agent NAME` handling,
+clear worker input wording, and a prominent offline mock-mode label and task
+warning. The release PTY sequence opened DB-02, returned to Coordinator,
+switched to SEC-03, then used `/agent AUTH-01` and `/coordinator`. The current
+focused TUI and app suites pass 26/26 and 9/9. Formatting and warnings-denied
+Clippy pass for the changed crates.
 
 Implemented an initial Workspace shell as the default `orynth` interface,
 with a 75/25 Coordinator and AI Team layout, responsive narrow mode,
@@ -8,11 +78,38 @@ worker Work/Conversation/Context/Tools/Access inspection, issue overlay,
 focus-aware input, local command palette and slash commands, and a transition
 to the preserved Advanced Debugger. Both modes use the same recovered run.
 
-Next: add an authoritative durable Coordinator conversation contract and
-runtime-backed input, improve demo conversation and worker activity, finish
-responsive/Unicode/scroll behavior, run two visual passes and full interaction
-walkthrough, measure Workspace RSS and first render, and complete required
-validation. Do not add a real provider or start Deep Audit #2.
+The offline demo now records a coherent Coordinator-to-worker and worker-to-worker
+IPC exchange. The first frame, empty run, 10-agent sidebar, Unicode input,
+issue selection, team collapse, and debugger run-history transition received
+two visual/interaction passes. A follow-up expands the bounded Coordinator
+activity window to 128 events on scroll, anchors scrolled-up content across new
+events, and makes every recorded conflict or active failure selectable. The
+focused TUI suite passes 26/26. The latest app, event-store, and runtime suites
+passed 9/9, 61/61, and 37/37. Windows Application Control intermittently
+blocked generated executables and the all-features workspace test (OS error 4551).
+Changed-crate Clippy and formatting pass. Workspace-wide Clippy is blocked by
+the host policy while loading a plugin-MCP dependency. Memory
+samples are recorded in `docs/BENCHMARK_RESULTS.md`.
+
+The current scrollback follow-up uses indexed bounded SQLite event pages and a
+bounded older-event cache in the Workspace. Run-list summaries no longer read
+each run's complete history. Unchanged selected runs reuse a cached recovered
+projection on idle refresh; changed runs still reconstruct their whole event
+stream. PageUp now advances a sequence cursor through older pages while
+keeping the cache bounded, and End returns to live activity. The Work tab
+now surfaces each agent's latest recorded exchange and active failure reason.
+
+ADR-0069 adds bounded, validated, durable user/Coordinator turns to the run
+event log. The demo records its request and a conflict-derived Coordinator
+summary through the runtime. SQLite reopen reconstructs the turns. Offline
+free-form input still reports unsent, and provider streaming remains out of
+scope for this phase.
+
+The full keyboard walkthrough and release demo render passed. Next: run the
+workspace-wide gates on a host that can execute all generated binaries and
+improve changed-run incremental projection before claiming the large-run
+performance goal.
+Do not add a real provider or start Deep Audit #2 in this phase.
 
 ## Phase 1: Foundation vertical slice - complete
 
