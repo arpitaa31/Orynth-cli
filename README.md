@@ -66,28 +66,36 @@ Reviewers/users should create their own OpenRouter key here:
 https://openrouter.ai/settings/keys
 
 1. Create your local config
-Copy-Item .\orynth.example.toml .\orynth.toml
+
+``Copy-Item .\orynth.example.toml .\orynth.toml``
 
 2. Add your OpenRouter key
 In the same PowerShell terminal:
-$env:OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
+
+``$env:OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"``
 
 Check that it is set:
-if ($env:OPENROUTER_API_KEY) { "KEY SET" } else { "KEY NOT SET" }
+
+``if ($env:OPENROUTER_API_KEY) { "KEY SET" } else { "KEY NOT SET" }``
 
 Never put the API key inside the repo or orynth.toml.
+
 3. Test the connection
-.\target\release\orynth.exe provider test openrouter --config .\orynth.toml
+
+``.\target\release\orynth.exe provider test openrouter --config .\orynth.toml``
 
 Optional tool-call test:
 .\target\release\orynth.exe provider tool-test openrouter --config .\orynth.toml
 
 4. Start a live workspace
+
 Orynth keeps coding work inside its sandbox directory.
-New-Item -ItemType Directory -Force .\sandbox\my-project
+
+``New-Item -ItemType Directory -Force .\sandbox\my-project``
 
 Then:
-.\target\release\orynth.exe --workspace .\sandbox\my-project
+
+``.\target\release\orynth.exe --workspace .\sandbox\my-project``
 
 You can now talk to the live Coordinator from the TUI.
 
@@ -103,5 +111,8 @@ Most AI tools make the model feel like the whole system.
 Orynth experiments with the opposite idea:
 keep the model replaceable and let the runtime own the important state.
 That's what I'm trying to build.
+
+# AI used for this project
+Around 20% of the times AI was used, to help me research the architecture, scaffold parts of the Rust workspace, implement, and identify issues.
 
 <img width="1288" height="527" alt="Screenshot 2026-09-29 192922" src="https://github.com/user-attachments/assets/b5b2816a-23cd-41db-b30d-36258fb353b3" />
