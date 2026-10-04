@@ -1,5 +1,19 @@
 # Status
 
+## Release patch: reviewer feedback in progress
+
+Live configuration now supports direct OpenRouter credentials with redacted
+diagnostics, explicit `--config` selection, configured-versus-resolved model
+presentation, a generic `spawn_agent` coding worker path, and live-turn
+interruption from Esc/Ctrl-C. The worker accepts ordinary files through the
+rooted filesystem tool and optional assigned-file scope. Focused CLI,
+provider, app, and TUI suites pass (20/20, 27/27, 47/47, and 54/54). All
+five required gates—formatting, workspace check, strict Clippy, all-features
+workspace tests, and release workspace build—now pass. The rebuilt release
+binary runs `help` and exposes `--config`. Earlier host-policy failures were
+intermittent and did not recur on the passing commands. Live acceptance A-D is
+pending a local OpenRouter key.
+
 ## Phase G.5: in progress
 
 The live Coordinator now owns a bounded multi-turn execution loop. A model
@@ -7,7 +21,7 @@ turn ending with `length` preserves visible output, executes any complete tool
 actions, and continues from the same logical agent/task context. Empty length
 turns use a bounded recovery policy; repeated unproductive turns stop with a
 sanitized diagnostic while preserving the Coordinator identity. The rooted
-website worker also accepts usable actions on length and continues bounded
+coding worker also accepts usable actions on length and continues bounded
 turns. Coordinator and worker requests share run-level request and scheduler
 budgets. Full multi-agent orchestration remains Phase H and is intentionally
 not started.
@@ -22,9 +36,9 @@ when reported, accepts reported usage, and classifies HTTP errors without
 exposing the bearer token. Manual text and function-call diagnostics are
 available through `provider test openrouter` and `provider tool-test openrouter`.
 Free-only model configuration exists. The live Workspace streams Coordinator
-turns, persists response and usage events, and delegates the tiny website task
+turns, persists response and usage events, and delegates bounded coding tasks
 to one rooted worker through Orynth's IPC, capability, ownership, and typed
-tool runtime. A persisted twelve-request cap covers both Coordinator and worker
+tool runtime. A persisted 48-request cap covers both Coordinator and worker
 calls in each live run. Reusable Coordinator turns record provider completion
 without terminating the logical agent; TUI shutdown persists a completed, failed, or
 cancelled run outcome. Replay now projects that terminal outcome onto agents

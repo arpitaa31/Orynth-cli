@@ -73,6 +73,22 @@ https://openrouter.ai/settings/keys
 In the same PowerShell terminal:
 
 ``$env:OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"``
+The easiest local setup is to put it in `orynth.toml`:
+
+```toml
+[providers.openrouter]
+api_key = "YOUR_OPENROUTER_API_KEY"
+```
+
+Or use the environment-variable option:
+
+```toml
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+```
+
+With the second option, in the same PowerShell terminal:
+$env:OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
 
 Check that it is set:
 
@@ -80,6 +96,7 @@ Check that it is set:
 
 Never put the API key inside the repo or orynth.toml.
 
+`orynth.toml` is gitignored; never commit it with a real key.
 3. Test the connection
 
 ``.\target\release\orynth.exe provider test openrouter --config .\orynth.toml``
@@ -96,6 +113,7 @@ Orynth keeps coding work inside its sandbox directory.
 Then:
 
 ``.\target\release\orynth.exe --workspace .\sandbox\my-project``
+.\target\release\orynth.exe --config .\orynth.toml --workspace .\sandbox\my-project
 
 You can now talk to the live Coordinator from the TUI.
 
@@ -103,7 +121,9 @@ You can now talk to the live Coordinator from the TUI.
 Orynth is still in experimental condition.
 
 The main unfinished part rn is fully reliable multi-agent orchestration. The runtime already has agent, IPC, context, ownership and coordination foundations, but automatic Coordinator → multiple specialist agent delegation is still being improved.
-Also, openrouter/free can select different underlying models between requests, so live behavior can vary.
+Also, `openrouter/free` can select different underlying models between requests,
+so live behavior can vary. The TUI labels the TOML value as `Configured` and
+OpenRouter's response as `Resolved`.
 I'd rather ship the actual current state than pretend those parts are finished.
 
 # Why Orynth?
@@ -116,3 +136,4 @@ That's what I'm trying to build.
 Around 20% of the times AI was used, to help me research the architecture, scaffold parts of the Rust workspace, implement, and identify issues.
 
 <img width="1288" height="527" alt="Screenshot 2026-09-29 192922" src="https://github.com/user-attachments/assets/b5b2816a-23cd-41db-b30d-36258fb353b3" />
+

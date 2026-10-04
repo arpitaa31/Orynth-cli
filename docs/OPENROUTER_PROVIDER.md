@@ -15,7 +15,9 @@ proposals; Orynth validates and executes them locally.
 ## Setup and configuration
 
 Create a key in the [OpenRouter dashboard](https://openrouter.ai/settings/keys).
-Set it in the current PowerShell session:
+The simplest local setup is `api_key = "YOUR_KEY"` in the gitignored
+`orynth.toml`. Alternatively, set `api_key_env = "OPENROUTER_API_KEY"` and
+provide that variable in the current PowerShell session:
 
 ```powershell
 $env:OPENROUTER_API_KEY="sk-or-v1-..."
@@ -23,8 +25,10 @@ $env:OPENROUTER_API_KEY="sk-or-v1-..."
 
 Copy `orynth.example.toml` to `orynth.toml`. The example enables
 `[providers.openrouter]`, sets the HTTPS base URL
-`https://openrouter.ai/api/v1`, references `OPENROUTER_API_KEY`, and assigns
-`openrouter/free` to Coordinator and worker. No key value belongs in TOML.
+`https://openrouter.ai/api/v1`, references either a direct `api_key` or the
+configured `api_key_env`, and assigns
+`openrouter/free` to Coordinator and worker. Never commit a real key or
+`orynth.toml`.
 `free_only = true` rejects model IDs other than `openrouter/free` or a slug
 ending in `:free`. With `free_only = false`, explicit OpenRouter model slugs are
 allowed, but the user must change that setting deliberately. Orynth sends no
@@ -69,16 +73,17 @@ tool-call responses without executing a tool, before the website test.
 
 ## Security and data routing
 
-The key is loaded from the environment. It is not logged, persisted as an
+The direct TOML key takes precedence over the named environment variable. It is not logged, persisted as an
 event, shown in the debugger, or included in HTTP error text. Coding writes
 use the existing rooted `FilesystemFixture` through `ToolRuntime` after schema,
 capability, ownership, and policy checks. Live coding workspaces must be
 selected below the repository's approved `sandbox` root; the selected
 workspace becomes the filesystem tool root.
-For the user-requested tiny site only, Orynth's policy approves the existing
-confirm-risk write after preview, within a fixed allowlist of `index.html` and
-`styles.css`, a 4 KiB per-file limit, and a no-overwrite rule. The model cannot
-grant itself a broader capability or approve another tool.
+For bounded coding tasks, Orynth's policy approves the existing confirm-risk
+write after preview. Workers may write ordinary files below the selected
+workspace, with an optional assigned-file allowlist and a 16 KiB per-file
+limit. The model cannot grant itself a broader capability or approve another
+tool.
 
 Prompts and projected context sent to OpenRouter leave the local machine and
 are processed through OpenRouter and the selected underlying model provider.
@@ -92,6 +97,6 @@ selected provider's policy before sharing sensitive project context.
 
 No API key is available in automated tests. The live diagnostic is manual.
 `openrouter/free` has changing capacity and rate limits. The current app
-supports one Coordinator and one narrow website worker, plus a manual
-single-worker `provider site-test openrouter` command. It has no general
+supports one Coordinator and one bounded generic coding worker per run, plus a
+manual single-worker `provider site-test openrouter` command. It has no general
 autonomous team planner. See [Phase G test procedure](PHASE_G_REAL_MODEL_TEST.md).

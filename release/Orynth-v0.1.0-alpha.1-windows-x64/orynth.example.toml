@@ -1,0 +1,40 @@
+[runtime]
+max_concurrent_agents = 6
+event_store = ".orynth/runtime.db"
+artifact_dir = ".orynth/artifacts"
+
+[providers.openrouter]
+enabled = true
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+free_only = true
+title = "Orynth"
+
+# The free router selects a compatible free model for each request.
+# For a pinned free model, use an OpenRouter slug ending in :free.
+[models.coordinator]
+provider = "openrouter"
+model = "openrouter/free"
+class = "strong"
+
+[models.worker]
+provider = "openrouter"
+model = "openrouter/free"
+class = "economy"
+
+[scheduler]
+mode = "economy"
+prefer_warm_cache = true
+promote_after_failures = 3
+
+[context]
+semantic_invalidation = true
+subscriptions = true
+
+[security]
+default_network = "deny"
+
+[plugins]
+process = true
+mcp = true
+wasm = false

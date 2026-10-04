@@ -111,17 +111,17 @@ fn legacy_stdio_session_round_trips_through_mcp_adapter() {
     )
     .unwrap();
     let session = match transport.connect(
-            McpProtocolMode::Legacy2025,
-            client(),
-            server(),
-            McpConnectionContext {
-                policy: &policy(agent_id, &program),
-                ownership: &AllowAllOwnership,
-                agent_id,
-                task_id: None,
-                now_ms: 1,
-            },
-        ) {
+        McpProtocolMode::Legacy2025,
+        client(),
+        server(),
+        McpConnectionContext {
+            policy: &policy(agent_id, &program),
+            ownership: &AllowAllOwnership,
+            agent_id,
+            task_id: None,
+            now_ms: 1,
+        },
+    ) {
         Ok(session) => session,
         Err(error) if is_unsupported_process_containment(&error) => {
             eprintln!("skipping stdio containment test: {error}");
@@ -162,17 +162,17 @@ fn modern_stdio_session_adds_per_request_metadata_without_legacy_handshake() {
     )
     .unwrap();
     let session = match transport.connect(
-            McpProtocolMode::Modern2026,
-            client(),
-            server(),
-            McpConnectionContext {
-                policy: &policy(agent_id, &program),
-                ownership: &AllowAllOwnership,
-                agent_id,
-                task_id: None,
-                now_ms: 1,
-            },
-        ) {
+        McpProtocolMode::Modern2026,
+        client(),
+        server(),
+        McpConnectionContext {
+            policy: &policy(agent_id, &program),
+            ownership: &AllowAllOwnership,
+            agent_id,
+            task_id: None,
+            now_ms: 1,
+        },
+    ) {
         Ok(session) => session,
         Err(error) if is_unsupported_process_containment(&error) => {
             eprintln!("skipping stdio containment test: {error}");

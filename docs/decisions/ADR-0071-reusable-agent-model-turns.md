@@ -20,7 +20,7 @@ absent usage remains absent from the turn event.
 The new event tags are additive in the filesystem and SQLite codecs and are
 valid only while the agent is running. The Workspace presents turn outcomes
 without claiming that the logical agent finished.
-The bounded site worker also records each finished provider request as a turn.
+The bounded coding worker also records each finished provider request as a turn.
 That preserves reported usage from an earlier request if a later tool step or
 model continuation fails. Its final terminal model event retains the aggregate
 usage when reported, so the agent projection does not double count it.

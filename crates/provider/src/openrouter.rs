@@ -38,11 +38,17 @@ impl OpenRouterProvider {
         base_url: &str,
         title: Option<String>,
     ) -> Result<Self, ProviderError> {
-        let key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-            ProviderError::Failed(
-                "OpenRouter is configured but OPENROUTER_API_KEY is not set".into(),
-            )
-        })?;
+        Self::from_config(model, None, Some("OPENROUTER_API_KEY"), base_url, title)
+    }
+
+    pub fn from_config(
+        model: ModelRef,
+        configured_key: Option<&str>,
+        key_env: Option<&str>,
+        base_url: &str,
+        title: Option<String>,
+    ) -> Result<Self, ProviderError> {
+        let key = resolve_api_key(configured_key, key_env, |name| std::env::var(name))?;
         Self::new(model, key, base_url, title)
     }
 
@@ -58,7 +64,7 @@ impl OpenRouterProvider {
             ));
         }
         if api_key.trim().is_empty() {
-            return Err(ProviderError::Failed("OPENROUTER_API_KEY is empty".into()));
+            return Err(ProviderError::Failed("OpenRouter API key is empty".into()));
         }
         if !(base_url.starts_with("https://")
             || base_url.starts_with("http://127.0.0.1:")
@@ -87,6 +93,27 @@ impl OpenRouterProvider {
             title,
         })
     }
+}
+
+fn resolve_api_key(
+    configured_key: Option<&str>,
+    key_env: Option<&str>,
+    read_env: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+) -> Result<String, ProviderError> {
+    configured_key
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            key_env
+                .filter(|name| !name.trim().is_empty())
+                .and_then(|name| read_env(name).ok())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            ProviderError::Failed(
+                "OpenRouter credentials are missing: set api_key or api_key_env".into(),
+            )
+        })
 }
 
 impl ModelProvider for OpenRouterProvider {
@@ -595,6 +622,53 @@ mod tests {
     fn model() -> ModelRef {
         ModelRef::new("openrouter", "openrouter/free", ModelClass::Cheap)
     }
+
+    #[test]
+    fn configured_key_has_precedence_and_missing_credentials_are_redacted() {
+        let provider = OpenRouterProvider::from_config(
+            model(),
+            Some("direct-test-secret"),
+            Some("ORYNTH_MISSING_TEST_KEY"),
+            "http://127.0.0.1:1",
+            None,
+        )
+        .expect("direct key should be accepted");
+        assert_eq!(provider.api_key, "direct-test-secret");
+        let missing = OpenRouterProvider::from_config(
+            model(),
+            None,
+            Some("ORYNTH_MISSING_TEST_KEY"),
+            "http://127.0.0.1:1",
+            None,
+        )
+        .err()
+        .expect("missing credentials should fail");
+        assert_eq!(
+            missing.to_string(),
+            "provider failed: OpenRouter credentials are missing: set api_key or api_key_env"
+        );
+    }
+
+    #[test]
+    fn named_environment_fallback_is_used_only_without_a_direct_key() {
+        let direct = resolve_api_key(Some("direct-key"), Some("CUSTOM_OPENROUTER_KEY"), |_| {
+            panic!("environment must not be read with a direct key")
+        })
+        .unwrap();
+        assert_eq!(direct, "direct-key");
+        let fallback = resolve_api_key(Some(""), Some("CUSTOM_OPENROUTER_KEY"), |name| {
+            assert_eq!(name, "CUSTOM_OPENROUTER_KEY");
+            Ok("fallback-key".into())
+        })
+        .unwrap();
+        assert_eq!(fallback, "fallback-key");
+        let missing = resolve_api_key(None, None, |_| panic!("no env is configured"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(missing.contains("set api_key or api_key_env"));
+        assert!(!missing.contains("direct-key"));
+    }
     fn request() -> ModelRequest {
         ModelRequest::new(
             RunId::from_u64(1),
@@ -604,6 +678,22 @@ mod tests {
             "hello",
         )
     }
+
+    #[test]
+    fn explicit_configured_model_is_sent_without_free_route_substitution() {
+        let explicit = ModelRef::new("openrouter", "google/explicit-model", ModelClass::Strong);
+        let request = ModelRequest::new(
+            RunId::from_u64(1),
+            TaskId::from_u64(2),
+            AgentId::from_u64(3),
+            explicit,
+            "hello",
+        );
+        let payload = encode_request(&request).unwrap();
+        assert_eq!(payload["model"], "google/explicit-model");
+        assert_ne!(payload["model"], "openrouter/free");
+    }
+
     fn serve(
         status: &str,
         body: impl Into<String>,

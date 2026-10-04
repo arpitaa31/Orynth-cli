@@ -1,6 +1,6 @@
 use std::{
-    collections::BTreeMap,
-    path::Path,
+    collections::{BTreeMap, BTreeSet},
+    path::{Component, Path},
     sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,27 +25,26 @@ use orynth_tool_runtime::{
 
 use super::ensure_provider_request_budget;
 
-const MAX_WORKER_CALLS: usize = 4;
-const MAX_WORKER_REQUESTS: usize = 4;
+const MAX_WORKER_CALLS: usize = 12;
+const MAX_WORKER_REQUESTS: usize = 8;
 const MAX_UNPRODUCTIVE_TURNS: usize = 3;
 const MAX_TURN_RETRIES: usize = 2;
 const WIRE_WRITE_TOOL: &str = "filesystem_write_text";
-
-pub(super) fn small_site_task(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    (lower.contains("website") || lower.contains("web page") || lower.contains("webpage"))
-        && (lower.contains("make ") || lower.contains("create ") || lower.contains("build "))
-}
 
 pub(super) struct WorkerTask<'a> {
     pub run_id: RunId,
     pub task_id: TaskId,
     pub coordinator_id: AgentId,
     pub model: ModelRef,
+    pub agent_name: String,
+    pub role: String,
     pub base_url: &'a str,
+    pub api_key: Option<&'a str>,
+    pub api_key_env: Option<&'a str>,
     pub title: Option<String>,
     pub workspace: &'a Path,
     pub user_text: &'a str,
+    pub owned_files: Vec<String>,
     pub cancellation: CancellationToken,
     pub effect_gate: Arc<Mutex<()>>,
 }
@@ -54,13 +53,18 @@ pub(super) fn run(
     service: &mut RuntimeService<SqliteEventStore>,
     task: WorkerTask<'_>,
 ) -> Result<(String, Usage), String> {
-    let provider =
-        OpenRouterProvider::from_env(task.model.clone(), task.base_url, task.title.clone())
-            .map_err(|error| error.to_string())?;
+    let provider = OpenRouterProvider::from_config(
+        task.model.clone(),
+        task.api_key,
+        task.api_key_env,
+        task.base_url,
+        task.title.clone(),
+    )
+    .map_err(|error| error.to_string())?;
     run_with_provider(service, task, &provider)
 }
 
-fn run_with_provider(
+pub(super) fn run_with_provider(
     service: &mut RuntimeService<SqliteEventStore>,
     task: WorkerTask<'_>,
     provider: &dyn ModelProvider,
@@ -70,24 +74,26 @@ fn run_with_provider(
         task_id,
         coordinator_id,
         model,
+        agent_name,
+        role,
         base_url,
+        api_key: _api_key,
+        api_key_env: _api_key_env,
         title,
         workspace,
         user_text,
+        owned_files,
         cancellation,
         effect_gate,
     } = task;
     if cancellation.is_cancelled() {
         return Err("worker cancelled".into());
     }
-    let child = AgentIdentity::new(
-        "SITE-01",
-        "Create a tiny personal site in the selected workspace",
-        model.clone(),
-    );
+    let child = AgentIdentity::new(&agent_name, &role, model.clone());
     service
         .spawn_agent(run_id, coordinator_id, child.clone())
         .map_err(|error| error.to_string())?;
+    let mut request_in_flight = false;
     let result = (|| {
         service
             .send_message(
@@ -97,7 +103,7 @@ fn run_with_provider(
                     coordinator_id,
                     child.id,
                     IpcMessage::ReviewRequest {
-                        subject: "tiny personal website".into(),
+                        subject: role.clone(),
                         instructions: user_text.into(),
                     },
                 )
@@ -131,7 +137,19 @@ fn run_with_provider(
             .map_err(|error| error.to_string())?;
         let mut fixture = FilesystemFixture::new(workspace).map_err(|error| error.to_string())?;
         let _ = (base_url, title);
-        let system = "You are SITE-01, an Orynth coding worker. Create a tiny personal website using only the filesystem_write_text tool. Files must be index.html and optionally styles.css in the current workspace. Use no external resources, shell, scripts, or hosted tools. Keep each file under 4 KiB. After writing, give a short factual summary.";
+        let owned_files = owned_files.into_iter().collect::<BTreeSet<_>>();
+        let file_scope = if owned_files.is_empty() {
+            "You may write ordinary files in the selected workspace.".to_owned()
+        } else {
+            format!(
+                "Write all of these assigned files before the final summary, and no others: {}.",
+                owned_files.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        let system = format!(
+            "You are {}, an Orynth coding worker with role {}. Complete the assigned coding task using only the filesystem_write_text tool in the selected workspace. {file_scope} No shell or hosted tools are available. Keep each file under 16 KiB. Parent directories must already exist. After writing, give a short factual summary.",
+            child.name, child.mission
+        );
         let recovered = service.recover(run_id).map_err(|error| error.to_string())?;
         let projected = recovered.context.project(
             ContextPrincipal::Agent(child.id),
@@ -146,23 +164,27 @@ fn run_with_provider(
             .iter()
             .map(|entry| entry.block.reference())
             .collect();
-        let context_prompt = recovered.context.render_prompt(
-            ContextPrincipal::Agent(child.id),
-            &[PromptLayer::stable("worker context", references)],
-            &format!(
-                "Runtime facts: selected coding workspace is {}; only index.html and styles.css may be written.",
-                workspace.display()
-            ),
-        ).map_err(|error| error.to_string())?;
+        let context_prompt = recovered
+            .context
+            .render_prompt(
+                ContextPrincipal::Agent(child.id),
+                &[PromptLayer::stable("worker context", references)],
+                &format!(
+                    "Runtime facts: selected coding workspace is {}. Assigned task: {}. {file_scope}",
+                    workspace.display(),
+                    user_text
+                ),
+            )
+            .map_err(|error| error.to_string())?;
         let mut next_parts = vec![
-            RequestPart::System(system.into()),
+            RequestPart::System(system),
             RequestPart::System(context_prompt.text),
             RequestPart::User(user_text.into()),
         ];
         let mut total_usage = Usage::default();
         let mut saw_usage = false;
         let mut tool_count = 0usize;
-        let mut wrote_index = false;
+        let mut verified_files = Vec::new();
         let mut unproductive_turns = 0usize;
         let started = Instant::now();
         let mut final_text = String::new();
@@ -176,7 +198,7 @@ fn run_with_provider(
             let mut request = ModelRequest::new(run_id, task_id, child.id, model.clone(), "");
             request.parts = next_parts.clone();
             request.max_output_tokens = Some(2048);
-            if !wrote_index {
+            if verified_files.is_empty() {
                 request.tool_choice = ToolChoice::Required;
             }
             request.tools = vec![ProviderToolDefinition {
@@ -194,6 +216,7 @@ fn run_with_provider(
                     },
                 )
                 .map_err(|error| error.to_string())?;
+            request_in_flight = true;
             let stream = worker_stream_with_retry(provider, request, cancellation.clone())?;
             let mut calls = Vec::new();
             let mut chunk_index = 0u32;
@@ -201,6 +224,9 @@ fn run_with_provider(
             let mut finish = None;
             let mut text = String::new();
             for item in stream {
+                if cancellation.is_cancelled() {
+                    return Err("worker cancelled".into());
+                }
                 match item.map_err(|error| error.to_string())? {
                     ProviderEvent::TextDelta { text: delta } => {
                         if text.len().saturating_add(delta.len()) > 16 * 1024 {
@@ -259,6 +285,7 @@ fn run_with_provider(
                     },
                 )
                 .map_err(|error| error.to_string())?;
+            request_in_flight = false;
             service
                 .record_model_transition(
                     run_id,
@@ -350,29 +377,14 @@ fn run_with_provider(
                     .map_err(|_| "worker supplied invalid tool JSON")?;
                 let path = args["path"].as_str().ok_or("tool path missing")?;
                 let content = args["content"].as_str().ok_or("tool content missing")?;
-                if !matches!(path, "index.html" | "styles.css") {
-                    return Err("worker may write only index.html or styles.css".into());
+                validate_worker_path(path)?;
+                if !owned_files.is_empty() && !owned_files.contains(path) {
+                    return Err(format!(
+                        "worker file is outside assigned file scope: {path}"
+                    ));
                 }
-                if content.len() > 4096 || content.is_empty() {
+                if content.len() > 16 * 1024 || content.is_empty() {
                     return Err("worker file content is empty or too large".into());
-                }
-                let lower_content = content.to_ascii_lowercase();
-                if path == "index.html"
-                    && (!content.contains("Arpi") || !lower_content.contains("<p"))
-                {
-                    return Err("index.html must contain Arpi and a paragraph".into());
-                }
-                if lower_content.contains("<script")
-                    || lower_content.contains("<iframe")
-                    || lower_content.contains("https://")
-                    || lower_content.contains("http://")
-                    || lower_content.contains("@import")
-                    || lower_content.contains("url(")
-                {
-                    return Err("personal site must not need external resources or scripts".into());
-                }
-                if fixture.root().join(path).exists() {
-                    return Err(format!("{path} already exists; refusing overwrite"));
                 }
                 service
                     .claim_ownership(run_id, child.id, path)
@@ -477,19 +489,30 @@ fn run_with_provider(
                         },
                     )
                     .map_err(|error| error.to_string())?;
-                if path == "index.html" {
-                    wrote_index = true;
+                if !verified_files.iter().any(|file| file == path) {
+                    verified_files.push(path.to_owned());
                 }
                 tool_count += 1;
                 next_parts.push(RequestPart::ToolResult {
                     call_id: call.call_id,
-                    content: format!("Created and verified {path} in Orynth workspace"),
+                    content: format!("Wrote and verified {path} in Orynth workspace"),
                     is_error: false,
                 });
             }
         }
-        if !wrote_index {
-            return Err("worker did not create index.html".into());
+        if verified_files.is_empty() {
+            return Err("worker did not write any files".into());
+        }
+        let missing = owned_files
+            .iter()
+            .filter(|file| !verified_files.iter().any(|written| written == *file))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "worker did not write assigned files: {}",
+                missing.join(", ")
+            ));
         }
         if final_text.trim().is_empty() {
             return Err("worker did not provide a final summary".into());
@@ -523,13 +546,9 @@ fn run_with_provider(
                 .map_err(|error| error.to_string())?;
         }
         let summary = format!(
-            "Worker created and verified {} file(s) in the selected Orynth workspace: index.html{}.",
-            tool_count,
-            if fixture.root().join("styles.css").exists() {
-                ", styles.css"
-            } else {
-                ""
-            },
+            "Worker wrote and verified {} file(s) in the selected Orynth workspace: {}.",
+            verified_files.len(),
+            verified_files.join(", ")
         );
         service
             .send_message(IpcEnvelope::new(
@@ -545,6 +564,12 @@ fn run_with_provider(
         Ok((summary, total_usage))
     })();
     if let Err(message) = &result {
+        if cancellation.is_cancelled() && request_in_flight {
+            let _ = service.record_model_transition(
+                run_id,
+                EventKind::ModelTurnCancelled { agent_id: child.id },
+            );
+        }
         let kind = if cancellation.is_cancelled() {
             EventKind::ModelCancelled { agent_id: child.id }
         } else {
@@ -563,6 +588,24 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+pub(super) fn validate_worker_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > 240 || path.contains('\0') {
+        return Err("worker file path is empty or invalid".into());
+    }
+    let candidate = Path::new(path);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || candidate.components().any(|component| {
+            matches!(component, Component::Normal(name) if name == ".orynth" || name == ".orynth-quarantine")
+        })
+    {
+        return Err("worker file path must stay inside the selected workspace".into());
+    }
+    Ok(())
 }
 
 fn worker_stream_with_retry(
@@ -769,10 +812,15 @@ mod tests {
                 task_id,
                 coordinator_id,
                 model,
+                agent_name: "WORKER-01".into(),
+                role: "Bounded coding specialist".into(),
                 base_url: "",
+                api_key: None,
+                api_key_env: Some("OPENROUTER_API_KEY"),
                 title: None,
                 workspace: &root,
                 user_text: "Make a simple personal website for Arpi",
+                owned_files: Vec::new(),
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -798,10 +846,10 @@ mod tests {
             .manager
             .agents
             .values()
-            .find(|agent| agent.name == "SITE-01")
+            .find(|agent| agent.name == "WORKER-01")
             .unwrap();
         assert!(worker.owned_resources.contains(&"index.html".to_owned()));
-        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, IpcMessage::Handoff { summary } if summary.contains("created and verified") && !summary.contains("deployed"))));
+        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, IpcMessage::Handoff { summary } if summary.contains("wrote and verified") && !summary.contains("deployed"))));
         drop(service);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -829,10 +877,15 @@ mod tests {
                 task_id,
                 coordinator_id,
                 model,
+                agent_name: "WORKER-01".into(),
+                role: "Bounded coding specialist".into(),
                 base_url: "",
+                api_key: None,
+                api_key_env: Some("OPENROUTER_API_KEY"),
                 title: None,
                 workspace: &root,
                 user_text: "Make a simple personal website for Arpi",
+                owned_files: Vec::new(),
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -841,6 +894,247 @@ mod tests {
         assert!(result.is_err());
         assert!(!root.parent().unwrap().join("outside.html").exists());
         assert!(service.recover(run_id).unwrap().tools.records().is_empty());
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generic_editor_worker_writes_assigned_files_with_real_identity_and_ipc() {
+        let (mut service, run_id, task_id, coordinator_id, root) = seeded_service("editor");
+        let model = ModelRef::new("mock", "editor", ModelClass::Cheap);
+        let files = [
+            (
+                "index.html",
+                "<main><aside>Files</aside><nav>Tabs</nav><div id=\"editor\"></div></main>",
+            ),
+            ("styles.css", "body { background: #161616; color: white; }"),
+            (
+                "editor.js",
+                "document.querySelector('#editor').textContent = 'VS Code-like editor';",
+            ),
+            (
+                "README.md",
+                "Browser editor with file sidebar, tabs, and dark styling.",
+            ),
+        ];
+        let calls = files.iter().enumerate().map(|(index, (path, content))| {
+            ProviderEvent::ToolCallCompleted {
+                call: ToolCall {
+                    call_id: format!("call-{index}"),
+                    name: WIRE_WRITE_TOOL.into(),
+                    arguments: serde_json::json!({"path": path, "content": content}).to_string(),
+                },
+            }
+        });
+        let provider = SequenceProvider {
+            model: model.clone(),
+            scripts: Mutex::new(VecDeque::from([
+                calls
+                    .chain([ProviderEvent::Finish(FinishReason::ToolCall)])
+                    .collect(),
+                vec![
+                    ProviderEvent::TextDelta {
+                        text: "Implementation done".into(),
+                    },
+                    ProviderEvent::Finish(FinishReason::Stop),
+                ],
+            ])),
+        };
+        let task = "Build a browser-based VS Code-like editor";
+        let (summary, _) = run_with_provider(
+            &mut service,
+            WorkerTask {
+                run_id,
+                task_id,
+                coordinator_id,
+                model,
+                agent_name: "EDITOR-01".into(),
+                role: "Browser editor specialist".into(),
+                base_url: "",
+                api_key: None,
+                api_key_env: None,
+                title: None,
+                workspace: &root,
+                user_text: task,
+                owned_files: files.iter().map(|(path, _)| (*path).to_owned()).collect(),
+                cancellation: CancellationToken::new(),
+                effect_gate: Arc::new(Mutex::new(())),
+            },
+            &provider,
+        )
+        .unwrap();
+        for (path, content) in files {
+            assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), content);
+            assert!(summary.contains(path));
+        }
+        let recovered = service.recover(run_id).unwrap();
+        let worker = recovered
+            .manager
+            .agents
+            .values()
+            .find(|agent| agent.name == "EDITOR-01")
+            .unwrap();
+        assert_ne!(worker.agent_id, coordinator_id);
+        assert_eq!(worker.parent_id, Some(coordinator_id));
+        assert!(recovered.events.iter().any(|stored| matches!(&stored.event.kind, EventKind::AgentCreated { agent } if agent.id == worker.agent_id)));
+        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, IpcMessage::ReviewRequest { instructions, .. } if instructions == task)));
+        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, IpcMessage::Handoff { summary: handoff } if handoff == &summary)));
+        assert_eq!(
+            recovered
+                .tools
+                .records()
+                .values()
+                .filter(|record| record.state == ToolState::Committed)
+                .count(),
+            4
+        );
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generic_worker_rejects_files_outside_its_assignment() {
+        let (mut service, run_id, task_id, coordinator_id, root) = seeded_service("assigned-scope");
+        let model = ModelRef::new("mock", "editor", ModelClass::Cheap);
+        let provider = SequenceProvider {
+            model: model.clone(),
+            scripts: Mutex::new(VecDeque::from([vec![
+                ProviderEvent::ToolCallCompleted {
+                    call: ToolCall {
+                        call_id: "call-1".into(),
+                        name: WIRE_WRITE_TOOL.into(),
+                        arguments: serde_json::json!({"path":"editor.js","content":"alert('hi')"})
+                            .to_string(),
+                    },
+                },
+                ProviderEvent::Finish(FinishReason::ToolCall),
+            ]])),
+        };
+        let result = run_with_provider(
+            &mut service,
+            WorkerTask {
+                run_id,
+                task_id,
+                coordinator_id,
+                model,
+                agent_name: "EDITOR-01".into(),
+                role: "Editor specialist".into(),
+                base_url: "",
+                api_key: None,
+                api_key_env: None,
+                title: None,
+                workspace: &root,
+                user_text: "Write index.html",
+                owned_files: vec!["index.html".into()],
+                cancellation: CancellationToken::new(),
+                effect_gate: Arc::new(Mutex::new(())),
+            },
+            &provider,
+        );
+        assert!(matches!(result, Err(error) if error.contains("outside assigned file scope")));
+        assert!(!root.join("editor.js").exists());
+        assert!(service.recover(run_id).unwrap().tools.records().is_empty());
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_after_a_verified_write_preserves_the_committed_effect() {
+        struct CancelSecondRequest {
+            model: ModelRef,
+            requests: AtomicU64,
+        }
+        impl ModelProvider for CancelSecondRequest {
+            fn model(&self) -> &ModelRef {
+                &self.model
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                orynth_provider::MockProvider::new(self.model.clone(), "").capabilities()
+            }
+            fn stream(
+                &self,
+                request: ModelRequest,
+                cancellation: CancellationToken,
+            ) -> Result<
+                Box<dyn Iterator<Item = Result<ProviderEvent, ProviderError>> + Send>,
+                ProviderError,
+            > {
+                self.validate_request(&request)?;
+                if self.requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let call = ToolCall {
+                        call_id: "write-1".into(),
+                        name: WIRE_WRITE_TOOL.into(),
+                        arguments: serde_json::json!({"path":"README.md","content":"Committed before cancellation"}).to_string(),
+                    };
+                    Ok(Box::new(
+                        vec![
+                            Ok(ProviderEvent::ToolCallCompleted { call }),
+                            Ok(ProviderEvent::Finish(FinishReason::ToolCall)),
+                        ]
+                        .into_iter(),
+                    ))
+                } else {
+                    cancellation.cancel();
+                    Err(ProviderError::Cancelled)
+                }
+            }
+        }
+        let (mut service, run_id, task_id, coordinator_id, root) =
+            seeded_service("cancel-after-write");
+        let model = ModelRef::new("mock", "writer", ModelClass::Cheap);
+        let provider = CancelSecondRequest {
+            model: model.clone(),
+            requests: AtomicU64::new(0),
+        };
+        let token = CancellationToken::new();
+        let result = run_with_provider(
+            &mut service,
+            WorkerTask {
+                run_id,
+                task_id,
+                coordinator_id,
+                model,
+                agent_name: "DOC-01".into(),
+                role: "Documentation specialist".into(),
+                base_url: "",
+                api_key: None,
+                api_key_env: None,
+                title: None,
+                workspace: &root,
+                user_text: "Write README",
+                owned_files: vec!["README.md".into()],
+                cancellation: token.clone(),
+                effect_gate: Arc::new(Mutex::new(())),
+            },
+            &provider,
+        );
+        assert!(result.is_err());
+        assert!(token.is_cancelled());
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "Committed before cancellation"
+        );
+        let recovered = service.recover(run_id).unwrap();
+        assert!(
+            recovered
+                .tools
+                .records()
+                .values()
+                .any(|record| record.state == ToolState::Committed)
+        );
+        assert!(
+            recovered
+                .events
+                .iter()
+                .any(|stored| matches!(stored.event.kind, EventKind::ModelTurnCancelled { .. }))
+        );
+        let worker = recovered
+            .manager
+            .agents
+            .values()
+            .find(|agent| agent.name == "DOC-01")
+            .unwrap();
+        assert_eq!(worker.status, orynth_event_store::AgentStatus::Cancelled);
         drop(service);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -878,10 +1172,15 @@ mod tests {
                 task_id,
                 coordinator_id,
                 model,
+                agent_name: "WORKER-01".into(),
+                role: "Bounded coding specialist".into(),
                 base_url: "",
+                api_key: None,
+                api_key_env: Some("OPENROUTER_API_KEY"),
                 title: None,
                 workspace: &root,
                 user_text: "Make a simple personal website for Arpi",
+                owned_files: Vec::new(),
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -893,7 +1192,7 @@ mod tests {
             .state
             .agents
             .values()
-            .find(|agent| agent.identity.name == "SITE-01")
+            .find(|agent| agent.identity.name == "WORKER-01")
             .unwrap();
         assert_eq!(worker.status, orynth_event_store::AgentStatus::Failed);
         assert_eq!(worker.usage, reported);
@@ -933,10 +1232,15 @@ mod tests {
                     task_id,
                     coordinator_id,
                     model,
+                    agent_name: "WORKER-01".into(),
+                    role: "Bounded coding specialist".into(),
                     base_url: "",
+                    api_key: None,
+                    api_key_env: Some("OPENROUTER_API_KEY"),
                     title: None,
                     workspace: &worker_root,
                     user_text: "Make a simple personal website for Arpi",
+                    owned_files: Vec::new(),
                     cancellation: worker_cancellation,
                     effect_gate: worker_gate,
                 },

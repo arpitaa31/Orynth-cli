@@ -1,7 +1,10 @@
 //! Markdown-to-terminal presentation for model-generated conversation text.
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use ratatui::{style::{Modifier, Style}, text::{Line, Span}};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
 
 use crate::theme::THEME;
 
@@ -10,7 +13,9 @@ const HEADING_STYLE: Style = Style::new().fg(THEME.accent).add_modifier(Modifier
 const MUTED_STYLE: Style = Style::new().fg(THEME.muted);
 const CODE_STYLE: Style = Style::new().fg(THEME.text).bg(THEME.surface);
 const INLINE_CODE_STYLE: Style = Style::new().fg(THEME.brand).bg(THEME.surface);
-const LINK_STYLE: Style = Style::new().fg(THEME.info).add_modifier(Modifier::UNDERLINED);
+const LINK_STYLE: Style = Style::new()
+    .fg(THEME.info)
+    .add_modifier(Modifier::UNDERLINED);
 
 /// Renders model-authored Markdown as safe ratatui lines.
 ///
@@ -244,9 +249,7 @@ impl Renderer {
 fn sanitize(value: &str) -> String {
     value
         .chars()
-        .filter(|character| {
-            !character.is_control() || matches!(*character, '\t' | '\n')
-        })
+        .filter(|character| !character.is_control() || matches!(*character, '\t' | '\n'))
         .collect()
 }
 
@@ -256,7 +259,11 @@ mod tests {
     use ratatui::style::Modifier;
 
     fn plain(lines: &[ratatui::text::Line<'static>]) -> String {
-        lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -267,21 +274,36 @@ mod tests {
     #[test]
     fn renders_bold_text() {
         let lines = render_markdown("**bold**");
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(plain(&lines), "bold");
     }
 
     #[test]
     fn renders_italic_text() {
         let lines = render_markdown("*italic*");
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
         assert_eq!(plain(&lines), "italic");
     }
 
     #[test]
     fn renders_headings() {
         let lines = render_markdown("# heading\n\n## subheading\n\n### detail");
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert!(plain(&lines).contains("heading"));
         assert!(plain(&lines).contains("subheading"));
         assert!(plain(&lines).contains("detail"));
@@ -296,7 +318,9 @@ mod tests {
 
     #[test]
     fn renders_fenced_code_with_structure() {
-        let rendered = plain(&render_markdown("```rust\nfn main() {\n\tprintln!(\"hi\");\n}"));
+        let rendered = plain(&render_markdown(
+            "```rust\nfn main() {\n\tprintln!(\"hi\");\n}",
+        ));
         assert!(rendered.contains("rust"));
         assert!(rendered.contains("fn main() {"));
         assert!(rendered.contains("println!"));
@@ -358,7 +382,9 @@ mod tests {
 
     #[test]
     fn malformed_markdown_degrades_to_readable_text() {
-        let rendered = plain(&render_markdown("[unclosed link\n| name | value |\n| --- | --- |"));
+        let rendered = plain(&render_markdown(
+            "[unclosed link\n| name | value |\n| --- | --- |",
+        ));
         assert!(rendered.contains("unclosed link"));
         assert!(rendered.contains("name"));
     }
@@ -396,7 +422,9 @@ mod tests {
 
     #[test]
     fn literal_rendering_is_safe_for_user_messages() {
-        let rendered = plain(&render_literal("requirements\u{1b}[2J\n- keep this literal"));
+        let rendered = plain(&render_literal(
+            "requirements\u{1b}[2J\n- keep this literal",
+        ));
         assert!(!rendered.contains('\u{1b}'));
         assert!(rendered.contains("- keep this literal"));
     }

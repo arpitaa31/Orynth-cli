@@ -1090,11 +1090,12 @@ impl RuntimeConfig {
                         config.openrouter.enabled = parse_bool(raw_value, key, line_number)?
                     }
                     "api_key_env" => {
-                        if parse_string(raw_value, key, line_number)? != "OPENROUTER_API_KEY" {
-                            return Err(ConfigError::Invalid(
-                                "OpenRouter key must come from OPENROUTER_API_KEY".into(),
-                            ));
-                        }
+                        config.openrouter.api_key_env =
+                            Some(parse_string(raw_value, key, line_number)?);
+                    }
+                    "api_key" => {
+                        config.openrouter.api_key =
+                            Some(parse_string(raw_value, key, line_number)?);
                     }
                     "base_url" => {
                         config.openrouter.base_url = parse_string(raw_value, key, line_number)?
@@ -1180,7 +1181,7 @@ impl RuntimeConfig {
                     && !model.model.ends_with(":free")
                 {
                     return Err(ConfigError::Invalid(format!(
-                        "models.{name} must use openrouter/free or a :free model when free_only = true"
+                        "models.{name} must use openrouter/free or a :free model when free_only = true; set free_only = false for a non-free explicit model"
                     )));
                 }
                 if model.reasoning_effort.as_deref().is_some_and(|effort| {
@@ -1231,18 +1232,37 @@ impl RuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OpenRouterSettings {
     pub enabled: bool,
     pub base_url: String,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
     pub free_only: bool,
     pub title: Option<String>,
 }
+
+impl std::fmt::Debug for OpenRouterSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenRouterSettings")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("api_key_env", &self.api_key_env)
+            .field("free_only", &self.free_only)
+            .field("title", &self.title)
+            .finish()
+    }
+}
+
 impl Default for OpenRouterSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: None,
+            api_key_env: Some("OPENROUTER_API_KEY".into()),
             free_only: true,
             title: None,
         }
@@ -1486,12 +1506,20 @@ mod tests {
             model = "vendor/paid-model"
             class = "strong"
         "#;
-        assert!(matches!(
-            RuntimeConfig::parse(source),
-            Err(ConfigError::Invalid(_))
-        ));
+        let error = RuntimeConfig::parse(source).unwrap_err().to_string();
+        assert!(error.contains("set free_only = false"));
         let free = source.replace("vendor/paid-model", "vendor/model:free");
         assert!(RuntimeConfig::parse(&free).is_ok());
+        let paid = source.replace("free_only = true", "free_only = false");
+        assert_eq!(
+            RuntimeConfig::parse(&paid)
+                .unwrap()
+                .models
+                .manager
+                .unwrap()
+                .model,
+            "vendor/paid-model"
+        );
     }
 
     #[test]
@@ -1520,11 +1548,46 @@ mod tests {
 
     #[test]
     fn repository_example_configuration_parses() {
-        let config = RuntimeConfig::parse(include_str!("../../../orynth.example.toml"))
-            .expect("repository example should parse");
+        let example = include_str!("../../../orynth.example.toml");
+        let config = RuntimeConfig::parse(example).expect("repository example should parse");
 
         assert_eq!(config.runtime.max_concurrent_agents, 6);
         assert_eq!(config.security.default_network, "deny");
+        assert!(example.contains("# api_key ="));
+        assert!(!example.contains("sk-or-v1-"));
+    }
+
+    #[test]
+    fn openrouter_accepts_direct_key_and_redacts_debug_output() {
+        let config = RuntimeConfig::parse(
+            r#"
+            [providers.openrouter]
+            enabled = true
+            api_key = "sk-or-v1-local-test"
+            [models.coordinator]
+            provider = "openrouter"
+            model = "openrouter/free"
+            class = "strong"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.openrouter.api_key.as_deref(),
+            Some("sk-or-v1-local-test")
+        );
+        let diagnostic = format!("{config:?}");
+        assert!(!diagnostic.contains("sk-or-v1-local-test"));
+        assert!(diagnostic.contains("[redacted]"));
+    }
+
+    #[test]
+    fn openrouter_defaults_to_named_environment_fallback() {
+        let config = RuntimeConfig::default();
+        assert!(config.openrouter.api_key.is_none());
+        assert_eq!(
+            config.openrouter.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
     }
 
     #[test]

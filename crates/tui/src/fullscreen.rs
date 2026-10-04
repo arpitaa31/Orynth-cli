@@ -10,9 +10,7 @@ use crossterm::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use orynth_context::{ContextPrincipal, ContextTrustPolicy, ProjectionRequest};
 use orynth_event_store::{RunStatus, StoredEvent};
@@ -77,6 +75,14 @@ pub trait TuiDataSource {
 
     fn submit_text(&mut self, _text: String) -> Result<(), String> {
         Err("No live Coordinator is connected".into())
+    }
+
+    fn cancel_live(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn live_busy(&self) -> bool {
+        false
     }
 
     fn live_text(&self) -> Option<String> {

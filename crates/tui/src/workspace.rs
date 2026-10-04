@@ -188,6 +188,7 @@ struct Workspace {
     last_event_count: u64,
     notice: Option<String>,
     live_text: Option<String>,
+    live_busy: bool,
 }
 
 impl Workspace {
@@ -220,6 +221,7 @@ impl Workspace {
             last_event_count,
             notice: None,
             live_text: None,
+            live_busy: false,
         }
     }
 
@@ -340,6 +342,7 @@ impl Workspace {
 
     fn refresh<S: TuiDataSource>(&mut self, source: &mut S) {
         self.live_text = source.live_text();
+        self.live_busy = source.live_busy();
         match source.snapshot() {
             Ok(snapshot) => {
                 let old_run = self.snapshot.selected.as_ref();
@@ -401,6 +404,10 @@ impl Workspace {
         key: KeyEvent,
         source: &mut S,
     ) -> Result<WorkspaceSignal, String> {
+        if is_interrupt_key(key) && source.live_busy() && source.cancel_live()? {
+            self.notice = Some("Coordinator interrupted.".into());
+            return Ok(WorkspaceSignal::Stay);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(match key.code {
                 KeyCode::Char('c') => WorkspaceSignal::Quit,
@@ -883,11 +890,20 @@ impl Workspace {
             );
             return;
         }
-        let input_height = input_height(&self.input, area.width);
+        let header_height = if self
+            .snapshot
+            .presentation
+            .as_ref()
+            .is_some_and(|view| view.title.starts_with("LIVE"))
+        {
+            5
+        } else {
+            input_height(&self.input, area.width)
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(input_height),
+                Constraint::Length(header_height),
                 Constraint::Min(3),
                 Constraint::Length(3),
                 Constraint::Length(if self.notice.is_some() { 3 } else { 1 }),
@@ -958,10 +974,11 @@ impl Workspace {
             .as_ref()
             .filter(|view| view.title.starts_with("LIVE"))
         {
-            lines.push(Line::styled(
-                format!(" {}", view.description),
-                Style::default().fg(MUTED),
-            ));
+            lines.extend(
+                view.description
+                    .lines()
+                    .map(|line| Line::styled(format!(" {line}"), Style::default().fg(MUTED))),
+            );
         }
         if self
             .snapshot
@@ -1644,6 +1661,9 @@ impl Workspace {
     }
 
     fn footer_text(&self) -> &'static str {
+        if self.live_busy {
+            return "Esc / Ctrl+C Stop   Tab Input   Ctrl+K Commands";
+        }
         match self.overlay {
             Some(Overlay::AgentSwitcher) => "↑↓ Select   Enter Open   Esc Close",
             Some(Overlay::Palette) => "↑↓ Select   Enter Run   Esc Close",
@@ -1922,8 +1942,7 @@ fn wrapped_input_lines(value: &str, width: u16) -> usize {
 }
 
 fn input_height(value: &str, width: u16) -> u16 {
-    (wrapped_input_lines(value, width.saturating_sub(2)) + 2)
-        .clamp(3, MAX_INPUT_LINES) as u16
+    (wrapped_input_lines(value, width.saturating_sub(2)) + 2).clamp(3, MAX_INPUT_LINES) as u16
 }
 
 fn input_scroll(value: &str, cursor: usize, width: u16) -> u16 {
@@ -1956,6 +1975,11 @@ enum WorkspaceSignal {
     Debugger,
     DebuggerRuns,
     Quit,
+}
+
+fn is_interrupt_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 pub fn run_workspace<S: TuiDataSource>(source: S) -> Result<(), String> {
@@ -2023,6 +2047,12 @@ pub fn run_workspace_started_at<S: TuiDataSource>(
             continue;
         }
         if debug_mode {
+            if is_interrupt_key(key) && source.live_busy() && source.cancel_live()? {
+                debug_mode = false;
+                workspace.refresh(&mut source);
+                workspace.notice = Some("Coordinator interrupted.".into());
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
                 debug_mode = false;
                 workspace.refresh(&mut source);
@@ -2083,6 +2113,7 @@ pub fn render_workspace_for_terminal(snapshot: &TuiSnapshot, width: u16, height:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fullscreen::TuiPresentation;
     use crossterm::event::KeyEvent;
     use orynth_assumptions::AssumptionGraph;
     use orynth_cache::CacheTelemetry;
@@ -2109,6 +2140,8 @@ mod tests {
 
     struct LiveSource {
         submitted: Vec<String>,
+        busy: bool,
+        cancellations: usize,
     }
 
     impl TuiDataSource for LiveSource {
@@ -2127,6 +2160,19 @@ mod tests {
 
         fn is_live(&self) -> bool {
             true
+        }
+
+        fn live_busy(&self) -> bool {
+            self.busy
+        }
+
+        fn cancel_live(&mut self) -> Result<bool, String> {
+            if !self.busy {
+                return Ok(false);
+            }
+            self.busy = false;
+            self.cancellations += 1;
+            Ok(true)
         }
     }
 
@@ -2645,6 +2691,8 @@ mod tests {
         let mut app = Workspace::new(empty());
         let mut source = LiveSource {
             submitted: Vec::new(),
+            busy: false,
+            cancellations: 0,
         };
         let prompt = "Build a task tracker.\n\n- localStorage\n- filters";
         app.paste(prompt);
@@ -2652,6 +2700,54 @@ mod tests {
             .expect("submit should be handled");
         assert_eq!(source.submitted, vec![prompt.to_owned()]);
         assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn live_escape_and_ctrl_c_interrupt_while_idle_ctrl_c_quits() {
+        let mut app = Workspace::new(empty());
+        let mut source = LiveSource {
+            submitted: Vec::new(),
+            busy: true,
+            cancellations: 0,
+        };
+        app.refresh(&mut source);
+        assert!(app.footer_text().contains("Esc / Ctrl+C Stop"));
+        assert_eq!(
+            app.key(KeyEvent::from(KeyCode::Esc), &mut source).unwrap(),
+            WorkspaceSignal::Stay
+        );
+        assert_eq!(source.cancellations, 1);
+        assert_eq!(app.notice.as_deref(), Some("Coordinator interrupted."));
+        assert!(!source.live_busy());
+        app.refresh(&mut source);
+        assert!(!app.footer_text().contains("Stop"));
+        source.busy = true;
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.key(ctrl_c, &mut source).unwrap(), WorkspaceSignal::Stay);
+        assert_eq!(source.cancellations, 2);
+        assert_eq!(app.key(ctrl_c, &mut source).unwrap(), WorkspaceSignal::Quit);
+        app.input = "Actually, create a README".into();
+        assert_eq!(
+            app.key(KeyEvent::from(KeyCode::Enter), &mut source)
+                .unwrap(),
+            WorkspaceSignal::Stay
+        );
+        assert_eq!(source.submitted, vec!["Actually, create a README"]);
+    }
+
+    #[test]
+    fn live_header_shows_configured_and_resolved_models() {
+        let mut snapshot = empty();
+        snapshot.presentation = Some(TuiPresentation {
+            title: "LIVE · OPENROUTER".into(),
+            description: "Config: gemini.toml\nConfigured: google/explicit-model\nResolved: google/served-model · Provider: Google".into(),
+            demo: false,
+        });
+        let rendered = render_workspace_for_terminal(&snapshot, 100, 24);
+        assert!(rendered.contains("Config: gemini.toml"));
+        assert!(rendered.contains("Configured: google/explicit-model"));
+        assert!(rendered.contains("Resolved: google/served-model"));
+        assert!(rendered.contains("Provider: Google"));
     }
 
     #[test]

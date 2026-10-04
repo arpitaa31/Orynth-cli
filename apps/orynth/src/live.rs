@@ -67,6 +67,7 @@ pub(super) struct LiveTuiSource {
     worker_model: ModelRef,
     config: RuntimeConfig,
     workspace: PathBuf,
+    config_path: String,
     state: Arc<Mutex<LiveState>>,
     cancellation: Arc<Mutex<Option<CancellationToken>>>,
     effect_gate: Arc<Mutex<()>>,
@@ -85,7 +86,11 @@ struct LiveTurn {
 }
 
 impl LiveTuiSource {
-    pub(super) fn new(config: RuntimeConfig, workspace: Option<PathBuf>) -> Result<Self, String> {
+    pub(super) fn new(
+        config: RuntimeConfig,
+        workspace: Option<PathBuf>,
+        config_path: impl Into<String>,
+    ) -> Result<Self, String> {
         let coordinator = config
             .models
             .manager
@@ -93,8 +98,10 @@ impl LiveTuiSource {
             .ok_or("configure [models.coordinator]")?;
         let model = model_ref(coordinator)?;
         let worker_model = model_ref(config.models.worker.as_ref().unwrap_or(coordinator))?;
-        OpenRouterProvider::from_env(
+        OpenRouterProvider::from_config(
             model.clone(),
+            config.openrouter.api_key.as_deref(),
+            config.openrouter.api_key_env.as_deref(),
             &config.openrouter.base_url,
             config.openrouter.title.clone(),
         )
@@ -171,6 +178,7 @@ impl LiveTuiSource {
             worker_model,
             config,
             workspace,
+            config_path: config_path.into(),
             state: Arc::new(Mutex::new(LiveState::default())),
             cancellation: Arc::new(Mutex::new(None)),
             effect_gate: Arc::new(Mutex::new(())),
@@ -179,7 +187,7 @@ impl LiveTuiSource {
 }
 
 pub(super) fn run_site_test(config: RuntimeConfig) -> Result<String, String> {
-    let source = LiveTuiSource::new(config, None)?;
+    let source = LiveTuiSource::new(config, None, "orynth.toml")?;
     let store = SqliteEventStore::open(&source.database).map_err(|error| error.to_string())?;
     let mut service = RuntimeService::new(store);
     let task = "Make a simple personal website with the name Arpi and one short paragraph centered on the page.";
@@ -193,10 +201,15 @@ pub(super) fn run_site_test(config: RuntimeConfig) -> Result<String, String> {
             task_id: source.task_id,
             coordinator_id: source.agent_id,
             model: source.worker_model.clone(),
+            agent_name: "WORKER-01".into(),
+            role: "Bounded coding specialist".into(),
             base_url: &source.config.openrouter.base_url,
+            api_key: source.config.openrouter.api_key.as_deref(),
+            api_key_env: source.config.openrouter.api_key_env.as_deref(),
             title: source.config.openrouter.title.clone(),
             workspace: &source.workspace,
             user_text: task,
+            owned_files: Vec::new(),
             cancellation: CancellationToken::new(),
             effect_gate: Arc::clone(&source.effect_gate),
         },
@@ -279,7 +292,9 @@ fn prepare_workspace(
         )
     })?;
     if relative.as_os_str().is_empty() {
-        return Err("live coding workspace must be a directory below the approved sandbox root".into());
+        return Err(
+            "live coding workspace must be a directory below the approved sandbox root".into(),
+        );
     }
 
     let mut current = sandbox.to_path_buf();
@@ -324,9 +339,7 @@ fn relative_workspace_path(
         let root = normalize(sandbox);
         let candidate = normalize(requested);
         let prefix = format!("{root}\\");
-        candidate
-            .strip_prefix(&prefix)
-            .map(PathBuf::from)
+        candidate.strip_prefix(&prefix).map(PathBuf::from)
     }
     #[cfg(not(windows))]
     {
@@ -379,15 +392,11 @@ impl TuiDataSource for LiveTuiSource {
             .unwrap_or_default();
         snapshot.presentation = Some(TuiPresentation {
             title: "LIVE · OPENROUTER".into(),
-            description: format!(
-                "Route: {}{}{}",
-                self.model.model,
-                resolved
-                    .map(|name| format!(" · Model: {name}"))
-                    .unwrap_or_default(),
-                provider_name
-                    .map(|name| format!(" · Provider: {name}"))
-                    .unwrap_or_default()
+            description: live_description(
+                &self.config_path,
+                &self.model,
+                resolved.as_deref(),
+                provider_name.as_deref(),
             ),
             demo: false,
         });
@@ -406,9 +415,18 @@ impl TuiDataSource for LiveTuiSource {
     fn is_live(&self) -> bool {
         true
     }
+    fn live_busy(&self) -> bool {
+        self.state.lock().map(|state| state.busy).unwrap_or(false)
+    }
+    fn cancel_live(&mut self) -> Result<bool, String> {
+        cancel_active_turn(&self.state, &self.cancellation)
+    }
     fn live_text(&self) -> Option<String> {
         let state = self.state.lock().ok()?;
         if let Some(error) = &state.error {
+            if error == "Coordinator interrupted." {
+                return Some(error.clone());
+            }
             return Some(format!("Provider error: {error}"));
         }
         if state.busy {
@@ -434,6 +452,11 @@ impl TuiDataSource for LiveTuiSource {
         service
             .record_conversation_turn(self.run_id, ConversationTurn::user(text))
             .map_err(|error| error.to_string())?;
+        let cancellation = CancellationToken::new();
+        *self
+            .cancellation
+            .lock()
+            .map_err(|_| "cancellation state unavailable")? = Some(cancellation.clone());
         state.busy = true;
         state.text.clear();
         state.error = None;
@@ -450,11 +473,6 @@ impl TuiDataSource for LiveTuiSource {
         let config = self.config.clone();
         let workspace = self.workspace.clone();
         let effect_gate = Arc::clone(&self.effect_gate);
-        let cancellation = CancellationToken::new();
-        *self
-            .cancellation
-            .lock()
-            .map_err(|_| "cancellation state unavailable")? = Some(cancellation.clone());
         let slot = Arc::clone(&self.cancellation);
         thread::spawn(move || {
             let failure_database = database.clone();
@@ -470,34 +488,98 @@ impl TuiDataSource for LiveTuiSource {
                 effect_gate,
             };
             let result = execute_turn(turn, cancellation.clone(), &shared);
-            if let Err(error) = &result
-                && let Ok(store) = SqliteEventStore::open(&failure_database)
-                && store
-                    .reconstruct(run_id)
-                    .is_ok_and(|state| state.status == RunStatus::Active)
-            {
-                let mut service = RuntimeService::new(store);
-                let kind = if cancellation.is_cancelled() {
-                    EventKind::ModelTurnCancelled { agent_id }
-                } else {
-                    EventKind::ModelTurnFailed {
-                        agent_id,
-                        message: error.clone(),
-                    }
-                };
-                let _ = service.record_model_transition(run_id, kind);
+            if let Err(error) = &result {
+                let _ = record_live_turn_failure(
+                    &failure_database,
+                    run_id,
+                    agent_id,
+                    error,
+                    cancellation.is_cancelled(),
+                );
             }
-            if let Ok(mut state) = shared.lock() {
-                state.busy = false;
-                state.text.clear();
-                state.error = result.err();
-            }
-            if let Ok(mut slot) = slot.lock() {
-                *slot = None;
-            }
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.busy = false;
+            state.text.clear();
+            state.error = if cancellation.is_cancelled() {
+                Some("Coordinator interrupted.".into())
+            } else {
+                result.err()
+            };
+            *slot = None;
         });
         Ok(())
     }
+}
+
+fn cancel_active_turn(
+    state: &Arc<Mutex<LiveState>>,
+    cancellation: &Arc<Mutex<Option<CancellationToken>>>,
+) -> Result<bool, String> {
+    let active = state.lock().map_err(|_| "live state unavailable")?;
+    if !active.busy {
+        return Ok(false);
+    }
+    let token = cancellation
+        .lock()
+        .map_err(|_| "cancellation state unavailable")?
+        .clone()
+        .ok_or("active turn has no cancellation token")?;
+    token.cancel();
+    drop(active);
+    for _ in 0..40 {
+        if !state.lock().map_err(|_| "live state unavailable")?.busy {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Ok(true)
+}
+
+fn record_live_turn_failure(
+    database: &std::path::Path,
+    run_id: RunId,
+    agent_id: AgentId,
+    error: &str,
+    cancelled: bool,
+) -> Result<(), String> {
+    let store = SqliteEventStore::open(database).map_err(|error| error.to_string())?;
+    if store
+        .reconstruct(run_id)
+        .map_err(|error| error.to_string())?
+        .status
+        != RunStatus::Active
+    {
+        return Ok(());
+    }
+    let mut service = RuntimeService::new(store);
+    let kind = if cancelled {
+        EventKind::ModelTurnCancelled { agent_id }
+    } else {
+        EventKind::ModelTurnFailed {
+            agent_id,
+            message: error.to_owned(),
+        }
+    };
+    service
+        .record_model_transition(run_id, kind)
+        .map_err(|error| error.to_string())
+}
+
+fn live_description(
+    config_path: &str,
+    configured: &ModelRef,
+    resolved: Option<&str>,
+    provider: Option<&str>,
+) -> String {
+    format!(
+        "Config: {config_path}\nConfigured: {}\nResolved: {} · Provider: {}",
+        configured.model,
+        resolved.unwrap_or("pending"),
+        provider.unwrap_or("pending")
+    )
 }
 
 impl Drop for LiveTuiSource {
@@ -568,7 +650,7 @@ fn execute_turn(
     let events = store.events(run_id).map_err(|error| error.to_string())?;
     let mut request = ModelRequest::new(run_id, task_id, agent_id, model.clone(), "");
     request.parts = vec![RequestPart::System(
-        "You are Orynth's Coordinator. Orynth owns authoritative state and side effects. Use only reported runtime facts. Do not claim actions or worker results until Orynth confirms them. Do not reveal hidden reasoning. Delegate a tiny website to one worker when useful.".into())];
+        "You are Orynth's Coordinator. Orynth owns authoritative state and side effects. Use only reported runtime facts. Do not claim actions or worker results until Orynth confirms them. Do not reveal hidden reasoning. Small tasks may stay with you; medium or large coding tasks, multi-part tasks, or requests that explicitly ask for subagents should use spawn_agent with one bounded specialist. Never claim an agent exists until runtime confirms it.".into())];
     let recovered =
         RuntimeService::new(SqliteEventStore::open(&database).map_err(|error| error.to_string())?)
             .recover(run_id)
@@ -594,12 +676,16 @@ fn execute_turn(
         .iter()
         .map(|entry| entry.block.reference())
         .collect();
-    let prompt = recovered.context.render_prompt(ContextPrincipal::Agent(agent_id),
-        &[PromptLayer::stable("projected context", references)],
-        &format!(
-            "Runtime facts: active agents: {roster}. Selected coding workspace: {}.",
-            workspace.display()
-        ))
+    let prompt = recovered
+        .context
+        .render_prompt(
+            ContextPrincipal::Agent(agent_id),
+            &[PromptLayer::stable("projected context", references)],
+            &format!(
+                "Runtime facts: active agents: {roster}. Selected coding workspace: {}.",
+                workspace.display()
+            ),
+        )
         .map_err(|error| error.to_string())?;
     request.parts.push(RequestPart::System(prompt.text));
     let mut latest_user = String::new();
@@ -620,17 +706,12 @@ fn execute_turn(
     }
     bound_conversation_parts(&mut request.parts);
     request.max_output_tokens = Some(LIVE_COORDINATOR_OUTPUT_TOKENS);
-    if worker::small_site_task(&latest_user) {
-        request.tools.push(ProviderToolDefinition {
-            name: "delegate_personal_site".into(),
-            description: "Assign the user's tiny personal website request to one Orynth coding worker in the selected sandbox".into(),
-            input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#.into(),
-        });
-        request.tool_choice = ToolChoice::Required;
-    }
+    configure_delegation(&mut request, &latest_user);
     let mut service = RuntimeService::new(store);
-    let provider = OpenRouterProvider::from_env(
+    let provider = OpenRouterProvider::from_config(
         model.clone(),
+        config.openrouter.api_key.as_deref(),
+        config.openrouter.api_key_env.as_deref(),
         &config.openrouter.base_url,
         config.openrouter.title.clone(),
     )
@@ -655,6 +736,9 @@ fn execute_turn(
             run_coordinator_request(&mut service, &provider, next, cancellation.clone(), shared)?;
         match reason {
             FinishReason::Stop => {
+                if cancellation.is_cancelled() {
+                    return Err("Coordinator request cancelled".into());
+                }
                 if output.trim().is_empty() {
                     return Err("Coordinator returned an empty response".into());
                 }
@@ -683,16 +767,15 @@ fn execute_turn(
                     worker_model: &worker_model,
                     config: &config,
                     workspace: &workspace,
-                    user_text: &latest_user,
                     cancellation: &cancellation,
                     effect_gate: &effect_gate,
                 };
                 let results = execute_coordinator_actions(&mut actions, &calls)?;
-                for (call_id, result) in results {
+                for (call_id, result, is_error) in results {
                     next_parts.push(RequestPart::ToolResult {
                         call_id,
                         content: result,
-                        is_error: false,
+                        is_error,
                     });
                 }
                 tool_choice = ToolChoice::Auto;
@@ -713,16 +796,15 @@ fn execute_turn(
                         worker_model: &worker_model,
                         config: &config,
                         workspace: &workspace,
-                        user_text: &latest_user,
                         cancellation: &cancellation,
                         effect_gate: &effect_gate,
                     };
                     let results = execute_coordinator_actions(&mut actions, &calls)?;
-                    for (call_id, result) in results {
+                    for (call_id, result, is_error) in results {
                         next_parts.push(RequestPart::ToolResult {
                             call_id,
                             content: result,
-                            is_error: false,
+                            is_error,
                         });
                     }
                     tool_choice = ToolChoice::Auto;
@@ -774,7 +856,6 @@ struct CoordinatorActionContext<'a> {
     worker_model: &'a ModelRef,
     config: &'a RuntimeConfig,
     workspace: &'a std::path::Path,
-    user_text: &'a str,
     cancellation: &'a CancellationToken,
     effect_gate: &'a Arc<Mutex<()>>,
 }
@@ -782,35 +863,108 @@ struct CoordinatorActionContext<'a> {
 fn execute_coordinator_actions(
     context: &mut CoordinatorActionContext<'_>,
     calls: &[ToolCall],
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, bool)>, String> {
+    execute_coordinator_actions_with(context, calls, worker::run)
+}
+
+fn execute_coordinator_actions_with<F>(
+    context: &mut CoordinatorActionContext<'_>,
+    calls: &[ToolCall],
+    mut run_worker: F,
+) -> Result<Vec<(String, String, bool)>, String>
+where
+    F: for<'task> FnMut(
+        &mut RuntimeService<SqliteEventStore>,
+        worker::WorkerTask<'task>,
+    ) -> Result<(String, orynth_kernel::Usage), String>,
+{
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
-        if call.name != "delegate_personal_site"
-            || !worker::small_site_task(context.user_text)
-            || !serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty()))
-        {
+        if call.name != "spawn_agent" {
             return Err(format!(
                 "Coordinator proposed invalid action: {}",
                 call.name
             ));
         }
-        let (summary, _) = worker::run(
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments)
+            .map_err(|_| "spawn_agent arguments must be valid JSON".to_owned())?;
+        let object = arguments
+            .as_object()
+            .ok_or_else(|| "spawn_agent arguments must be an object".to_owned())?;
+        let task = object
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .filter(|task| !task.trim().is_empty())
+            .ok_or_else(|| "spawn_agent requires a non-empty task".to_owned())?
+            .to_owned();
+        if task.len() > 4096 {
+            return Err("spawn_agent task exceeds 4 KiB".into());
+        }
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("WORKER-01")
+            .to_owned();
+        let role = object
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .filter(|role| !role.trim().is_empty())
+            .unwrap_or("Bounded coding specialist")
+            .to_owned();
+        if name.len() > 64 || role.len() > 128 || name.contains('\n') || role.contains('\n') {
+            return Err("spawn_agent name or role is too long or invalid".into());
+        }
+        let files = object
+            .get("files")
+            .map(|value| value.as_array().ok_or("spawn_agent files must be an array"))
+            .transpose()?
+            .map(|items| {
+                if items.len() > 16 {
+                    return Err("spawn_agent allows at most 16 owned files".to_owned());
+                }
+                items
+                    .iter()
+                    .map(|item| {
+                        let path = item
+                            .as_str()
+                            .ok_or("spawn_agent file paths must be strings")?;
+                        worker::validate_worker_path(path)?;
+                        Ok(path.to_owned())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let result = run_worker(
             context.service,
             worker::WorkerTask {
                 run_id: context.run_id,
                 task_id: context.task_id,
                 coordinator_id: context.agent_id,
                 model: context.worker_model.clone(),
+                agent_name: name,
+                role,
                 base_url: &context.config.openrouter.base_url,
+                api_key: context.config.openrouter.api_key.as_deref(),
+                api_key_env: context.config.openrouter.api_key_env.as_deref(),
                 title: context.config.openrouter.title.clone(),
                 workspace: context.workspace,
-                user_text: context.user_text,
+                user_text: &task,
+                owned_files: files,
                 cancellation: context.cancellation.clone(),
                 effect_gate: Arc::clone(context.effect_gate),
             },
-        )?;
-        results.push((call.call_id.clone(), summary));
+        );
+        match result {
+            Ok((summary, _)) => results.push((call.call_id.clone(), summary, false)),
+            Err(error) if context.cancellation.is_cancelled() => return Err(error),
+            Err(error) => results.push((
+                call.call_id.clone(),
+                format!("Worker failed: {error}"),
+                true,
+            )),
+        }
     }
     Ok(results)
 }
@@ -819,6 +973,24 @@ fn bound_conversation_parts(parts: &mut Vec<RequestPart>) {
     if parts.len() > 64 {
         // Retain both runtime/system layers while bounding older conversation.
         parts.drain(2..parts.len() - 62);
+    }
+}
+
+fn configure_delegation(request: &mut ModelRequest, latest_user: &str) {
+    request.tools.push(ProviderToolDefinition {
+        name: "spawn_agent".into(),
+        description: "Create one real bounded coding specialist in the selected workspace. Use for medium/large or explicitly delegated work; do not use for trivial explanations or tiny edits.".into(),
+        input_schema: r#"{"type":"object","properties":{"name":{"type":"string"},"role":{"type":"string"},"task":{"type":"string"},"files":{"type":"array","items":{"type":"string"}}},"required":["task"],"additionalProperties":false}"#.into(),
+    });
+    let lower_user = latest_user.to_ascii_lowercase();
+    if lower_user.contains("subagent")
+        || lower_user.contains("use agents")
+        || lower_user.contains("multi-part")
+        || lower_user.contains("vs code")
+        || lower_user.contains("refactor")
+        || lower_user.contains("full task manager")
+    {
+        request.tool_choice = ToolChoice::Required;
     }
 }
 
@@ -904,9 +1076,12 @@ fn run_coordinator_request_once(
     state = ModelTurnState::Streaming;
     debug_assert_eq!(state, ModelTurnState::Streaming);
     for event in provider
-        .stream(request, cancellation)
+        .stream(request, cancellation.clone())
         .map_err(coordinator_provider_error)?
     {
+        if cancellation.is_cancelled() {
+            return Err("Coordinator request cancelled".into());
+        }
         match event.map_err(coordinator_provider_error)? {
             ProviderEvent::TextDelta { text } => {
                 if output.len().saturating_add(text.len()) > 16 * 1024 {
@@ -964,6 +1139,9 @@ fn run_coordinator_request_once(
             ProviderEvent::Finish(reason) => finish = Some(reason),
             ProviderEvent::ReasoningDelta { .. } => {}
         }
+    }
+    if cancellation.is_cancelled() {
+        return Err("Coordinator request cancelled".into());
     }
     let finish = finish.ok_or("OpenRouter stream ended without completion")?;
     state = ModelTurnState::TurnFinished;
@@ -1272,6 +1450,29 @@ mod tests {
         let _ = std::fs::remove_file(database.with_extension("db-shm"));
     }
 
+    #[test]
+    fn live_cancellation_signals_active_token_and_restores_idle_state() {
+        let state = Arc::new(Mutex::new(LiveState {
+            busy: true,
+            ..LiveState::default()
+        }));
+        let token = CancellationToken::new();
+        let cancellation = Arc::new(Mutex::new(Some(token.clone())));
+        let finished = Arc::clone(&state);
+        let observed = token.clone();
+        let worker = thread::spawn(move || {
+            while !observed.is_cancelled() {
+                thread::yield_now();
+            }
+            finished.lock().unwrap().busy = false;
+        });
+        assert!(cancel_active_turn(&state, &cancellation).unwrap());
+        worker.join().unwrap();
+        assert!(token.is_cancelled());
+        assert!(!state.lock().unwrap().busy);
+        assert!(!cancel_active_turn(&state, &cancellation).unwrap());
+    }
+
     fn coordinator_request(
         run_id: RunId,
         task_id: TaskId,
@@ -1279,6 +1480,394 @@ mod tests {
         model: ModelRef,
     ) -> ModelRequest {
         ModelRequest::new(run_id, task_id, agent_id, model, "reply")
+    }
+
+    #[test]
+    fn delegation_is_available_for_general_tasks_and_required_when_explicit() {
+        let model = ModelRef::new("mock", "coordinator", ModelClass::Strong);
+        let mut simple =
+            coordinator_request(RunId::new(), TaskId::new(), AgentId::new(), model.clone());
+        configure_delegation(&mut simple, "Change the button text");
+        assert_eq!(simple.tools.len(), 1);
+        assert_eq!(simple.tools[0].name, "spawn_agent");
+        assert_eq!(simple.tool_choice, ToolChoice::Auto);
+
+        let mut complex = coordinator_request(RunId::new(), TaskId::new(), AgentId::new(), model);
+        configure_delegation(&mut complex, "Build a VS Code-like editor. Use subagents.");
+        assert_eq!(complex.tools[0].name, "spawn_agent");
+        assert_eq!(complex.tool_choice, ToolChoice::Required);
+    }
+
+    #[test]
+    fn live_header_distinguishes_selected_config_and_reported_model() {
+        let explicit = ModelRef::new("openrouter", "google/explicit-model", ModelClass::Strong);
+        let header = live_description(
+            "gemini.toml",
+            &explicit,
+            Some("google/served-model"),
+            Some("Google"),
+        );
+        assert!(header.contains("Config: gemini.toml"));
+        assert!(header.contains("Configured: google/explicit-model"));
+        assert!(header.contains("Resolved: google/served-model · Provider: Google"));
+        assert!(!header.contains("openrouter/free"));
+        let free = ModelRef::new("openrouter", "openrouter/free", ModelClass::Cheap);
+        let header = live_description(
+            "orynth.toml",
+            &free,
+            Some("nvidia/free-model"),
+            Some("NVIDIA"),
+        );
+        assert!(header.contains("Configured: openrouter/free"));
+        assert!(header.contains("Resolved: nvidia/free-model · Provider: NVIDIA"));
+    }
+
+    #[test]
+    fn live_direct_key_stays_out_of_snapshot_and_sqlite_events() {
+        let secret = "test-only-openrouter-key-never-persist";
+        let suffix = RunId::new().value();
+        let database = std::env::temp_dir().join(format!("orynth-key-redaction-{suffix}.db"));
+        let repository = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let workspace = repository
+            .join("sandbox")
+            .join(format!("key-redaction-{suffix}"));
+        let mut config =
+            RuntimeConfig::parse(include_str!("../../../orynth.example.toml")).unwrap();
+        config.openrouter.api_key = Some(secret.into());
+        config.runtime.event_store = database.to_string_lossy().into_owned();
+
+        let mut source = LiveTuiSource::new(config, Some(workspace.clone()), "local-key.toml")
+            .expect("a direct key should configure the live source");
+        let snapshot = source.snapshot().unwrap();
+        let diagnostic = format!("{snapshot:?}");
+        assert!(diagnostic.contains("local-key.toml"));
+        assert!(!diagnostic.contains(secret));
+        drop(source);
+
+        for path in [
+            database.clone(),
+            database.with_extension("db-wal"),
+            database.with_extension("db-shm"),
+        ] {
+            if path.exists() {
+                let bytes = fs::read(&path).unwrap();
+                assert!(
+                    !bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes())
+                );
+            }
+        }
+        cleanup_database(&database);
+        fs::remove_dir(workspace).unwrap();
+    }
+
+    #[test]
+    fn coordinator_prose_cannot_create_a_sidebar_agent() {
+        let (database, mut service, run_id, task_id, agent_id, model, shared) =
+            coordinator_fixture();
+        let provider = MockProvider::new(model.clone(), "I created several specialist agents.");
+        let _ = run_coordinator_request(
+            &mut service,
+            &provider,
+            coordinator_request(run_id, task_id, agent_id, model),
+            CancellationToken::new(),
+            &shared,
+        )
+        .unwrap();
+        let recovered = service.recover(run_id).unwrap();
+        assert_eq!(recovered.manager.agents.len(), 1);
+        assert!(!recovered.events.iter().any(|stored| matches!(stored.event.kind, EventKind::AgentCreated { ref agent } if agent.id != agent_id)));
+        drop(service);
+        cleanup_database(&database);
+    }
+
+    #[test]
+    fn coordinator_passes_bounded_assignment_and_receives_worker_result() {
+        let (database, mut service, run_id, task_id, agent_id, model, _) = coordinator_fixture();
+        let config = RuntimeConfig::default();
+        let workspace = std::env::temp_dir();
+        let cancellation = CancellationToken::new();
+        let effect_gate = Arc::new(Mutex::new(()));
+        let mut context = CoordinatorActionContext {
+            service: &mut service,
+            run_id,
+            task_id,
+            agent_id,
+            worker_model: &model,
+            config: &config,
+            workspace: &workspace,
+            cancellation: &cancellation,
+            effect_gate: &effect_gate,
+        };
+        let call = ToolCall {
+            call_id: "spawn-1".into(),
+            name: "spawn_agent".into(),
+            arguments: serde_json::json!({
+                "name": "EDITOR-01", "role": "Frontend specialist",
+                "task": "Build editor tabs", "files": ["index.html", "editor.js"]
+            })
+            .to_string(),
+        };
+        let result = execute_coordinator_actions_with(&mut context, &[call], |_, assigned| {
+            assert_eq!(assigned.agent_name, "EDITOR-01");
+            assert_eq!(assigned.role, "Frontend specialist");
+            assert_eq!(assigned.user_text, "Build editor tabs");
+            assert_eq!(
+                assigned.owned_files,
+                vec!["index.html".to_owned(), "editor.js".to_owned()]
+            );
+            assert_eq!(assigned.workspace, workspace.as_path());
+            Ok((
+                "Worker wrote and verified index.html and editor.js".into(),
+                orynth_kernel::Usage::default(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![(
+                "spawn-1".into(),
+                "Worker wrote and verified index.html and editor.js".into(),
+                false
+            )]
+        );
+        let invalid = ToolCall {
+            call_id: "bad".into(),
+            name: "spawn_agent".into(),
+            arguments: serde_json::json!({"task":"Escape", "files":["../escape.txt"]}).to_string(),
+        };
+        assert!(
+            execute_coordinator_actions_with(&mut context, &[invalid], |_, _| panic!(
+                "invalid assignment reached worker"
+            ))
+            .is_err()
+        );
+        drop(service);
+        cleanup_database(&database);
+    }
+
+    #[test]
+    fn coordinator_spawn_action_creates_a_real_worker_and_returns_verified_work() {
+        struct ScriptedWorker {
+            model: ModelRef,
+            requests: AtomicUsize,
+        }
+        impl ModelProvider for ScriptedWorker {
+            fn model(&self) -> &ModelRef {
+                &self.model
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                MockProvider::new(self.model.clone(), "").capabilities()
+            }
+            fn stream(
+                &self,
+                request: ModelRequest,
+                cancellation: CancellationToken,
+            ) -> Result<
+                Box<dyn Iterator<Item = Result<ProviderEvent, ProviderError>> + Send>,
+                ProviderError,
+            > {
+                self.validate_request(&request)?;
+                if cancellation.is_cancelled() {
+                    return Err(ProviderError::Cancelled);
+                }
+                let events = if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(request.tool_choice, ToolChoice::Required);
+                    vec![
+                        ProviderEvent::ToolCallCompleted {
+                            call: ToolCall {
+                                call_id: "write-editor".into(),
+                                name: "filesystem_write_text".into(),
+                                arguments: serde_json::json!({
+                                    "path": "editor.js",
+                                    "content": "document.body.dataset.editor = 'ready';"
+                                })
+                                .to_string(),
+                            },
+                        },
+                        ProviderEvent::Finish(FinishReason::ToolCall),
+                    ]
+                } else {
+                    assert!(
+                        request
+                            .parts
+                            .iter()
+                            .any(|part| matches!(part, RequestPart::ToolResult { .. }))
+                    );
+                    vec![
+                        ProviderEvent::TextDelta {
+                            text: "Editor file written".into(),
+                        },
+                        ProviderEvent::Finish(FinishReason::Stop),
+                    ]
+                };
+                Ok(Box::new(events.into_iter().map(Ok)))
+            }
+        }
+
+        let (database, mut service, run_id, task_id, agent_id, model, _) = coordinator_fixture();
+        service
+            .configure_budget(
+                run_id,
+                agent_id,
+                BudgetLimits {
+                    max_child_agents: Some(1),
+                    ..BudgetLimits::default()
+                },
+            )
+            .unwrap();
+        let (root, sandbox) = workspace_test_root();
+        let workspace = sandbox.join("editor");
+        fs::create_dir_all(&workspace).unwrap();
+        let config = RuntimeConfig::default();
+        let cancellation = CancellationToken::new();
+        let effect_gate = Arc::new(Mutex::new(()));
+        let provider = ScriptedWorker {
+            model: model.clone(),
+            requests: AtomicUsize::new(0),
+        };
+        let mut context = CoordinatorActionContext {
+            service: &mut service,
+            run_id,
+            task_id,
+            agent_id,
+            worker_model: &model,
+            config: &config,
+            workspace: &workspace,
+            cancellation: &cancellation,
+            effect_gate: &effect_gate,
+        };
+        let call = ToolCall {
+            call_id: "spawn-editor".into(),
+            name: "spawn_agent".into(),
+            arguments: serde_json::json!({
+                "name": "EDITOR-01",
+                "role": "Browser editor specialist",
+                "task": "Implement the browser editor",
+                "files": ["editor.js"]
+            })
+            .to_string(),
+        };
+        let results = execute_coordinator_actions_with(&mut context, &[call], |service, task| {
+            worker::run_with_provider(service, task, &provider)
+        })
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].2);
+        assert!(results[0].1.contains("editor.js"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("editor.js")).unwrap(),
+            "document.body.dataset.editor = 'ready';"
+        );
+        let recovered = service.recover(run_id).unwrap();
+        let worker = recovered
+            .manager
+            .agents
+            .values()
+            .find(|agent| agent.name == "EDITOR-01")
+            .unwrap();
+        assert_ne!(worker.agent_id, agent_id);
+        assert_eq!(worker.parent_id, Some(agent_id));
+        assert!(recovered.events.iter().any(|stored| matches!(&stored.event.kind, EventKind::AgentCreated { agent } if agent.id == worker.agent_id)));
+        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, orynth_ipc::IpcMessage::ReviewRequest { instructions, .. } if instructions == "Implement the browser editor")));
+        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, orynth_ipc::IpcMessage::Handoff { summary } if summary == &results[0].1)));
+        drop(service);
+        cleanup_database(&database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_partial_turn_is_recorded_and_same_coordinator_can_continue() {
+        struct CancellingProvider {
+            model: ModelRef,
+        }
+        impl ModelProvider for CancellingProvider {
+            fn model(&self) -> &ModelRef {
+                &self.model
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                MockProvider::new(self.model.clone(), "").capabilities()
+            }
+            fn stream(
+                &self,
+                request: ModelRequest,
+                cancellation: CancellationToken,
+            ) -> Result<
+                Box<dyn Iterator<Item = Result<ProviderEvent, ProviderError>> + Send>,
+                ProviderError,
+            > {
+                self.validate_request(&request)?;
+                let mut emitted = false;
+                Ok(Box::new(std::iter::from_fn(move || {
+                    if !emitted {
+                        emitted = true;
+                        Some(Ok(ProviderEvent::TextDelta {
+                            text: "unfinished".into(),
+                        }))
+                    } else {
+                        cancellation.cancel();
+                        Some(Err(ProviderError::Cancelled))
+                    }
+                })))
+            }
+        }
+        let (database, mut service, run_id, task_id, agent_id, model, shared) =
+            coordinator_fixture();
+        let token = CancellationToken::new();
+        let result = run_coordinator_request(
+            &mut service,
+            &CancellingProvider {
+                model: model.clone(),
+            },
+            coordinator_request(run_id, task_id, agent_id, model.clone()),
+            token.clone(),
+            &shared,
+        );
+        assert!(result.is_err());
+        assert!(token.is_cancelled());
+        record_live_turn_failure(
+            &database,
+            run_id,
+            agent_id,
+            "Coordinator request cancelled",
+            true,
+        )
+        .unwrap();
+        let recovered = service.recover(run_id).unwrap();
+        assert!(
+            recovered
+                .events
+                .iter()
+                .any(|stored| matches!(stored.event.kind, EventKind::ModelChunkReceived { .. }))
+        );
+        assert!(
+            recovered
+                .events
+                .iter()
+                .any(|stored| matches!(stored.event.kind, EventKind::ModelTurnCancelled { .. }))
+        );
+        assert!(!recovered.events.iter().any(|stored| matches!(
+            stored.event.kind,
+            EventKind::ModelTurnCompleted { .. } | EventKind::ConversationTurn { .. }
+        )));
+        assert_eq!(
+            recovered.state.agents[&agent_id].status,
+            AgentStatus::Running
+        );
+        let provider = MockProvider::new(model.clone(), "README task acknowledged");
+        let (answer, _, _, _) = run_coordinator_request(
+            &mut service,
+            &provider,
+            coordinator_request(run_id, task_id, agent_id, model),
+            CancellationToken::new(),
+            &shared,
+        )
+        .unwrap();
+        assert_eq!(answer, "README task acknowledged");
+        assert_eq!(service.recover(run_id).unwrap().manager.agents.len(), 1);
+        drop(service);
+        cleanup_database(&database);
     }
 
     #[test]

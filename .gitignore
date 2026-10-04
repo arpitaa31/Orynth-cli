@@ -1,7 +1,7 @@
 /target/
 .orynth/
+orynth.toml
 .env
 .env.*
 *.log
 .DS_Store
-

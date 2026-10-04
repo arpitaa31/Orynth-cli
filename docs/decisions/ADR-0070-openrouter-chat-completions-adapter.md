@@ -12,7 +12,8 @@ streamed text and function-call format is broadly supported by free and
 explicit models. The adapter decodes SSE into Orynth provider events. It never
 executes filesystem or process effects.
 
-The key comes only from `OPENROUTER_API_KEY`. Config keeps the route/model ID
+The key may come from a direct `api_key` or from the configured `api_key_env`
+environment variable, with the direct value taking precedence. Config keeps the route/model ID
 per logical agent role and a free-only policy; the resolved model and provider
 request ID and selected underlying provider are response observations, not changes of agent identity or route.
 The runtime persists those observations in the normal event stream. It also

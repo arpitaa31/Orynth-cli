@@ -7,7 +7,9 @@ Coordinator turns are durable; Phase G live acceptance is pending. Deep Audit
 
 ## Primary Workspace
 
-`orynth` opens the normal Workspace. `orynth --demo` opens a deterministic
+`orynth [--config <path>]` opens the normal Workspace. The default config is
+`orynth.toml`; `--config` applies to the live provider and all workers.
+`orynth --demo` opens a deterministic
 offline team scenario. `orynth debug --demo` opens Advanced Debugger directly.
 An explicit `orynth --db <path> [--run <id>]` opens persisted runs for
 inspection; it does not start a new live provider session.
@@ -86,7 +88,9 @@ transactions. `ORYNTH_TUI_DEMO_AGENTS=10` remains available for measurement.
 technical details; `Tab`/`Shift-Tab` changes screens; `1`-`9` jumps directly;
 `/` filters; `r` refreshes authoritative state; `[`/`]` pages older/newest
 Activity; `a` toggles Conflicts/Assumptions; `s` selects a run on Runs; `?`
-opens contextual help; `Esc` closes help/details; `q` or `Ctrl-C` exits.
+opens contextual help; `Esc` closes help/details; `q` or `Ctrl-C` exits when
+idle. While the live Coordinator is busy, `Esc` or `Ctrl-C` interrupts the
+current turn and keeps the Workspace open.
 
 The footer is dynamic. It advertises `Enter` only when the current screen has
 an inspectable item, and only advertises Activity paging, run selection, or

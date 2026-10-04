@@ -6,6 +6,7 @@ artifact_dir = ".orynth/artifacts"
 [providers.openrouter]
 enabled = true
 base_url = "https://openrouter.ai/api/v1"
+# api_key = "paste-your-openrouter-key-here"
 api_key_env = "OPENROUTER_API_KEY"
 free_only = true
 title = "Orynth"

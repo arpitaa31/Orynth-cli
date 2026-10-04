@@ -1,5 +1,18 @@
 # Current Plan
 
+## Reviewer feedback release patch - in progress
+
+Direct or environment OpenRouter credentials, explicit live `--config`,
+configured/resolved model labels, generic `spawn_agent` delegation, and
+Esc/Ctrl+C turn interruption are implemented in the worktree. The coding worker
+uses the rooted filesystem tool with optional file scope and bounded budgets;
+the old website-only write restrictions are removed. Focused CLI, provider,
+app, and TUI tests pass. All five required gates now pass, including the exact
+all-features workspace test and release workspace build commands. The rebuilt
+release binary runs `help` with `--config` visible. Manual tests A-D are the
+remaining acceptance work; no live OpenRouter key is available in this
+session. Do not declare reviewer retest ready until live acceptance passes.
+
 ## Phase G.5: durable multi-turn agent execution - in progress
 
 The live Coordinator and rooted worker now treat provider completions as model
@@ -33,20 +46,22 @@ are blocked by Application Control (OS error 4551), and only the Windows Rust
 target is installed locally.
 
 G2/G3/G4: The live Workspace streams Coordinator text, requires a typed
-`delegate_personal_site` proposal for the tiny website task, invokes one
+`spawn_agent` proposal for a bounded coding task, invokes one
 rooted worker through Orynth's capability, ownership, and typed-tool pipeline,
 records IPC assignment/handoff, and returns the verified worker result to
 Coordinator. Provider-turn completion leaves the logical Coordinator active
 for multi-turn chat and tool-result continuation (ADR-0071). A persisted
-twelve-request cap covers both agents in one live run. Offline Coordinator
+48-request cap covers both agents in one live run. Offline Coordinator
 and worker integration tests cover consecutive turns, committed tool writes,
 and out-of-workspace rejection. Terminal run replay now closes any still-active
 Coordinator or worker while preserving each previously finished agent's result.
 The worker now records usage for each provider turn, shutdown is serialized
 with its verified file transaction, and the Coordinator handoff contains only
-verified file results. The release app library suite passes (20/20).
+verified file results. Before the reviewer feedback patch, the release app
+library suite passed (20/20). The following validation statements are from
+that earlier build and do not verify the current patch.
 Exact workspace check, warnings-denied Clippy, formatting, and the full release
-workspace build pass; its binary ran `help`, opened the offline demo, and exited
+workspace build passed then; its binary ran `help`, opened the offline demo, and exited
 cleanly via Ctrl+C. The latest all-features workspace test passed the app,
 agent, assumptions, and cache suites before Application Control blocked the
 CLI test executable (OS error 4551). Earlier release workspace test attempts also

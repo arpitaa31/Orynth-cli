@@ -39,7 +39,7 @@ use orynth_tui::{
     run_fullscreen, run_workspace_started_at, scan_semantic_breakpoints,
 };
 
-const HELP: &str = "Usage:\n  orynth [--db <path>] [--run <run-id>] [--workspace <path>]\n  orynth --demo\n  orynth provider test openrouter [--config <path>]\n  orynth provider tool-test openrouter [--config <path>]\n  orynth provider site-test openrouter [--config <path>]\n  orynth debug [--db <path>] [--run <run-id>] [--demo]\n  orynth debug-session --db <path> --run <run-id>\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth help";
+const HELP: &str = "Usage:\n  orynth [--config <path>] [--db <path>] [--run <run-id>] [--workspace <path>]\n  orynth --demo\n  orynth provider test openrouter [--config <path>]\n  orynth provider tool-test openrouter [--config <path>]\n  orynth provider site-test openrouter [--config <path>]\n  orynth debug [--db <path>] [--run <run-id>] [--demo]\n  orynth debug-session --db <path> --run <run-id>\n  orynth inspect --db <path> --run <run-id>\n  orynth replay --db <path> --run <run-id> [--at <sequence>]\n  orynth fork --db <path> --run <run-id> --at <sequence> --child <run-id> [--mode recorded|reexecute|live]\n  orynth diff --db <path> --left <run-id> --right <run-id>\n  orynth help";
 const MAX_TUI_EVENT_WINDOW: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +87,7 @@ pub enum Command {
     Tui {
         database: PathBuf,
         explicit_database: bool,
+        config: Option<PathBuf>,
         run: Option<u64>,
         demo: bool,
         workspace: Option<PathBuf>,
@@ -165,6 +166,7 @@ where
     let mut right = None;
     let mut demo = false;
     let mut workspace = None;
+    let mut config = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--db" => {
@@ -248,6 +250,13 @@ where
                         .into(),
                 );
             }
+            "--config" if command == "tui" => {
+                config = Some(
+                    args.next()
+                        .ok_or_else(|| "--config requires a path".to_owned())?
+                        .into(),
+                );
+            }
             other => return Err(format!("unknown {command} argument {other:?}\n\n{HELP}")),
         }
     }
@@ -263,9 +272,15 @@ where
             });
         }
         let explicit_database = database.is_some();
+        if config.is_some() && (explicit_database || run.is_some() || demo) {
+            return Err(
+                "--config is only for the live Workspace; omit --db, --run, and --demo".into(),
+            );
+        }
         return Ok(Command::Tui {
             database: database.unwrap_or_else(|| PathBuf::from(".orynth/runtime.db")),
             explicit_database,
+            config,
             run,
             demo,
             workspace,
@@ -353,17 +368,26 @@ where
             run,
             demo,
         } => {
-            run_tui(database, true, run, demo, true, None)?;
+            run_tui(database, true, None, run, demo, true, None)?;
             Ok(None)
         }
         Command::Tui {
             database,
             explicit_database,
+            config,
             run,
             demo,
             workspace,
         } => {
-            run_tui(database, explicit_database, run, demo, false, workspace)?;
+            run_tui(
+                database,
+                explicit_database,
+                config,
+                run,
+                demo,
+                false,
+                workspace,
+            )?;
             Ok(None)
         }
     }
@@ -514,8 +538,10 @@ fn provider_test_openrouter(path: PathBuf) -> Result<String, String> {
         other => return Err(format!("unsupported model class {other}")),
     };
     let model = ModelRef::new("openrouter", &configured.model, class);
-    let provider = OpenRouterProvider::from_env(
+    let provider = OpenRouterProvider::from_config(
         model.clone(),
+        config.openrouter.api_key.as_deref(),
+        config.openrouter.api_key_env.as_deref(),
         &config.openrouter.base_url,
         config.openrouter.title.clone(),
     )
@@ -574,8 +600,10 @@ fn provider_tool_test_openrouter(path: PathBuf) -> Result<String, String> {
             observed.clone()
         } else {
             let model = ModelRef::new("openrouter", &configured.model, class);
-            let provider = OpenRouterProvider::from_env(
+            let provider = OpenRouterProvider::from_config(
                 model.clone(),
+                config.openrouter.api_key.as_deref(),
+                config.openrouter.api_key_env.as_deref(),
                 &config.openrouter.base_url,
                 config.openrouter.title.clone(),
             )
@@ -853,6 +881,7 @@ impl TuiDataSource for DemoTuiSource {
 fn run_tui(
     database: PathBuf,
     explicit_database: bool,
+    config_path: Option<PathBuf>,
     run: Option<u64>,
     demo: bool,
     advanced: bool,
@@ -874,20 +903,37 @@ fn run_tui(
         if advanced {
             run_fullscreen(DbTuiSource::new(database, run))
         } else {
-            if run.is_none() && !explicit_database && std::path::Path::new("orynth.toml").exists() {
-                let config =
-                    RuntimeConfig::from_path("orynth.toml").map_err(|error| error.to_string())?;
-                if config.openrouter.enabled
-                    && config
-                        .models
-                        .manager
-                        .as_ref()
-                        .is_some_and(|model| model.provider == "openrouter")
-                {
-                    return run_workspace_started_at(
-                        live::LiveTuiSource::new(config, workspace)?,
-                        started_at,
-                    );
+            if run.is_none() && !explicit_database {
+                let explicit_config = config_path.is_some();
+                let selected_config = config_path.unwrap_or_else(|| PathBuf::from("orynth.toml"));
+                if !selected_config.exists() {
+                    if workspace.is_some() || explicit_config {
+                        return Err(format!(
+                            "configuration file not found: {}",
+                            selected_config.display()
+                        ));
+                    }
+                } else {
+                    let config = load_config_for_live(&selected_config)?;
+                    if config.openrouter.enabled
+                        && config
+                            .models
+                            .manager
+                            .as_ref()
+                            .is_some_and(|model| model.provider == "openrouter")
+                    {
+                        return run_workspace_started_at(
+                            live::LiveTuiSource::new(
+                                config,
+                                workspace,
+                                selected_config.display().to_string(),
+                            )?,
+                            started_at,
+                        );
+                    }
+                    if explicit_config {
+                        return Err("selected config must enable OpenRouter and configure [models.coordinator] with provider = \"openrouter\"".into());
+                    }
                 }
             }
             if workspace.is_some() {
@@ -896,6 +942,10 @@ fn run_tui(
             run_workspace_started_at(DbTuiSource::new(database, run), started_at)
         }
     }
+}
+
+fn load_config_for_live(path: &std::path::Path) -> Result<RuntimeConfig, String> {
+    RuntimeConfig::from_path(path).map_err(|error| error.to_string())
 }
 
 fn bound_tui_history(mut recovered: orynth_runtime::RecoveredRun) -> orynth_runtime::RecoveredRun {
@@ -1849,6 +1899,7 @@ mod tests {
             Ok(Command::Tui {
                 database: PathBuf::from(".orynth/runtime.db"),
                 explicit_database: false,
+                config: None,
                 run: None,
                 demo: false,
                 workspace: None,
@@ -1859,6 +1910,7 @@ mod tests {
             Ok(Command::Tui {
                 database: PathBuf::from(".orynth/runtime.db"),
                 explicit_database: false,
+                config: None,
                 run: None,
                 demo: true,
                 workspace: None,
@@ -1876,6 +1928,7 @@ mod tests {
             Ok(Command::Tui {
                 database: PathBuf::from(".orynth/runtime.db"),
                 explicit_database: false,
+                config: None,
                 run: None,
                 demo: true,
                 workspace: None,
@@ -1886,11 +1939,52 @@ mod tests {
             Ok(Command::Tui {
                 database: PathBuf::from("recorded.db"),
                 explicit_database: true,
+                config: None,
                 run: None,
                 demo: false,
                 workspace: None,
             })
         );
+        assert_eq!(
+            parse_args(["--config", "gemini.toml", "--workspace", "sandbox/editor"]),
+            Ok(Command::Tui {
+                database: PathBuf::from(".orynth/runtime.db"),
+                explicit_database: false,
+                config: Some(PathBuf::from("gemini.toml")),
+                run: None,
+                demo: false,
+                workspace: Some(PathBuf::from("sandbox/editor")),
+            })
+        );
+        assert!(parse_args(["--config", "gemini.toml", "--db", "recorded.db"]).is_err());
+    }
+
+    #[test]
+    fn selected_live_config_path_controls_the_actual_model() {
+        let path = std::env::temp_dir().join(format!(
+            "orynth-selected-config-{}.toml",
+            RunId::new().value()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[providers.openrouter]
+enabled = true
+api_key = "local-test-key"
+free_only = false
+[models.coordinator]
+provider = "openrouter"
+model = "google/explicit-model"
+class = "strong"
+"#,
+        )
+        .unwrap();
+        let config = load_config_for_live(&path).unwrap();
+        assert_eq!(
+            config.models.manager.unwrap().model,
+            "google/explicit-model"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
