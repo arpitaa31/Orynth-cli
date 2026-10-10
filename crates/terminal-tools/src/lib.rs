@@ -646,6 +646,43 @@ impl FilesystemFixture {
         &self.root
     }
 
+    /// Read a small UTF-8 file through the same rooted path checks as effects.
+    /// Intended for bounded, read-only workspace review projections.
+    pub fn read_text_bounded(&self, relative: &str, max_bytes: usize) -> Result<String, String> {
+        let path = self.checked_path(relative)?;
+        let metadata = fs::metadata(&path).map_err(io_error)?;
+        if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+            return Err(
+                FilesystemError::InvalidInput("review file is not a bounded regular file")
+                    .to_string(),
+            );
+        }
+        let bytes = fs::read(path).map_err(io_error)?;
+        if bytes.len() > max_bytes {
+            return Err(
+                FilesystemError::InvalidInput("review file exceeded its size bound").to_string(),
+            );
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| FilesystemError::InvalidInput("review file is not UTF-8").to_string())
+    }
+
+    pub fn list_root_files_bounded(&self, max_files: usize) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if self.checked_path(&name).is_ok() && entry.file_type().map_err(io_error)?.is_file() {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names.truncate(max_files);
+        Ok(names)
+    }
+
     /// Export only the validated, path-relative data needed for a later undo.
     pub fn export_undo(&self, token: &str) -> Result<FilesystemUndoRecord, String> {
         let record = self

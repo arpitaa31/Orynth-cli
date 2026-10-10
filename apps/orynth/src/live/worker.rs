@@ -23,7 +23,7 @@ use orynth_tool_runtime::{
     ApprovalSource, ToolProposal, ToolProvenance, ToolRuntime, ToolState, ToolTransition,
 };
 
-use super::ensure_provider_request_budget;
+use super::{bound_conversation_parts, ensure_provider_request_budget, runtime_budget_error};
 
 const MAX_WORKER_CALLS: usize = 12;
 const MAX_WORKER_REQUESTS: usize = 8;
@@ -45,6 +45,8 @@ pub(super) struct WorkerTask<'a> {
     pub workspace: &'a Path,
     pub user_text: &'a str,
     pub owned_files: Vec<String>,
+    pub budget_tokens: u64,
+    pub review_only: bool,
     pub cancellation: CancellationToken,
     pub effect_gate: Arc<Mutex<()>>,
 }
@@ -83,6 +85,8 @@ pub(super) fn run_with_provider(
         workspace,
         user_text,
         owned_files,
+        budget_tokens,
+        review_only,
         cancellation,
         effect_gate,
     } = task;
@@ -115,7 +119,7 @@ pub(super) fn run_with_provider(
                 run_id,
                 child.id,
                 BudgetLimits {
-                    max_tokens: Some(20_000),
+                    max_tokens: Some(budget_tokens),
                     max_tool_calls: Some(MAX_WORKER_CALLS as u64),
                     max_wall_clock_ms: Some(180_000),
                     max_child_agents: Some(0),
@@ -123,22 +127,26 @@ pub(super) fn run_with_provider(
                 },
             )
             .map_err(|error| error.to_string())?;
-        service
-            .grant_capability(
-                run_id,
-                CapabilityLease {
-                    agent_id: child.id,
-                    task_id: Some(task_id),
-                    domain: CapabilityDomain::Filesystem,
-                    resource: ".".into(),
-                    expires_at_ms: u128::MAX,
-                },
-            )
-            .map_err(|error| error.to_string())?;
+        if !review_only {
+            service
+                .grant_capability(
+                    run_id,
+                    CapabilityLease {
+                        agent_id: child.id,
+                        task_id: Some(task_id),
+                        domain: CapabilityDomain::Filesystem,
+                        resource: ".".into(),
+                        expires_at_ms: u128::MAX,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
         let mut fixture = FilesystemFixture::new(workspace).map_err(|error| error.to_string())?;
         let _ = (base_url, title);
         let owned_files = owned_files.into_iter().collect::<BTreeSet<_>>();
-        let file_scope = if owned_files.is_empty() {
+        let file_scope = if review_only {
+            "Review the provided workspace files. Do not write files. Report concrete findings or state that you found none.".to_owned()
+        } else if owned_files.is_empty() {
             "You may write ordinary files in the selected workspace.".to_owned()
         } else {
             format!(
@@ -147,7 +155,7 @@ pub(super) fn run_with_provider(
             )
         };
         let system = format!(
-            "You are {}, an Orynth coding worker with role {}. Complete the assigned coding task using only the filesystem_write_text tool in the selected workspace. {file_scope} No shell or hosted tools are available. Keep each file under 16 KiB. Parent directories must already exist. After writing, give a short factual summary.",
+            "You are {}, an Orynth worker with role {}. Complete only the assigned task in the selected workspace. {file_scope} No shell or hosted tools are available. Coding workers may use filesystem_write_text. Tool paths must be relative to the selected workspace, for example index.html or app.js; never include the workspace directory or an absolute path. Keep each file under 16 KiB and use existing parent directories. Give a short factual result.",
             child.name, child.mission
         );
         let recovered = service.recover(run_id).map_err(|error| error.to_string())?;
@@ -181,10 +189,16 @@ pub(super) fn run_with_provider(
             RequestPart::System(context_prompt.text),
             RequestPart::User(user_text.into()),
         ];
+        if review_only {
+            next_parts.push(RequestPart::System(review_workspace_snapshot(
+                workspace,
+                &owned_files,
+            )?));
+        }
         let mut total_usage = Usage::default();
         let mut saw_usage = false;
         let mut tool_count = 0usize;
-        let mut verified_files = Vec::new();
+        let mut verified_files: Vec<String> = Vec::new();
         let mut unproductive_turns = 0usize;
         let started = Instant::now();
         let mut final_text = String::new();
@@ -196,16 +210,21 @@ pub(super) fn run_with_provider(
                 return Err("worker wall-clock budget exceeded".into());
             }
             let mut request = ModelRequest::new(run_id, task_id, child.id, model.clone(), "");
+            bound_conversation_parts(&mut next_parts);
             request.parts = next_parts.clone();
             request.max_output_tokens = Some(2048);
-            if verified_files.is_empty() {
+            if verified_files.is_empty() && !review_only {
                 request.tool_choice = ToolChoice::Required;
             }
-            request.tools = vec![ProviderToolDefinition {
+            request.tools = if review_only {
+                Vec::new()
+            } else {
+                vec![ProviderToolDefinition {
             name: WIRE_WRITE_TOOL.into(),
             description: "Write one UTF-8 file inside Orynth's selected workspace".into(),
             input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}"#.into(),
-        }];
+        }]
+            };
             ensure_provider_request_budget(service, run_id)?;
             service
                 .record_model_transition(
@@ -270,6 +289,11 @@ pub(super) fn run_with_provider(
             let Some(finish) = finish else {
                 return Err("worker provider stream ended early".into());
             };
+            let finish = if finish == FinishReason::Stop && !calls.is_empty() {
+                FinishReason::ToolCall
+            } else {
+                finish
+            };
             if cancellation.is_cancelled() {
                 return Err("worker cancelled".into());
             }
@@ -318,10 +342,32 @@ pub(super) fn run_with_provider(
                             ..BudgetUsage::default()
                         },
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| runtime_budget_error("Worker", error))?;
+            }
+            if review_only && !calls.is_empty() {
+                return Err("review worker requested a write tool".into());
             }
             if calls.is_empty() {
                 if finish == FinishReason::Stop {
+                    let missing = owned_files
+                        .iter()
+                        .filter(|file| !verified_files.contains(*file))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !review_only && (verified_files.is_empty() || !missing.is_empty()) {
+                        unproductive_turns = unproductive_turns.saturating_add(1);
+                        if unproductive_turns >= MAX_UNPRODUCTIVE_TURNS {
+                            return Err("worker did not complete required file writes after repeated reminders".into());
+                        }
+                        if !text.trim().is_empty() {
+                            next_parts.push(RequestPart::Model(text));
+                        }
+                        next_parts.push(RequestPart::System(format!(
+                            "The worker assignment is incomplete. Call filesystem_write_text for the required files before your final answer. Missing assigned files: {}. Use paths relative to the selected workspace.",
+                            if missing.is_empty() { "at least one file".into() } else { missing.join(", ") }
+                        )));
+                        continue;
+                    }
                     final_text = text;
                     break;
                 }
@@ -370,15 +416,26 @@ pub(super) fn run_with_provider(
                 if started.elapsed().as_millis() > 180_000 {
                     return Err("worker wall-clock budget exceeded".into());
                 }
-                if call.name != WIRE_WRITE_TOOL {
-                    return Err("worker requested an unavailable tool".into());
+                if call.name != WIRE_WRITE_TOOL && call.name != FILESYSTEM_WRITE_TOOL {
+                    next_parts.push(RequestPart::ToolResult {
+                        call_id: call.call_id,
+                        content: format!(
+                            "Unavailable tool {}. Use filesystem_write_text with path and content.",
+                            call.name
+                        ),
+                        is_error: true,
+                    });
+                    tool_count += 1;
+                    continue;
                 }
                 let args: serde_json::Value = serde_json::from_str(&call.arguments)
                     .map_err(|_| "worker supplied invalid tool JSON")?;
-                let path = args["path"].as_str().ok_or("tool path missing")?;
+                let path = normalize_worker_path_in_workspace(
+                    args["path"].as_str().ok_or("tool path missing")?,
+                    workspace,
+                )?;
                 let content = args["content"].as_str().ok_or("tool content missing")?;
-                validate_worker_path(path)?;
-                if !owned_files.is_empty() && !owned_files.contains(path) {
+                if !owned_files.is_empty() && !owned_files.contains(&path) {
                     return Err(format!(
                         "worker file is outside assigned file scope: {path}"
                     ));
@@ -387,7 +444,7 @@ pub(super) fn run_with_provider(
                     return Err("worker file content is empty or too large".into());
                 }
                 service
-                    .claim_ownership(run_id, child.id, path)
+                    .claim_ownership(run_id, child.id, &path)
                     .map_err(|error| error.to_string())?;
                 let mut tools = ToolRuntime::new();
                 tools
@@ -399,11 +456,11 @@ pub(super) fn run_with_provider(
                         agent_id: child.id,
                         task_id: Some(task_id),
                         domain: CapabilityDomain::Filesystem,
-                        resource: path.into(),
+                        resource: path.clone(),
                         expires_at_ms: u128::MAX,
                     })
                     .map_err(|error| error.to_string())?;
-                let ownership = ExclusiveOwnershipPolicy::new(child.id, path)
+                let ownership = ExclusiveOwnershipPolicy::new(child.id, &path)
                     .map_err(|error| error.to_string())?;
                 let proposal = ToolProposal {
                     run_id,
@@ -411,7 +468,7 @@ pub(super) fn run_with_provider(
                     agent_id: child.id,
                     tool_name: FILESYSTEM_WRITE_TOOL.into(),
                     input: BTreeMap::from([
-                        ("path".into(), path.into()),
+                        ("path".into(), path.clone()),
                         ("content".into(), content.into()),
                     ]),
                     provenance: ToolProvenance::Agent,
@@ -489,8 +546,8 @@ pub(super) fn run_with_provider(
                         },
                     )
                     .map_err(|error| error.to_string())?;
-                if !verified_files.iter().any(|file| file == path) {
-                    verified_files.push(path.to_owned());
+                if !verified_files.iter().any(|file| file == &path) {
+                    verified_files.push(path.clone());
                 }
                 tool_count += 1;
                 next_parts.push(RequestPart::ToolResult {
@@ -500,12 +557,13 @@ pub(super) fn run_with_provider(
                 });
             }
         }
-        if verified_files.is_empty() {
+        if verified_files.is_empty() && !review_only {
             return Err("worker did not write any files".into());
         }
         let missing = owned_files
             .iter()
-            .filter(|file| !verified_files.iter().any(|written| written == *file))
+            .filter(|_| !review_only)
+            .filter(|file| !verified_files.contains(*file))
             .cloned()
             .collect::<Vec<_>>();
         if !missing.is_empty() {
@@ -545,11 +603,19 @@ pub(super) fn run_with_provider(
                 )
                 .map_err(|error| error.to_string())?;
         }
-        let summary = format!(
-            "Worker wrote and verified {} file(s) in the selected Orynth workspace: {}.",
-            verified_files.len(),
-            verified_files.join(", ")
-        );
+        let summary = if review_only {
+            format!(
+                "Review worker {} inspected workspace files: {}",
+                child.name,
+                final_text.trim()
+            )
+        } else {
+            format!(
+                "Worker wrote and verified {} file(s) in the selected Orynth workspace: {}.",
+                verified_files.len(),
+                verified_files.join(", ")
+            )
+        };
         service
             .send_message(IpcEnvelope::new(
                 run_id,
@@ -564,6 +630,13 @@ pub(super) fn run_with_provider(
         Ok((summary, total_usage))
     })();
     if let Err(message) = &result {
+        if let Ok(recovered) = service.recover(run_id)
+            && let Some(agent) = recovered.manager.agents.get(&child.id)
+        {
+            for resource in agent.owned_resources.clone() {
+                let _ = service.release_ownership(run_id, child.id, resource);
+            }
+        }
         if cancellation.is_cancelled() && request_in_flight {
             let _ = service.record_model_transition(
                 run_id,
@@ -590,22 +663,86 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn review_workspace_snapshot(
+    workspace: &Path,
+    owned_files: &BTreeSet<String>,
+) -> Result<String, String> {
+    let fixture = FilesystemFixture::new(workspace).map_err(|error| error.to_string())?;
+    let paths = if owned_files.is_empty() {
+        fixture.list_root_files_bounded(16)?
+    } else {
+        owned_files.iter().take(16).cloned().collect::<Vec<_>>()
+    };
+    let mut snapshot = String::from("Read-only workspace snapshot (bounded):\n");
+    for path in paths {
+        validate_worker_path(&path)?;
+        let content = match fixture.read_text_bounded(&path, 16 * 1024) {
+            Ok(content) => content,
+            Err(error) => {
+                snapshot.push_str(&format!("{path}: unavailable ({error})\n"));
+                continue;
+            }
+        };
+        if snapshot.len().saturating_add(content.len()) > 32 * 1024 {
+            break;
+        }
+        snapshot.push_str(&format!("\nFILE {path}:\n{content}\n"));
+    }
+    Ok(snapshot)
+}
+
 pub(super) fn validate_worker_path(path: &str) -> Result<(), String> {
+    normalize_worker_path(path).map(|_| ())
+}
+
+pub(super) fn normalize_worker_path(path: &str) -> Result<String, String> {
     if path.is_empty() || path.len() > 240 || path.contains('\0') {
         return Err("worker file path is empty or invalid".into());
     }
     let candidate = Path::new(path);
-    if candidate.is_absolute()
-        || candidate
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        || candidate.components().any(|component| {
-            matches!(component, Component::Normal(name) if name == ".orynth" || name == ".orynth-quarantine")
-        })
-    {
+    if candidate.is_absolute() {
         return Err("worker file path must stay inside the selected workspace".into());
     }
-    Ok(())
+    let mut names = Vec::new();
+    for component in candidate.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) if name != ".orynth" && name != ".orynth-quarantine" => {
+                names.push(name.to_string_lossy().into_owned());
+            }
+            _ => return Err("worker file path must stay inside the selected workspace".into()),
+        }
+    }
+    if names.is_empty() {
+        return Err("worker file path is empty or invalid".into());
+    }
+    Ok(names.join("/"))
+}
+
+pub(super) fn normalize_worker_path_in_workspace(
+    path: &str,
+    workspace: &Path,
+) -> Result<String, String> {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return normalize_worker_path(path);
+    }
+    let root = workspace
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let parent = candidate
+        .parent()
+        .ok_or("worker file path must stay inside the selected workspace")?
+        .canonicalize()
+        .map_err(|_| "worker file path must stay inside the selected workspace")?;
+    let relative_parent = parent
+        .strip_prefix(&root)
+        .map_err(|_| "worker file path must stay inside the selected workspace")?;
+    let file_name = candidate
+        .file_name()
+        .ok_or("worker file path must stay inside the selected workspace")?;
+    let relative = relative_parent.join(file_name);
+    normalize_worker_path(&relative.to_string_lossy())
 }
 
 fn worker_stream_with_retry(
@@ -660,6 +797,33 @@ mod tests {
     };
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn worker_paths_normalize_benign_relative_prefix_and_reject_escape() {
+        assert_eq!(normalize_worker_path("./app.js").unwrap(), "app.js");
+        assert_eq!(
+            normalize_worker_path("samples/hello.txt").unwrap(),
+            "samples/hello.txt"
+        );
+        assert!(normalize_worker_path("../escape.txt").is_err());
+        #[cfg(windows)]
+        assert!(normalize_worker_path("C:/outside.txt").is_err());
+        let root = std::env::temp_dir().join(format!("orynth-path-check-{}", RunId::new().value()));
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(
+            normalize_worker_path_in_workspace(&root.join("app.js").to_string_lossy(), &root)
+                .unwrap(),
+            "app.js"
+        );
+        assert!(
+            normalize_worker_path_in_workspace(
+                &root.parent().unwrap().join("outside.js").to_string_lossy(),
+                &root
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(root).unwrap();
+    }
 
     struct SequenceProvider {
         model: ModelRef,
@@ -755,7 +919,7 @@ mod tests {
                 run.id,
                 coordinator.id,
                 BudgetLimits {
-                    max_child_agents: Some(1),
+                    max_child_agents: Some(4),
                     ..BudgetLimits::default()
                 },
             )
@@ -821,6 +985,8 @@ mod tests {
                 workspace: &root,
                 user_text: "Make a simple personal website for Arpi",
                 owned_files: Vec::new(),
+                budget_tokens: 50_000,
+                review_only: false,
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -886,6 +1052,8 @@ mod tests {
                 workspace: &root,
                 user_text: "Make a simple personal website for Arpi",
                 owned_files: Vec::new(),
+                budget_tokens: 50_000,
+                review_only: false,
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -930,7 +1098,7 @@ mod tests {
             model: model.clone(),
             scripts: Mutex::new(VecDeque::from([
                 calls
-                    .chain([ProviderEvent::Finish(FinishReason::ToolCall)])
+                    .chain([ProviderEvent::Finish(FinishReason::Stop)])
                     .collect(),
                 vec![
                     ProviderEvent::TextDelta {
@@ -957,6 +1125,8 @@ mod tests {
                 workspace: &root,
                 user_text: task,
                 owned_files: files.iter().map(|(path, _)| (*path).to_owned()).collect(),
+                budget_tokens: 50_000,
+                review_only: false,
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -987,6 +1157,137 @@ mod tests {
                 .filter(|record| record.state == ToolState::Committed)
                 .count(),
             4
+        );
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_implementation_workers_and_read_only_qa_have_real_distinct_ids() {
+        let (mut service, run_id, task_id, coordinator_id, root) = seeded_service("team");
+        let model = ModelRef::new("mock", "editor", ModelClass::Cheap);
+        for (name, role, path, content) in [
+            (
+                "UI-01",
+                "UI specialist",
+                "index.html",
+                "<main>Editor</main>",
+            ),
+            (
+                "LOGIC-02",
+                "Logic specialist",
+                "app.js",
+                "const ready = true;",
+            ),
+        ] {
+            let provider = SequenceProvider {
+                model: model.clone(),
+                scripts: Mutex::new(VecDeque::from([
+                    vec![
+                        ProviderEvent::ToolCallCompleted {
+                            call: ToolCall {
+                                call_id: format!("write-{name}"),
+                                name: WIRE_WRITE_TOOL.into(),
+                                arguments: serde_json::json!({"path":path,"content":content})
+                                    .to_string(),
+                            },
+                        },
+                        ProviderEvent::Finish(FinishReason::ToolCall),
+                    ],
+                    vec![
+                        ProviderEvent::TextDelta {
+                            text: "Done".into(),
+                        },
+                        ProviderEvent::Finish(FinishReason::Stop),
+                    ],
+                ])),
+            };
+            run_with_provider(
+                &mut service,
+                WorkerTask {
+                    run_id,
+                    task_id,
+                    coordinator_id,
+                    model: model.clone(),
+                    agent_name: name.into(),
+                    role: role.into(),
+                    base_url: "",
+                    api_key: None,
+                    api_key_env: None,
+                    title: None,
+                    workspace: &root,
+                    user_text: "Implement assigned browser editor part",
+                    owned_files: vec![path.into()],
+                    budget_tokens: 50_000,
+                    review_only: false,
+                    cancellation: CancellationToken::new(),
+                    effect_gate: Arc::new(Mutex::new(())),
+                },
+                &provider,
+            )
+            .unwrap();
+        }
+        let qa = orynth_provider::MockProvider::new(
+            model.clone(),
+            "Reviewed index.html and app.js; no issues found.",
+        );
+        let snapshot = review_workspace_snapshot(
+            &root,
+            &BTreeSet::from(["index.html".into(), "app.js".into()]),
+        )
+        .unwrap();
+        assert!(snapshot.contains("<main>Editor</main>"));
+        assert!(snapshot.contains("const ready = true;"));
+        let (review, _) = run_with_provider(
+            &mut service,
+            WorkerTask {
+                run_id,
+                task_id,
+                coordinator_id,
+                model,
+                agent_name: "QA-03".into(),
+                role: "Review specialist".into(),
+                base_url: "",
+                api_key: None,
+                api_key_env: None,
+                title: None,
+                workspace: &root,
+                user_text: "Review the implementation",
+                owned_files: vec!["index.html".into(), "app.js".into()],
+                budget_tokens: 50_000,
+                review_only: true,
+                cancellation: CancellationToken::new(),
+                effect_gate: Arc::new(Mutex::new(())),
+            },
+            &qa,
+        )
+        .unwrap();
+        assert!(review.contains("Reviewed index.html and app.js"));
+        let recovered = service.recover(run_id).unwrap();
+        let workers = recovered
+            .manager
+            .agents
+            .values()
+            .filter(|agent| agent.parent_id == Some(coordinator_id))
+            .collect::<Vec<_>>();
+        assert_eq!(workers.len(), 3);
+        let ids = workers
+            .iter()
+            .map(|agent| agent.agent_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .filter(|event| matches!(event.event.kind, EventKind::AgentCreated { .. }))
+                .count(),
+            4
+        );
+        assert!(recovered.messages.iter().any(|message| matches!(&message.payload, IpcMessage::Handoff { summary } if summary == &review)));
+        assert_eq!(
+            std::fs::read_to_string(root.join("app.js")).unwrap(),
+            "const ready = true;"
         );
         drop(service);
         let _ = std::fs::remove_dir_all(root);
@@ -1026,6 +1327,8 @@ mod tests {
                 workspace: &root,
                 user_text: "Write index.html",
                 owned_files: vec!["index.html".into()],
+                budget_tokens: 50_000,
+                review_only: false,
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -1103,6 +1406,8 @@ mod tests {
                 workspace: &root,
                 user_text: "Write README",
                 owned_files: vec!["README.md".into()],
+                budget_tokens: 50_000,
+                review_only: false,
                 cancellation: token.clone(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -1181,6 +1486,8 @@ mod tests {
                 workspace: &root,
                 user_text: "Make a simple personal website for Arpi",
                 owned_files: Vec::new(),
+                budget_tokens: 50_000,
+                review_only: false,
                 cancellation: CancellationToken::new(),
                 effect_gate: Arc::new(Mutex::new(())),
             },
@@ -1241,6 +1548,8 @@ mod tests {
                     workspace: &worker_root,
                     user_text: "Make a simple personal website for Arpi",
                     owned_files: Vec::new(),
+                    budget_tokens: 50_000,
+                    review_only: false,
                     cancellation: worker_cancellation,
                     effect_gate: worker_gate,
                 },

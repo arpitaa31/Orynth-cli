@@ -1,6 +1,27 @@
 # Current Plan
 
-## Reviewer feedback release patch - in progress
+## Alpha release blocker patch - in progress
+
+The live path now uses configurable bounded Coordinator/worker token budgets
+of 100,000/50,000 and permits four real child agents. Coordinator provider
+history is bounded independently of durable events. The normal Coordinator
+always exposes `spawn_agent`; an explicit multi-part subagent request requires
+two implementation worker results and a read-only QA result. Workers use the
+selected rooted workspace; QA reads through the rooted filesystem fixture.
+Runtime budget errors have their own live status. Formatting, check, strict
+Clippy, release build, focused app library tests (50), and CLI tests (21) pass.
+Full workspace tests passed before the latest hardening; the current rerun
+passes the app library, then Windows Application Control blocks the rebuilt
+zero-test app binary.
+Live unpinned attempts created real workers
+but failed the editor/QA acceptance. The final fresh-sandbox run after worker
+and Coordinator hardening launched with a pinned free model, but OpenRouter
+rate-limited both the exact prompt and the small follow-up before any worker
+call. Remaining work: rerun both live prompts when the provider permits them,
+then inspect persisted AgentCreated events, handoffs, and files before claiming
+readiness.
+
+## Reviewer feedback release patch - prior validation
 
 Direct or environment OpenRouter credentials, explicit live `--config`,
 configured/resolved model labels, generic `spawn_agent` delegation, and
@@ -9,9 +30,8 @@ uses the rooted filesystem tool with optional file scope and bounded budgets;
 the old website-only write restrictions are removed. Focused CLI, provider,
 app, and TUI tests pass. All five required gates now pass, including the exact
 all-features workspace test and release workspace build commands. The rebuilt
-release binary runs `help` with `--config` visible. Manual tests A-D are the
-remaining acceptance work; no live OpenRouter key is available in this
-session. Do not declare reviewer retest ready until live acceptance passes.
+release binary previously ran `help` with `--config` visible. The current live
+acceptance result is recorded above.
 
 ## Phase G.5: durable multi-turn agent execution - in progress
 
@@ -34,8 +54,8 @@ chunks before and after finish, repeated `[DONE]`, explicit multi-choice
 rejection, cumulative SSE payload limiting,
 prompt cancellation on a stalled body, and a total response deadline. The
 reported duplicate-finish shape has an offline sanitized fixture; its original
-live response body was not available in this environment. No live call was
-made because `OPENROUTER_API_KEY` is absent here.
+live response body was not available in the earlier diagnostic. Later alpha
+blocker acceptance attempts are recorded above.
 
 The process-isolation wrapper now stores its platform handle only on Windows;
 non-Windows attachment is checked without binding the unit result. Windows
@@ -46,8 +66,8 @@ are blocked by Application Control (OS error 4551), and only the Windows Rust
 target is installed locally.
 
 G2/G3/G4: The live Workspace streams Coordinator text, requires a typed
-`spawn_agent` proposal for a bounded coding task, invokes one
-rooted worker through Orynth's capability, ownership, and typed-tool pipeline,
+`spawn_agent` proposal for a bounded coding task, invokes rooted workers
+through Orynth's capability, ownership, and typed-tool pipeline,
 records IPC assignment/handoff, and returns the verified worker result to
 Coordinator. Provider-turn completion leaves the logical Coordinator active
 for multi-turn chat and tool-result continuation (ADR-0071). A persisted

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dark VS Code Style Editor</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: #1e1e1e;
+    color: #cccccc;
+  }
+  .container {
+    display: flex;
+    height: 100vh;
+  }
+  .sidebar {
+    width: 200px;
+    background-color: #252526;
+    padding: 10px;
+    box-sizing: border-box;
+    overflow-y: auto;
+  }
+  .sidebar h3 {
+    margin-top: 0;
+    font-size: 14px;
+    color: #cccccc;
+  }
+  .file-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .file-list li {
+    padding: 4px 0;
+    cursor: pointer;
+  }
+  .file-list li:hover {
+    background-color: #2a2d2e;
+  }
+  .tabs {
+    display: flex;
+    background-color: #1e1e1e;
+    border-bottom: 1px solid #3c3c3c;
+    height: 30px;
+    align-items: center;
+    padding-left: 10px;
+  }
+  .tab {
+    padding: 5px 10px;
+    margin-right: 2px;
+    background-color: #2d2d2d;
+    color: #cccccc;
+    text-decoration: none;
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
+  }
+  .tab.active {
+    background-color: #1e1e1e;
+    color: #ffffff;
+    border-bottom: 2px solid #007acc;
+  }
+  .editor-flex {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+  .editor {
+    flex: 1;
+    min-height: 0;
+    padding: 10px;
+    box-sizing: box-sizing;
+    background-color: #1e1e1e;
+    color: #cccccc;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    outline: none;
+    border: none;
+    resize: none;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .status-bar {
+    height: 22px;
+    background-color: #007acc;
+    color: #ffffff;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    padding-left: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="sidebar">
+    <h3>EXPLORER</h3>
+    <ul class="file-list">
+      <li>index.html</li>
+      <li>styles.css</li>
+      <li>app.js</li>
+    </ul>
+  </div>
+  <div class="editor-flex">
+    <div class="tabs">
+      <a href="#" class="tab active">index.html</a>
+      <a href="#" class="tab">styles.css</a>
+      <a href="#" class="tab">app.js</a>
+    </div>
+    <textarea class="editor" placeholder="// Start coding...">
+/* Welcome to the editor */
+function hello() {
+    console.log("Hello, world!");
+}
+</textarea>
+    <div class="status-bar">
+      <span>Ln 1, Col 1</span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

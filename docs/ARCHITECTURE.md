@@ -20,7 +20,7 @@ The dependency direction is: applications and UI -> runtime services -> domain c
 - `orynth-terminal-tools`: bounded terminal planning plus controlled rooted filesystem effects and injected typed process fixtures built on the tool contracts.
 - `orynth-cli` and `orynth-shell`: explicit terminal request parsing, host-aware plan rendering, and confirmed rooted-filesystem execution through the tool runtime; they do not execute ambient shell commands.
 - `orynth-tui`: chat-first Workspace and Advanced Debugger over the same `RecoveredRun` source; the TUI owns presentation state and forwards live input through an app-supplied data source. Complete Coordinator turns are durable; the Phase G app source streams provider text and uses the runtime for effects.
-- `orynth`: operator command boundary for recovering selected SQLite runs, constructing the deterministic offline demo, or running the OpenRouter-backed Coordinator and rooted website worker.
+- `orynth`: operator command boundary for recovering selected SQLite runs, constructing the deterministic offline demo, or running the OpenRouter-backed Coordinator and bounded rooted coding workers.
 - Later: policy-driven specialist selection, context-wide trust propagation, broader platform enforcement, interactive replay/fork/comparison controls, semantic breakpoints, and terminal services.
 - Apps compose contracts; adapters cannot replace kernel authority.
 
@@ -48,7 +48,7 @@ The live turn state machine is explicit: `READY` -> `REQUESTING` ->
 turn outcomes handled by bounded retry policy; they are not implicit run
 terminal states.
 
-The live Coordinator and rooted website worker preserve their request parts and
+The live Coordinator and rooted coding workers preserve their request parts and
 runtime results across bounded turns. Tool calls are validated and executed
 before the next request, while a length finish continues from the current
 runtime state. Empty length turns use a small consecutive retry budget and then

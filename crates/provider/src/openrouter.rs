@@ -1157,7 +1157,7 @@ mod tests {
     fn tool_continuation_serializes_as_assistant_call_and_local_result() {
         let mut request = request();
         request.tools.push(crate::ToolDefinition {
-            name: "delegate_personal_site".into(),
+            name: "spawn_agent".into(),
             description: "delegate".into(),
             input_schema: r#"{"type":"object"}"#.into(),
         });
@@ -1166,12 +1166,12 @@ mod tests {
             .parts
             .push(RequestPart::ModelToolCalls(vec![ToolCall {
                 call_id: "call-1".into(),
-                name: "delegate_personal_site".into(),
+                name: "spawn_agent".into(),
                 arguments: "{}".into(),
             }]));
         request.parts.push(RequestPart::ToolResult {
             call_id: "call-1".into(),
-            content: "worker verified index.html".into(),
+            content: "worker verified assigned files".into(),
             is_error: false,
         });
         let body = encode_request(&request).unwrap();

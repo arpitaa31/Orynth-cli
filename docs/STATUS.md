@@ -1,6 +1,39 @@
 # Status
 
-## Release patch: reviewer feedback in progress
+## Release blocker patch: bounded generic live delegation
+
+The live Coordinator now uses configurable bounded defaults of 100,000 task
+tokens, 50,000 tokens per worker, and four child agents. Its provider prompt
+keeps a bounded recent conversation projection while the event store retains
+complete history. Live status distinguishes runtime budget exhaustion,
+provider errors, tool failures, and cancellation.
+
+`spawn_agent` remains available for every normal live request. Explicit
+multi-part coding team requests require two successful implementation workers
+and a read-only QA worker before a final Coordinator answer. Each spawn uses
+`RuntimeService::spawn_agent`, so AI TEAM derives its rows from real
+`AgentCreated` events. Coding workers retain rooted, capability-gated writes;
+QA receives a bounded read-only projection through the rooted filesystem
+fixture. Deterministic app tests cover three distinct workers, actual files,
+review handoff, and sandbox escape rejection. See ADR-0072.
+
+Formatting, workspace check, strict Clippy, and release workspace build pass
+on the current worktree. The focused app library (50 tests) and CLI (21 tests)
+pass. The full workspace suite passed before the latest hardening; its current
+rerun passes the app library tests, then Windows Application Control (OS error
+4551) blocks the rebuilt zero-test app binary. Fresh-sandbox
+live runs with the unpinned free route produced real child agents and visible
+AI TEAM rows, but did not complete the requested editor or QA handoff. They
+exposed provider finish/tool naming quirks, path formatting, worker ownership
+after failure, and repeated implementation proposals; the live path now handles
+those cases within bounded limits. A further fresh-sandbox attempt using the
+rebuilt release binary and a pinned tool-capable free model reached OpenRouter,
+but the provider returned rate-limit errors before any worker call. The small
+follow-up also reached the provider, returned a rate-limit error, and created
+no new agents. The exact live acceptance and negative follow-up have not yet
+passed, so release retest readiness remains unconfirmed.
+
+## Release patch: reviewer feedback prior validation
 
 Live configuration now supports direct OpenRouter credentials with redacted
 diagnostics, explicit `--config` selection, configured-versus-resolved model
@@ -10,9 +43,8 @@ rooted filesystem tool and optional assigned-file scope. Focused CLI,
 provider, app, and TUI suites pass (20/20, 27/27, 47/47, and 54/54). All
 five required gates—formatting, workspace check, strict Clippy, all-features
 workspace tests, and release workspace build—now pass. The rebuilt release
-binary runs `help` and exposes `--config`. Earlier host-policy failures were
-intermittent and did not recur on the passing commands. Live acceptance A-D is
-pending a local OpenRouter key.
+binary previously ran `help` and exposed `--config`. The current live
+acceptance result and host-policy block are recorded above.
 
 ## Phase G.5: in progress
 
@@ -37,7 +69,7 @@ exposing the bearer token. Manual text and function-call diagnostics are
 available through `provider test openrouter` and `provider tool-test openrouter`.
 Free-only model configuration exists. The live Workspace streams Coordinator
 turns, persists response and usage events, and delegates bounded coding tasks
-to one rooted worker through Orynth's IPC, capability, ownership, and typed
+to rooted workers through Orynth's IPC, capability, ownership, and typed
 tool runtime. A persisted 48-request cap covers both Coordinator and worker
 calls in each live run. Reusable Coordinator turns record provider completion
 without terminating the logical agent; TUI shutdown persists a completed, failed, or

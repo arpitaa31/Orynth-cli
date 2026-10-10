@@ -2,8 +2,8 @@ mod worker;
 
 const MAX_LIVE_PROVIDER_REQUESTS: usize = 48;
 const LIVE_COORDINATOR_OUTPUT_TOKENS: u32 = 2048;
-const MAX_COORDINATOR_TOOL_CALLS: usize = 8;
-const MAX_COORDINATOR_TURNS: usize = 12;
+const MAX_COORDINATOR_TOOL_CALLS: usize = 12;
+const MAX_COORDINATOR_TURNS: usize = 16;
 const MAX_UNPRODUCTIVE_TURNS: usize = 3;
 const MAX_TURN_RETRIES: usize = 2;
 
@@ -26,10 +26,10 @@ use orynth_provider::{
     ToolChoice, ToolDefinition as ProviderToolDefinition, openrouter::OpenRouterProvider,
 };
 use orynth_runtime::{
-    RuntimeService,
+    RuntimeError, RuntimeService,
     conversation::{ConversationSpeaker, ConversationTurn},
 };
-use orynth_scheduler::{BudgetLimits, BudgetUsage};
+use orynth_scheduler::{BudgetDimension, BudgetLimits, BudgetUsage, SchedulerError};
 use orynth_tui::{TuiDataSource, TuiPresentation, TuiSnapshot};
 
 use crate::DbTuiSource;
@@ -160,10 +160,10 @@ impl LiveTuiSource {
                 run.id,
                 agent.id,
                 BudgetLimits {
-                    max_tokens: Some(30_000),
+                    max_tokens: Some(config.scheduler.coordinator_max_tokens),
                     max_wall_clock_ms: Some(600_000),
                     max_tool_calls: Some(MAX_COORDINATOR_TOOL_CALLS as u64),
-                    max_child_agents: Some(1),
+                    max_child_agents: Some(config.scheduler.max_child_agents),
                     ..BudgetLimits::default()
                 },
             )
@@ -210,6 +210,8 @@ pub(super) fn run_site_test(config: RuntimeConfig) -> Result<String, String> {
             workspace: &source.workspace,
             user_text: task,
             owned_files: Vec::new(),
+            budget_tokens: source.config.scheduler.worker_max_tokens,
+            review_only: false,
             cancellation: CancellationToken::new(),
             effect_gate: Arc::clone(&source.effect_gate),
         },
@@ -424,10 +426,7 @@ impl TuiDataSource for LiveTuiSource {
     fn live_text(&self) -> Option<String> {
         let state = self.state.lock().ok()?;
         if let Some(error) = &state.error {
-            if error == "Coordinator interrupted." {
-                return Some(error.clone());
-            }
-            return Some(format!("Provider error: {error}"));
+            return Some(live_error_status(error));
         }
         if state.busy {
             Some(if state.text.is_empty() {
@@ -650,7 +649,7 @@ fn execute_turn(
     let events = store.events(run_id).map_err(|error| error.to_string())?;
     let mut request = ModelRequest::new(run_id, task_id, agent_id, model.clone(), "");
     request.parts = vec![RequestPart::System(
-        "You are Orynth's Coordinator. Orynth owns authoritative state and side effects. Use only reported runtime facts. Do not claim actions or worker results until Orynth confirms them. Do not reveal hidden reasoning. Small tasks may stay with you; medium or large coding tasks, multi-part tasks, or requests that explicitly ask for subagents should use spawn_agent with one bounded specialist. Never claim an agent exists until runtime confirms it.".into())];
+        "You are Orynth's Coordinator. Orynth owns authoritative state and side effects. Use only reported runtime facts. Do not claim actions or worker results until Orynth confirms them. Do not reveal hidden reasoning. Handle small tasks directly. For multi-part coding tasks, especially explicit subagent requests, decompose into distinct assignments and use spawn_agent for implementation workers. Give implementation workers different file scopes with owned_files so they do not overwrite each other; assign distinct UI/layout and logic/interaction responsibilities when requested. Ask each worker to create ordinary project files needed for its assignment. After two implementation results, spawn a read-only QA worker with review_only=true to inspect actual workspace files. Coordinate and summarize verified results; do not reproduce all worker implementation yourself. Never claim an agent exists until runtime confirms it.".into())];
     let recovered =
         RuntimeService::new(SqliteEventStore::open(&database).map_err(|error| error.to_string())?)
             .recover(run_id)
@@ -722,12 +721,17 @@ fn execute_turn(
     let mut unproductive_turns = 0usize;
     let mut total_tool_calls = 0usize;
     let mut partial_output = String::new();
+    let team_requested = explicit_coding_team_requested(&latest_user);
+    let mut implementation_workers = 0usize;
+    let mut review_workers = 0usize;
+    let mut missing_delegation_turns = 0usize;
 
     for turn_index in 0..MAX_COORDINATOR_TURNS {
         if cancellation.is_cancelled() {
             return Err("Coordinator request cancelled".into());
         }
         let mut next = ModelRequest::new(run_id, task_id, agent_id, model.clone(), "");
+        bound_conversation_parts(&mut next_parts);
         next.parts = next_parts.clone();
         next.tools = tools.clone();
         next.tool_choice = tool_choice;
@@ -738,6 +742,27 @@ fn execute_turn(
             FinishReason::Stop => {
                 if cancellation.is_cancelled() {
                     return Err("Coordinator request cancelled".into());
+                }
+                if team_requested && (implementation_workers < 2 || review_workers == 0) {
+                    missing_delegation_turns += 1;
+                    if missing_delegation_turns >= MAX_UNPRODUCTIVE_TURNS {
+                        return Err(format!(
+                            "Coordinator did not complete requested delegation: {implementation_workers} implementation worker(s), {review_workers} review worker(s); routed model omitted required spawn_agent calls"
+                        ));
+                    }
+                    if !output.trim().is_empty() {
+                        next_parts.push(RequestPart::Model(output));
+                    }
+                    let instruction = if implementation_workers < 2 {
+                        format!(
+                            "The user requested distinct implementation workers. Only {implementation_workers} have completed. Your previous prose did not create an agent. Call spawn_agent now for the next distinct implementation assignment. Use a specific role and task; do not answer in prose."
+                        )
+                    } else {
+                        "The implementation workers completed. Call spawn_agent now with review_only=true and a QA role to inspect actual workspace files. Do not answer in prose.".into()
+                    };
+                    next_parts.push(RequestPart::System(instruction));
+                    tool_choice = ToolChoice::Required;
+                    continue;
                 }
                 if output.trim().is_empty() {
                     return Err("Coordinator returned an empty response".into());
@@ -770,7 +795,21 @@ fn execute_turn(
                     cancellation: &cancellation,
                     effect_gate: &effect_gate,
                 };
-                let results = execute_coordinator_actions(&mut actions, &calls)?;
+                let results = execute_coordinator_actions(
+                    &mut actions,
+                    &calls,
+                    team_requested,
+                    implementation_workers,
+                )?;
+                count_worker_results(
+                    &calls,
+                    &results,
+                    &mut implementation_workers,
+                    &mut review_workers,
+                );
+                if results.iter().any(|(_, _, failed)| !failed) {
+                    missing_delegation_turns = 0;
+                }
                 for (call_id, result, is_error) in results {
                     next_parts.push(RequestPart::ToolResult {
                         call_id,
@@ -778,7 +817,12 @@ fn execute_turn(
                         is_error,
                     });
                 }
-                tool_choice = ToolChoice::Auto;
+                tool_choice =
+                    if team_requested && (implementation_workers < 2 || review_workers == 0) {
+                        ToolChoice::Required
+                    } else {
+                        ToolChoice::Auto
+                    };
                 unproductive_turns = 0;
             }
             FinishReason::Length => {
@@ -799,7 +843,21 @@ fn execute_turn(
                         cancellation: &cancellation,
                         effect_gate: &effect_gate,
                     };
-                    let results = execute_coordinator_actions(&mut actions, &calls)?;
+                    let results = execute_coordinator_actions(
+                        &mut actions,
+                        &calls,
+                        team_requested,
+                        implementation_workers,
+                    )?;
+                    count_worker_results(
+                        &calls,
+                        &results,
+                        &mut implementation_workers,
+                        &mut review_workers,
+                    );
+                    if results.iter().any(|(_, _, failed)| !failed) {
+                        missing_delegation_turns = 0;
+                    }
                     for (call_id, result, is_error) in results {
                         next_parts.push(RequestPart::ToolResult {
                             call_id,
@@ -807,7 +865,12 @@ fn execute_turn(
                             is_error,
                         });
                     }
-                    tool_choice = ToolChoice::Auto;
+                    tool_choice =
+                        if team_requested && (implementation_workers < 2 || review_workers == 0) {
+                            ToolChoice::Required
+                        } else {
+                            ToolChoice::Auto
+                        };
                     unproductive_turns = 0;
                 } else {
                     let has_output = !output.trim().is_empty();
@@ -863,8 +926,46 @@ struct CoordinatorActionContext<'a> {
 fn execute_coordinator_actions(
     context: &mut CoordinatorActionContext<'_>,
     calls: &[ToolCall],
+    team_requested: bool,
+    implementation_workers: usize,
 ) -> Result<Vec<(String, String, bool)>, String> {
-    execute_coordinator_actions_with(context, calls, worker::run)
+    let mut results = Vec::with_capacity(calls.len());
+    let mut completed_in_batch = 0usize;
+    for call in calls {
+        let review = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .ok()
+            .map(|value| {
+                value
+                    .get("review_only")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| {
+                        value
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(is_review_role)
+                    })
+            })
+            .unwrap_or(false);
+        if team_requested && !review && implementation_workers + completed_in_batch >= 2 {
+            results.push((call.call_id.clone(), "Two implementation workers have completed. Spawn a read-only QA worker with review_only=true next.".into(), true));
+            continue;
+        }
+        if team_requested && review && implementation_workers + completed_in_batch < 2 {
+            results.push((
+                call.call_id.clone(),
+                "Complete two distinct implementation workers before QA review.".into(),
+                true,
+            ));
+            continue;
+        }
+        let mut current =
+            execute_coordinator_actions_with(context, std::slice::from_ref(call), worker::run)?;
+        if !review && current.iter().any(|(_, _, failed)| !failed) {
+            completed_in_batch += 1;
+        }
+        results.append(&mut current);
+    }
+    Ok(results)
 }
 
 fn execute_coordinator_actions_with<F>(
@@ -900,23 +1001,39 @@ where
         if task.len() > 4096 {
             return Err("spawn_agent task exceeds 4 KiB".into());
         }
-        let name = object
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or("WORKER-01")
-            .to_owned();
         let role = object
             .get("role")
             .and_then(serde_json::Value::as_str)
             .filter(|role| !role.trim().is_empty())
             .unwrap_or("Bounded coding specialist")
             .to_owned();
+        let ordinal = context
+            .service
+            .recover(context.run_id)
+            .map_err(|error| error.to_string())?
+            .manager
+            .agents
+            .values()
+            .filter(|agent| agent.parent_id == Some(context.agent_id))
+            .count()
+            + 1;
+        let name = object
+            .get("name_hint")
+            .or_else(|| object.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| default_worker_name(&role, ordinal));
+        let review_only = object
+            .get("review_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| is_review_role(&role));
         if name.len() > 64 || role.len() > 128 || name.contains('\n') || role.contains('\n') {
             return Err("spawn_agent name or role is too long or invalid".into());
         }
         let files = object
-            .get("files")
+            .get("owned_files")
+            .or_else(|| object.get("files"))
             .map(|value| value.as_array().ok_or("spawn_agent files must be an array"))
             .transpose()?
             .map(|items| {
@@ -929,8 +1046,7 @@ where
                         let path = item
                             .as_str()
                             .ok_or("spawn_agent file paths must be strings")?;
-                        worker::validate_worker_path(path)?;
-                        Ok(path.to_owned())
+                        worker::normalize_worker_path_in_workspace(path, context.workspace)
                     })
                     .collect::<Result<Vec<_>, String>>()
             })
@@ -952,6 +1068,8 @@ where
                 workspace: context.workspace,
                 user_text: &task,
                 owned_files: files,
+                budget_tokens: context.config.scheduler.worker_max_tokens,
+                review_only,
                 cancellation: context.cancellation.clone(),
                 effect_gate: Arc::clone(context.effect_gate),
             },
@@ -970,17 +1088,103 @@ where
 }
 
 fn bound_conversation_parts(parts: &mut Vec<RequestPart>) {
-    if parts.len() > 64 {
-        // Retain both runtime/system layers while bounding older conversation.
-        parts.drain(2..parts.len() - 62);
+    const MAX_PARTS: usize = 64;
+    const MAX_TEXT_BYTES: usize = 48 * 1024;
+    let mut bytes = parts.iter().map(request_part_bytes).sum::<usize>();
+    while parts.len() > MAX_PARTS || (bytes > MAX_TEXT_BYTES && parts.len() > 3) {
+        // The two stable system layers are retained. Older complete turns can
+        // be projected away without touching the durable conversation events.
+        bytes = bytes.saturating_sub(request_part_bytes(&parts[2]));
+        parts.remove(2);
+        while matches!(parts.get(2), Some(RequestPart::ToolResult { .. })) {
+            bytes = bytes.saturating_sub(request_part_bytes(&parts[2]));
+            parts.remove(2);
+        }
+    }
+}
+
+fn explicit_coding_team_requested(user: &str) -> bool {
+    let lower = user.to_ascii_lowercase();
+    (lower.contains("subagents") || lower.contains("sub-agents"))
+        && (lower.contains(" and ")
+            || lower.contains(',')
+            || lower.contains("worker")
+            || lower.contains("specialist"))
+}
+
+fn is_review_role(role: &str) -> bool {
+    let role = role.to_ascii_lowercase();
+    role.contains("review") || role.contains("qa") || role.contains("quality")
+}
+
+fn default_worker_name(role: &str, ordinal: usize) -> String {
+    let slug = role
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric())
+        .take(16)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let slug = if slug.is_empty() { "WORKER" } else { &slug };
+    format!("{slug}-{ordinal:02}")
+}
+
+fn count_worker_results(
+    calls: &[ToolCall],
+    results: &[(String, String, bool)],
+    implementation_workers: &mut usize,
+    review_workers: &mut usize,
+) {
+    for (call_id, _, failed) in results {
+        if *failed {
+            continue;
+        }
+        let Some(call) = calls
+            .iter()
+            .find(|call| &call.call_id == call_id && call.name == "spawn_agent")
+        else {
+            continue;
+        };
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+            continue;
+        };
+        let review_only = arguments
+            .get("review_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                arguments
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_review_role)
+            });
+        if review_only {
+            *review_workers += 1;
+        } else {
+            *implementation_workers += 1;
+        }
+    }
+}
+
+fn request_part_bytes(part: &RequestPart) -> usize {
+    match part {
+        RequestPart::System(text) | RequestPart::User(text) | RequestPart::Model(text) => {
+            text.len()
+        }
+        RequestPart::ToolResult {
+            call_id, content, ..
+        } => call_id.len() + content.len(),
+        RequestPart::ModelToolCalls(calls) => calls
+            .iter()
+            .map(|call| call.call_id.len() + call.name.len() + call.arguments.len())
+            .sum(),
+        RequestPart::Image { media_type, data } => media_type.len() + data.len(),
     }
 }
 
 fn configure_delegation(request: &mut ModelRequest, latest_user: &str) {
     request.tools.push(ProviderToolDefinition {
         name: "spawn_agent".into(),
-        description: "Create one real bounded coding specialist in the selected workspace. Use for medium/large or explicitly delegated work; do not use for trivial explanations or tiny edits.".into(),
-        input_schema: r#"{"type":"object","properties":{"name":{"type":"string"},"role":{"type":"string"},"task":{"type":"string"},"files":{"type":"array","items":{"type":"string"}}},"required":["task"],"additionalProperties":false}"#.into(),
+        description: "Create one real bounded coding or read-only review worker in the selected workspace. Call separately for distinct assignments. Use review_only for QA after implementation. Do not use for trivial edits.".into(),
+        input_schema: r#"{"type":"object","properties":{"name_hint":{"type":"string"},"role":{"type":"string"},"task":{"type":"string"},"owned_files":{"type":"array","items":{"type":"string"}},"review_only":{"type":"boolean"}},"required":["role","task"],"additionalProperties":false}"#.into(),
     });
     let lower_user = latest_user.to_ascii_lowercase();
     if lower_user.contains("subagent")
@@ -1144,6 +1348,11 @@ fn run_coordinator_request_once(
         return Err("Coordinator request cancelled".into());
     }
     let finish = finish.ok_or("OpenRouter stream ended without completion")?;
+    let finish = if finish == FinishReason::Stop && !calls.is_empty() {
+        FinishReason::ToolCall
+    } else {
+        finish
+    };
     state = ModelTurnState::TurnFinished;
     debug_assert_eq!(state, ModelTurnState::TurnFinished);
     state = match &finish {
@@ -1197,7 +1406,7 @@ fn run_coordinator_request_once(
                 ..BudgetUsage::default()
             },
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| runtime_budget_error("Coordinator", error))?;
     Ok((output, calls, finish, usage))
 }
 
@@ -1221,6 +1430,33 @@ fn coordinator_provider_error(error: ProviderError) -> String {
             format!("Coordinator provider stream malformed: {message}")
         }
         other => format!("Coordinator provider error: {other}"),
+    }
+}
+
+fn runtime_budget_error(role: &str, error: RuntimeError) -> String {
+    match error {
+        RuntimeError::Scheduler(SchedulerError::BudgetExceeded {
+            dimension: BudgetDimension::Tokens,
+            limit,
+            observed,
+            ..
+        }) => format!("{role} token budget exhausted ({observed} / {limit})."),
+        other => other.to_string(),
+    }
+}
+
+fn live_error_status(error: &str) -> String {
+    if error.contains("budget exhausted")
+        || error.contains("budget exceeded")
+        || error.contains("request limit reached")
+    {
+        format!("Runtime budget exhausted: {error}")
+    } else if error.contains("cancelled") || error.contains("interrupted") {
+        format!("Cancellation: {error}")
+    } else if error.contains("provider") || error.contains("OpenRouter") {
+        format!("Provider error: {error}")
+    } else {
+        format!("Tool failure: {error}")
     }
 }
 
@@ -1496,6 +1732,33 @@ mod tests {
         configure_delegation(&mut complex, "Build a VS Code-like editor. Use subagents.");
         assert_eq!(complex.tools[0].name, "spawn_agent");
         assert_eq!(complex.tool_choice, ToolChoice::Required);
+        assert!(explicit_coding_team_requested(
+            "Build a browser editor with UI, logic, and review workers. Use subagents for implementation across these separable responsibilities."
+        ));
+        assert!(!explicit_coding_team_requested(
+            "Change the status bar text to Ready."
+        ));
+        assert_eq!(default_worker_name("UI/layout specialist", 1), "UI-01");
+        assert_eq!(default_worker_name("Logic specialist", 2), "LOGIC-02");
+    }
+
+    #[test]
+    fn runtime_budget_and_failure_status_are_distinct_from_provider_errors() {
+        let error = RuntimeError::Scheduler(SchedulerError::BudgetExceeded {
+            agent_id: AgentId::new(),
+            dimension: BudgetDimension::Tokens,
+            limit: 30_000,
+            observed: 32_473,
+        });
+        let message = runtime_budget_error("Coordinator", error);
+        assert_eq!(
+            message,
+            "Coordinator token budget exhausted (32473 / 30000)."
+        );
+        assert!(live_error_status(&message).starts_with("Runtime budget exhausted:"));
+        assert!(live_error_status("Coordinator provider timeout").starts_with("Provider error:"));
+        assert!(live_error_status("Coordinator request cancelled").starts_with("Cancellation:"));
+        assert!(live_error_status("worker file path invalid").starts_with("Tool failure:"));
     }
 
     #[test]
@@ -1712,7 +1975,7 @@ mod tests {
                 run_id,
                 agent_id,
                 BudgetLimits {
-                    max_child_agents: Some(1),
+                    max_child_agents: Some(4),
                     ..BudgetLimits::default()
                 },
             )
@@ -1727,6 +1990,35 @@ mod tests {
             model: model.clone(),
             requests: AtomicUsize::new(0),
         };
+        let explicit_user = "Build a browser-based VS Code-style editor with UI, logic, and review workers. Use subagents for implementation across these distinct assignments.";
+        assert!(explicit_coding_team_requested(explicit_user));
+        let mut request = coordinator_request(run_id, task_id, agent_id, model.clone());
+        configure_delegation(&mut request, explicit_user);
+        assert_eq!(request.tool_choice, ToolChoice::Required);
+        let call = ToolCall {
+            call_id: "spawn-editor".into(),
+            name: "spawn_agent".into(),
+            arguments: serde_json::json!({
+                "name_hint": "EDITOR-01",
+                "role": "Browser editor specialist",
+                "task": "Implement the browser editor",
+                "owned_files": ["editor.js"]
+            })
+            .to_string(),
+        };
+        let proposal = MockProvider::new(model.clone(), "").with_script(vec![
+            Ok(ProviderEvent::ToolCallCompleted { call }),
+            Ok(ProviderEvent::Finish(FinishReason::ToolCall)),
+        ]);
+        let (_, proposed_calls, finish, _) = run_coordinator_request(
+            &mut service,
+            &proposal,
+            request,
+            cancellation.clone(),
+            &Arc::new(Mutex::new(LiveState::default())),
+        )
+        .unwrap();
+        assert_eq!(finish, FinishReason::ToolCall);
         let mut context = CoordinatorActionContext {
             service: &mut service,
             run_id,
@@ -1738,21 +2030,11 @@ mod tests {
             cancellation: &cancellation,
             effect_gate: &effect_gate,
         };
-        let call = ToolCall {
-            call_id: "spawn-editor".into(),
-            name: "spawn_agent".into(),
-            arguments: serde_json::json!({
-                "name": "EDITOR-01",
-                "role": "Browser editor specialist",
-                "task": "Implement the browser editor",
-                "files": ["editor.js"]
+        let results =
+            execute_coordinator_actions_with(&mut context, &proposed_calls, |service, task| {
+                worker::run_with_provider(service, task, &provider)
             })
-            .to_string(),
-        };
-        let results = execute_coordinator_actions_with(&mut context, &[call], |service, task| {
-            worker::run_with_provider(service, task, &provider)
-        })
-        .unwrap();
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].2);
         assert!(results[0].1.contains("editor.js"));
@@ -2183,6 +2465,14 @@ mod tests {
         assert!(matches!(&parts[0], RequestPart::System(text) if text == "Coordinator policy"));
         assert!(matches!(&parts[1], RequestPart::System(text) if text == "Actual runtime roster"));
         assert!(matches!(&parts[63], RequestPart::User(text) if text == "message 79"));
+        let mut oversized = vec![
+            RequestPart::System("policy".into()),
+            RequestPart::System("runtime".into()),
+        ];
+        oversized.extend((0..20).map(|_| RequestPart::User("x".repeat(4096))));
+        bound_conversation_parts(&mut oversized);
+        assert!(oversized.iter().map(request_part_bytes).sum::<usize>() <= 48 * 1024);
+        assert!(oversized.len() < 20);
     }
 
     #[test]

@@ -1,0 +1,20 @@
+[providers.openrouter]
+enabled = true
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+free_only = true
+
+[models.coordinator]
+provider = "openrouter"
+model = "nvidia/nemotron-3-super-120b-a12b:free"
+class = "strong"
+
+[models.worker]
+provider = "openrouter"
+model = "nvidia/nemotron-3-super-120b-a12b:free"
+class = "economy"
+
+[scheduler]
+coordinator_max_tokens = 100000
+worker_max_tokens = 50000
+max_child_agents = 4

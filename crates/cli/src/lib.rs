@@ -1120,6 +1120,17 @@ impl RuntimeConfig {
                         config.scheduler.promote_after_failures =
                             parse_u32(raw_value, key, line_number)?;
                     }
+                    "coordinator_max_tokens" => {
+                        config.scheduler.coordinator_max_tokens =
+                            parse_u64(raw_value, key, line_number)?;
+                    }
+                    "worker_max_tokens" => {
+                        config.scheduler.worker_max_tokens =
+                            parse_u64(raw_value, key, line_number)?;
+                    }
+                    "max_child_agents" => {
+                        config.scheduler.max_child_agents = parse_u64(raw_value, key, line_number)?;
+                    }
                     _ => return Err(unknown_key(key, line_number)),
                 },
                 Section::Context => match key {
@@ -1223,6 +1234,14 @@ impl RuntimeConfig {
                 "scheduler.promote_after_failures must be greater than zero".to_string(),
             ));
         }
+        if !(1..=1_000_000).contains(&self.scheduler.coordinator_max_tokens)
+            || !(1..=1_000_000).contains(&self.scheduler.worker_max_tokens)
+            || !(1..=16).contains(&self.scheduler.max_child_agents)
+        {
+            return Err(ConfigError::Invalid(
+                "scheduler live budgets must be positive and bounded".into(),
+            ));
+        }
         if self.security.default_network.trim().is_empty() {
             return Err(ConfigError::Invalid(
                 "security.default_network must not be empty".to_string(),
@@ -1306,6 +1325,9 @@ pub struct SchedulerSettings {
     pub mode: String,
     pub prefer_warm_cache: bool,
     pub promote_after_failures: u32,
+    pub coordinator_max_tokens: u64,
+    pub worker_max_tokens: u64,
+    pub max_child_agents: u64,
 }
 
 impl Default for SchedulerSettings {
@@ -1314,6 +1336,9 @@ impl Default for SchedulerSettings {
             mode: "economy".to_string(),
             prefer_warm_cache: true,
             promote_after_failures: 3,
+            coordinator_max_tokens: 100_000,
+            worker_max_tokens: 50_000,
+            max_child_agents: 4,
         }
     }
 }
@@ -1461,9 +1486,32 @@ fn parse_u32(value: &str, key: &str, line_number: usize) -> Result<u32, ConfigEr
     })
 }
 
+fn parse_u64(value: &str, key: &str, line_number: usize) -> Result<u64, ConfigError> {
+    value.parse().map_err(|_| {
+        ConfigError::Parse(format!(
+            "line {line_number}: {key} must be an unsigned 64-bit integer"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_budget_defaults_are_bounded_and_configurable() {
+        let defaults = SchedulerSettings::default();
+        assert_eq!(defaults.coordinator_max_tokens, 100_000);
+        assert_eq!(defaults.worker_max_tokens, 50_000);
+        assert_eq!(defaults.max_child_agents, 4);
+        let config = RuntimeConfig::parse("[scheduler]\ncoordinator_max_tokens = 120000\nworker_max_tokens = 60000\nmax_child_agents = 3\n").unwrap();
+        assert_eq!(config.scheduler.coordinator_max_tokens, 120_000);
+        assert_eq!(config.scheduler.worker_max_tokens, 60_000);
+        assert_eq!(config.scheduler.max_child_agents, 3);
+        assert!(RuntimeConfig::parse("[scheduler]\ncoordinator_max_tokens = 0\n").is_err());
+        assert!(RuntimeConfig::parse("[scheduler]\nworker_max_tokens = 0\n").is_err());
+        assert!(RuntimeConfig::parse("[scheduler]\nmax_child_agents = 0\n").is_err());
+    }
 
     #[test]
     fn parses_readable_runtime_configuration() {

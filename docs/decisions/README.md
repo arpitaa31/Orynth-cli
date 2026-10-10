@@ -55,3 +55,4 @@ Significant decisions record context, decision, alternatives, consequences, and 
   existing provider trait and its secret, streaming, and tool boundaries.
 - ADR-0071 separates reusable Coordinator provider turns from terminal logical
   agent lifecycle transitions.
+- ADR-0072 records bounded generic live coding delegation and read-only review.

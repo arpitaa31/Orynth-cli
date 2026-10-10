@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VS Code-like Editor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="vscode-layout">
+  <header class="tab-bar">
+    <div class="tab active">index.html</div>
+    <div class="tab">style.css</div>
+  </header>
+  <div class="content">
+    <aside class="sidebar">
+      <h2>Explorer</h2>
+      <ul>
+        <li>file1.js</li>
+        <li>folder1/
+          <ul>
+            <li>nested.js</li>
+          </ul>
+        </li>
+      </ul>
+    </aside>
+    <main class="editor-area">
+      <div class="editor-placeholder">
+        <p>Editor content for index.html</p>
+      </div>
+      <div class="editor-placeholder hidden">
+        <p>Editor content for style.css</p>
+      </div>
+    </main>
+  </div>
+  <footer class="status-bar">
+    <div class="status-item">Ln 1, Col 1</div>
+    <div class="status-item">UTF-8</div>
+    <div class="status-item">Spaces: 2</div>
+  </footer>
+</div>
+</body>
+</html>
